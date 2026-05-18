@@ -219,6 +219,56 @@ button.primary:hover {
   color: var(--accent);
 }
 
+.export-wrap {
+  position: relative;
+}
+
+.header-btn {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 4px 10px;
+  background: var(--bg);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.header-btn:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+
+.export-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px;
+  min-width: 100px;
+  z-index: 15;
+  box-shadow: 0 4px 12px rgba(0,0,0,.3);
+}
+
+.export-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.export-menu button:hover {
+  background: var(--bg);
+  color: var(--accent);
+}
+
 .format-badge {
   margin: 8px 14px 0;
   padding: 6px 10px;
@@ -362,6 +412,89 @@ button.primary:hover {
 
 #graph-view {
   overflow: hidden;
+}
+
+.chain-tooltip {
+  position: absolute;
+  z-index: 20;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  max-width: 280px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.4);
+  pointer-events: none;
+  line-height: 1.4;
+}
+
+.chain-tooltip .tt-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.chain-tooltip .tt-meta {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-bottom: 6px;
+}
+
+.chain-tooltip .tt-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.chain-tooltip .tt-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.chain-tooltip .tt-stat-accept { background: var(--accept-bg); color: #4ade80; }
+.chain-tooltip .tt-stat-drop   { background: var(--drop-bg);   color: #fff; }
+.chain-tooltip .tt-stat-reject { background: var(--reject-bg); color: var(--reject); }
+.chain-tooltip .tt-stat-jump   { background: var(--bg); color: var(--accent); border: 1px dashed var(--accent); }
+.chain-tooltip .tt-stat-other  { background: var(--bg); color: var(--text-dim); }
+
+.chain-tooltip .tt-comments-title {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-top: 4px;
+  margin-bottom: 2px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+.chain-tooltip .tt-comment {
+  color: var(--text);
+  font-style: italic;
+  padding-left: 8px;
+  position: relative;
+}
+
+.chain-tooltip .tt-comment::before {
+  content: "#";
+  position: absolute;
+  left: 0;
+  color: var(--text-dim);
+  font-style: normal;
+}
+
+.chain-tooltip .tt-more {
+  color: var(--text-dim);
+  font-size: 10px;
+  font-style: italic;
+  margin-top: 2px;
 }
 
 #graph {

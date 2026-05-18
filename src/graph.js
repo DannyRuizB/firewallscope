@@ -33,7 +33,83 @@
       switchToTableAndScrollTo(data.tableName, data.chainName);
     });
 
+    cyInstance.on('mouseover', 'node[type = "chain"]', (e) => {
+      showTooltip(e.target);
+    });
+    cyInstance.on('mouseout', 'node[type = "chain"]', () => {
+      hideTooltip();
+    });
+    cyInstance.on('pan zoom', () => {
+      hideTooltip();
+    });
+
     window.FirewallScope.cy = cyInstance;
+  }
+
+  function showTooltip(node) {
+    const tt = document.getElementById('chain-tooltip');
+    if (!tt) return;
+    const d = node.data();
+
+    let html = `<div class="tt-title">${escapeHtml(d.chainName)}</div>`;
+    const metaBits = [];
+    if (d.tableName) metaBits.push(`table ${escapeHtml(d.tableName)}${d.tableFamily ? ` [${escapeHtml(d.tableFamily)}]` : ''}`);
+    if (d.policy) metaBits.push(`policy ${escapeHtml(d.policy)}`);
+    else if (!d.builtIn) metaBits.push('user-defined');
+    if (d.hook) metaBits.push(`hook ${escapeHtml(d.hook)}`);
+    if (d.priority) metaBits.push(`priority ${escapeHtml(d.priority)}`);
+    if (metaBits.length) html += `<div class="tt-meta">${metaBits.join(' · ')}</div>`;
+
+    const stats = [];
+    if (d.accept) stats.push(`<span class="tt-stat tt-stat-accept">${d.accept} ACCEPT</span>`);
+    if (d.drop)   stats.push(`<span class="tt-stat tt-stat-drop">${d.drop} DROP</span>`);
+    if (d.reject) stats.push(`<span class="tt-stat tt-stat-reject">${d.reject} REJECT</span>`);
+    if (d.jump)   stats.push(`<span class="tt-stat tt-stat-jump">${d.jump} jump</span>`);
+    if (d.other)  stats.push(`<span class="tt-stat tt-stat-other">${d.other} other</span>`);
+    if (stats.length) html += `<div class="tt-stats">${stats.join('')}</div>`;
+    else html += `<div class="tt-meta">(no rules)</div>`;
+
+    const comments = d.comments || [];
+    if (comments.length) {
+      html += `<div class="tt-comments-title">Comments</div>`;
+      for (const c of comments.slice(0, 5)) {
+        html += `<div class="tt-comment">${escapeHtml(c)}</div>`;
+      }
+      if (comments.length > 5) {
+        html += `<div class="tt-more">…and ${comments.length - 5} more</div>`;
+      }
+    }
+
+    tt.innerHTML = html;
+
+    const bb = node.renderedBoundingBox();
+    const view = document.getElementById('graph-view');
+    const viewW = view.clientWidth;
+    const viewH = view.clientHeight;
+    tt.hidden = false;
+    const tw = tt.offsetWidth;
+    const th = tt.offsetHeight;
+
+    let left = bb.x2 + 12;
+    let top  = bb.y1;
+    if (left + tw > viewW - 10) left = Math.max(10, bb.x1 - tw - 12);
+    if (top + th > viewH - 10)  top  = Math.max(10, viewH - th - 10);
+    tt.style.left = `${left}px`;
+    tt.style.top  = `${top}px`;
+  }
+
+  function hideTooltip() {
+    const tt = document.getElementById('chain-tooltip');
+    if (tt) tt.hidden = true;
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   function buildElements(result) {
@@ -58,6 +134,7 @@
         const policyText = chain.policy ? ` · policy ${chain.policy}` : (chain.builtIn ? '' : ' · user');
         const ruleSummary = `${chain.rules.length} rule${chain.rules.length !== 1 ? 's' : ''}`;
         const label = `${chain.name}\n${ruleSummary}${policyText}`;
+        const comments = chain.rules.map(r => r.comment).filter(Boolean);
         elements.push({
           data: {
             id: chainId,
@@ -69,11 +146,14 @@
             tableFamily: table.family || null,
             policy: chain.policy,
             builtIn: chain.builtIn,
+            hook: chain.hook || null,
+            priority: chain.priority || null,
             accept: stats.accept,
             drop: stats.drop,
             reject: stats.reject,
             jump: stats.jump,
-            other: stats.other
+            other: stats.other,
+            comments
           }
         });
       }
@@ -365,7 +445,36 @@
     return String(s).replace(/(["\\])/g, '\\$1');
   }
 
+  function exportGraph(format) {
+    if (!cyInstance) return;
+    if (format === 'png') {
+      const blob = cyInstance.png({ bg: '#0f172a', full: true, scale: 2, output: 'blob' });
+      downloadBlob(blob, 'firewallscope.png');
+      return;
+    }
+    if (format === 'svg') {
+      if (typeof cyInstance.svg !== 'function') {
+        console.error('SVG export plugin not loaded (cytoscape-svg).');
+        return;
+      }
+      const svgText = cyInstance.svg({ scale: 1, full: true, bg: '#0f172a' });
+      downloadBlob(new Blob([svgText], { type: 'image/svg+xml' }), 'firewallscope.svg');
+    }
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   window.FirewallScope = window.FirewallScope || {};
   window.FirewallScope.renderGraph = renderGraph;
   window.FirewallScope.renderTable = renderTable;
+  window.FirewallScope.exportGraph = exportGraph;
 })();

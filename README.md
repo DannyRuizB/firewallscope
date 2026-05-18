@@ -6,7 +6,7 @@
 
 ![FirewallScope on the iptables sample: the graph view renders the filter and nat tables as dashed compound boxes; built-in chains are colour-coded by policy (INPUT and FORWARD red for DROP, OUTPUT and the four nat chains green for ACCEPT), user-defined chains (DOCKER-USER, WEB, DOCKER) carry a dashed red border, and the jump edges between chains show a 2x counter where INPUT jumps to WEB on both port 80 and 443.](screenshots/screenshot.png)
 
-🟠 **v0.1.0** — early alpha. The four parsers and the structural view are in. The "trace a packet" view is on the roadmap.
+🟠 **v0.2.0** — early alpha. Four parsers, structural view, chain tooltips with action distribution and comments, PNG / SVG export. The "trace a packet" view is still on the roadmap.
 
 ---
 
@@ -66,7 +66,7 @@ Both views are derived from the same model, so swapping is instant.
 FirewallScope's direction: cover the common firewall surfaces and gradually add views that turn the same model into different lenses (structure, flow, diff).
 
 - [x] **v0.1** — Four parsers (iptables / ip6tables / nftables / ufw), format auto-detection with manual override, structural graph view, table view, paste / upload / drag & drop input, four realistic samples.
-- [ ] **v0.2** — `--comment` extraction surfaced on the graph as node sub-labels, hover tooltips on chains showing the action distribution (X ACCEPT / Y DROP / Z jump), export graph as PNG / SVG.
+- [x] **v0.2** — Hover a chain in the graph to get an enriched tooltip with the action distribution (X ACCEPT / Y DROP / Z jump / other) and the `--comment` values found in its rules (truncated to 5). Export the graph as **PNG** (2× scale) or **SVG** (vector, editable in Inkscape / Figma) from the ⤓ button in the graph header.
 - [ ] **v0.3** — Diff view: paste two rulesets and see what rules were added / removed / reordered between them, colour-coded.
 - [ ] **v0.4** — Linter pass: flag common smells (overly permissive `0.0.0.0/0 ACCEPT`, exposed admin ports like 22 / 3306 open to Anywhere, missing default `DROP` policy on INPUT, conflicting rules where a later one is shadowed by an earlier one).
 - [ ] **v0.5** — *Trace a packet* view: type a packet description (`tcp from 10.0.0.5 to host:22`) and FirewallScope walks the chains rule by rule, highlighting the path through the graph and the final verdict.

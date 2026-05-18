@@ -96,12 +96,40 @@
     tabGraph.addEventListener('click', () => switchTab('graph'));
     tabTable.addEventListener('click', () => switchTab('table'));
 
+    const exportWrap   = document.getElementById('export-wrap');
+    const exportToggle = document.getElementById('export-toggle');
+    const exportMenu   = document.getElementById('export-menu');
+
+    exportToggle.addEventListener('click', () => {
+      const open = exportMenu.hidden;
+      exportMenu.hidden = !open;
+      exportToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    exportMenu.querySelectorAll('button[data-format]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        exportMenu.hidden = true;
+        exportToggle.setAttribute('aria-expanded', 'false');
+        window.FirewallScope.exportGraph(btn.dataset.format);
+      });
+    });
+    document.addEventListener('click', (e) => {
+      if (!exportMenu.hidden && !e.target.closest('.export-wrap')) {
+        exportMenu.hidden = true;
+        exportToggle.setAttribute('aria-expanded', 'false');
+      }
+    });
+
     function switchTab(which) {
       const isGraph = which === 'graph';
       tabGraph.classList.toggle('active', isGraph);
       tabTable.classList.toggle('active', !isGraph);
       graphView.hidden = !isGraph;
       tableView.hidden = isGraph;
+      exportWrap.hidden = !isGraph;
+      if (!isGraph) {
+        exportMenu.hidden = true;
+        exportToggle.setAttribute('aria-expanded', 'false');
+      }
       if (isGraph && lastResult && window.FirewallScope.renderGraph) {
         window.FirewallScope.renderGraph(lastResult);
       }

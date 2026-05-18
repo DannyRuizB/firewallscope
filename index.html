@@ -68,9 +68,17 @@
           <span><i class="dot rule-drop"></i>DROP</span>
           <span><i class="dot rule-other"></i>other</span>
         </div>
+        <div class="export-wrap" id="export-wrap">
+          <button id="export-toggle" class="header-btn" type="button" aria-haspopup="true" aria-expanded="false" title="Download graph">⤓</button>
+          <div id="export-menu" class="export-menu" hidden>
+            <button type="button" data-format="png">PNG</button>
+            <button type="button" data-format="svg">SVG</button>
+          </div>
+        </div>
       </div>
       <div id="graph-view" class="view-container">
         <div id="graph"></div>
+        <div id="chain-tooltip" class="chain-tooltip" hidden></div>
         <div id="graph-empty" class="empty-state">Paste a ruleset and click <b>Analyze</b> to see the graph.</div>
       </div>
       <div id="table-view" class="view-container" hidden>
@@ -81,7 +89,7 @@
   </main>
 
   <footer class="bottombar">
-    <span>v0.1.0</span>
+    <span>v0.2.0</span>
     <span>·</span>
     <span>MIT</span>
     <span>·</span>
@@ -91,6 +99,7 @@
   <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape-svg@0.4.0/cytoscape-svg.js"></script>
   <script src="src/parsers/iptables.js"></script>
   <script src="src/parsers/ip6tables.js"></script>
   <script src="src/parsers/nftables.js"></script>

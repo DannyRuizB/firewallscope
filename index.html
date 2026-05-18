@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FirewallScope — visual analyzer for iptables, nftables and UFW</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⛨</span>
+      <h1>FirewallScope</h1>
+      <span class="tag">visual analyzer for <code>iptables</code> · <code>nftables</code> · <code>ufw</code></span>
+    </div>
+    <a class="repo-link" href="https://github.com/DannyRuizB/firewallscope" target="_blank" rel="noopener">GitHub</a>
+  </header>
+
+  <main class="layout">
+    <section class="input-pane">
+      <div class="pane-header">
+        <h2>Input</h2>
+        <div class="actions">
+          <div class="sample-wrap">
+            <button id="load-sample" class="sample-toggle" type="button" aria-haspopup="true" aria-expanded="false">Load sample ▾</button>
+            <div id="sample-menu" class="sample-menu" hidden>
+              <button type="button" data-sample="iptables">iptables-save (IPv4)</button>
+              <button type="button" data-sample="ip6tables">ip6tables-save (IPv6)</button>
+              <button type="button" data-sample="nftables">nft list ruleset</button>
+              <button type="button" data-sample="ufw">ufw status verbose</button>
+            </div>
+          </div>
+          <button id="upload" type="button">Upload</button>
+          <select id="format-override" title="Auto-detected unless overridden">
+            <option value="auto">Auto-detect</option>
+            <option value="iptables">iptables-save</option>
+            <option value="ip6tables">ip6tables-save</option>
+            <option value="nftables">nft list ruleset</option>
+            <option value="ufw">ufw status verbose</option>
+          </select>
+          <button id="analyze" type="button" class="primary">Analyze</button>
+        </div>
+      </div>
+      <input id="file-input" type="file" accept=".txt,.conf,text/plain" hidden />
+      <div id="format-badge" class="format-badge" hidden></div>
+      <div class="textarea-wrap">
+        <textarea
+          id="ruleset-input"
+          spellcheck="false"
+          placeholder="Paste output of `iptables-save`, `ip6tables-save`, `nft list ruleset`, or `ufw status verbose` here.&#10;Or drop a file. Or click Load sample to try one."
+        ></textarea>
+        <div id="drop-overlay" class="drop-overlay" hidden>Drop ruleset file here</div>
+      </div>
+      <div id="parse-error" class="error" hidden></div>
+      <div id="parse-warnings" class="warnings" hidden></div>
+    </section>
+
+    <section class="output-pane">
+      <div class="pane-header tabs-header">
+        <div class="tabs">
+          <button id="tab-graph" class="tab active" type="button">Graph</button>
+          <button id="tab-table" class="tab" type="button">Table</button>
+        </div>
+        <div class="legend">
+          <span><i class="dot table-node"></i>table</span>
+          <span><i class="dot chain-node"></i>chain</span>
+          <span><i class="dot rule-accept"></i>ACCEPT</span>
+          <span><i class="dot rule-drop"></i>DROP</span>
+          <span><i class="dot rule-other"></i>other</span>
+        </div>
+      </div>
+      <div id="graph-view" class="view-container">
+        <div id="graph"></div>
+        <div id="graph-empty" class="empty-state">Paste a ruleset and click <b>Analyze</b> to see the graph.</div>
+      </div>
+      <div id="table-view" class="view-container" hidden>
+        <div id="table-content"></div>
+        <div id="table-empty" class="empty-state">Paste a ruleset and click <b>Analyze</b> to see the rules table.</div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="bottombar">
+    <span>v0.1.0</span>
+    <span>·</span>
+    <span>MIT</span>
+    <span>·</span>
+    <span>Built by <a href="https://github.com/DannyRuizB" target="_blank" rel="noopener">DannyRuizB</a></span>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+  <script src="src/parsers/iptables.js"></script>
+  <script src="src/parsers/ip6tables.js"></script>
+  <script src="src/parsers/nftables.js"></script>
+  <script src="src/parsers/ufw.js"></script>
+  <script src="src/parser.js"></script>
+  <script src="src/graph.js"></script>
+  <script src="src/app.js"></script>
+</body>
+</html>

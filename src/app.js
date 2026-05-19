@@ -255,6 +255,7 @@
         diffSummary.innerHTML =
           `Diff: <span class="badge badge-added">+${d.addedRules}</span> added, ` +
           `<span class="badge badge-removed">−${d.removedRules}</span> removed, ` +
+          `<span class="badge badge-moved">⇅${d.movedRules || 0}</span> moved, ` +
           `<span class="badge badge-same">=${d.sameRules}</span> unchanged · ` +
           `<span class="badge badge-added">+${d.addedChains}</span> chains, ` +
           `<span class="badge badge-removed">−${d.removedChains}</span> chains`;

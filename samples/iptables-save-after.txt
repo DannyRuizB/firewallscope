@@ -8,10 +8,10 @@
 :RATELIMIT - [0:0]
 -A INPUT -i lo -j ACCEPT
 -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
--A INPUT -p icmp -j ACCEPT
 -A INPUT -p tcp -m tcp --dport 22 -j RATELIMIT
 -A INPUT -p tcp -m tcp --dport 80 -j WEB
 -A INPUT -p tcp -m tcp --dport 443 -j WEB
+-A INPUT -p icmp -j ACCEPT
 -A INPUT -s 10.0.0.0/8 -p tcp -m tcp --dport 8006 -m comment --comment "proxmox vpn" -j ACCEPT
 -A INPUT -j LOG --log-prefix "DROP-INPUT: "
 -A INPUT -j DROP

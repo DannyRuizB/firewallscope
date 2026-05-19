@@ -458,6 +458,29 @@ button.active {
 .tbl-chain-state.added   { background: var(--accept-bg); color: #4ade80; }
 .tbl-chain-state.removed { background: var(--drop-bg); color: #fff; }
 
+.tbl-rules tr.diff-moved td {
+  background: rgba(59,130,246,.10);
+  border-left: 3px solid #3b82f6;
+}
+.tbl-rules tr.diff-moved .col-num::before {
+  content: "~ ";
+  color: #3b82f6;
+  font-weight: 700;
+}
+.move-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(59,130,246,.18);
+  color: #93c5fd;
+  font-family: var(--mono);
+  vertical-align: middle;
+}
+.diff-banner .badge-moved { background: rgba(59,130,246,.18); color: #93c5fd; }
+
 /* ── output pane ────────────────────────────────── */
 
 .tabs-header { gap: 16px; }

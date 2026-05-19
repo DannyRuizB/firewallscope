@@ -177,7 +177,7 @@
         let hasInnerDiff = false;
         if (chainDiff === 'same' && Array.isArray(chain.rules)) {
           for (const r of chain.rules) {
-            if (r.diffState === 'added' || r.diffState === 'removed') { hasInnerDiff = true; break; }
+            if (r.diffState === 'added' || r.diffState === 'removed' || r.diffState === 'moved') { hasInnerDiff = true; break; }
           }
         }
         const diffState = chainDiff === 'same' && hasInnerDiff ? 'changed' : chainDiff;
@@ -466,6 +466,7 @@
       const tr = document.createElement('tr');
       if (rule.diffState === 'added')   tr.classList.add('diff-added');
       if (rule.diffState === 'removed') tr.classList.add('diff-removed');
+      if (rule.diffState === 'moved')   tr.classList.add('diff-moved');
 
       const tdNum = document.createElement('td');
       tdNum.className = 'col-num';
@@ -475,6 +476,15 @@
       const tdMatch = document.createElement('td');
       tdMatch.className = 'col-match';
       tdMatch.textContent = rule.match || '(any)';
+      if (rule.diffState === 'moved' && typeof rule.movedDelta === 'number' && rule.movedDelta !== 0) {
+        const badge = document.createElement('span');
+        badge.className = 'move-badge';
+        const arrow = rule.movedDelta < 0 ? '↑' : '↓';
+        badge.textContent = `moved ${arrow}${Math.abs(rule.movedDelta)}`;
+        badge.title = `was at position ${rule.movedFrom + 1}, now at ${rule.movedTo + 1}`;
+        tdMatch.appendChild(document.createTextNode(' '));
+        tdMatch.appendChild(badge);
+      }
       tr.appendChild(tdMatch);
 
       const tdAction = document.createElement('td');

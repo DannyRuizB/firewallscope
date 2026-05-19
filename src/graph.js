@@ -8,7 +8,7 @@
 
   let cyInstance = null;
 
-  function renderGraph(result, lintReport) {
+  function renderGraph(result, lintReport, traceReport) {
     const container = document.getElementById('graph');
     if (!container) return;
 
@@ -17,7 +17,7 @@
       cyInstance = null;
     }
 
-    const elements = buildElements(result, lintReport);
+    const elements = buildElements(result, lintReport, traceReport);
     if (!elements.length) return;
 
     cyInstance = cytoscape({
@@ -149,10 +149,13 @@
       .replace(/'/g, '&#39;');
   }
 
-  function buildElements(result, lintReport) {
+  function buildElements(result, lintReport, traceReport) {
     const elements = [];
     const chainIdSet = new Set();
     const byKey = (lintReport && lintReport.byKey) || {};
+    const visitedChains = new Set((traceReport && traceReport.visitedChains) || []);
+    const jumpedEdges = new Set((traceReport && traceReport.jumpedEdges) || []);
+    const finalRule = traceReport && traceReport.finalRule;
 
     for (const table of result.tables) {
       const tableId = `t:${table.name}${table.family ? '@' + table.family : ''}`;
@@ -184,6 +187,9 @@
           }
         }
         const diffState = chainDiff === 'same' && hasInnerDiff ? 'changed' : chainDiff;
+        const chainKey = `${table.name}::${chain.name}`;
+        const traceVisited = visitedChains.has(chainKey) ? 'yes' : null;
+        const traceFinal = (finalRule && finalRule.table === table.name && finalRule.chain === chain.name) ? 'yes' : null;
 
         elements.push({
           data: {
@@ -204,6 +210,8 @@
             jump: stats.jump,
             other: stats.other,
             comments,
+            traceVisited,
+            traceFinal,
             diffState
           }
         });
@@ -223,13 +231,16 @@
         for (const [target, count] of Object.entries(jumpCount)) {
           const targetId = `${tableId}::${target}`;
           if (!chainIdSet.has(targetId)) continue;
+          const edgeTraceKey = `${table.name}::${chain.name}->${table.name}::${target}`;
+          const traceOnPath = jumpedEdges.has(edgeTraceKey) ? 'yes' : null;
           elements.push({
             data: {
               id: `e:${srcId}->${targetId}`,
               source: srcId,
               target: targetId,
               label: count > 1 ? `${count}×` : '',
-              type: 'jump'
+              type: 'jump',
+              traceOnPath
             }
           });
         }
@@ -367,6 +378,32 @@
           'border-color': '#f59e0b',
           'border-style': 'solid',
           'border-width': 3
+        }
+      },
+      {
+        selector: 'node[type = "chain"][traceVisited = "yes"]',
+        style: {
+          'border-color': '#3b82f6',
+          'border-style': 'solid',
+          'border-width': 3,
+          'background-color': '#1e3a8a',
+          'color': '#bfdbfe'
+        }
+      },
+      {
+        selector: 'node[type = "chain"][traceFinal = "yes"]',
+        style: {
+          'border-color': '#60a5fa',
+          'border-width': 5
+        }
+      },
+      {
+        selector: 'edge[traceOnPath = "yes"]',
+        style: {
+          'line-color': '#3b82f6',
+          'target-arrow-color': '#3b82f6',
+          'width': 4,
+          'opacity': 1
         }
       },
       {

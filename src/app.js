@@ -19,6 +19,7 @@
 
   let lastResult = null;
   let lastLintReport = null;
+  let lastTraceReport = null;
 
   document.addEventListener('DOMContentLoaded', () => {
     const textarea     = document.getElementById('ruleset-input');
@@ -36,12 +37,29 @@
     const tabTable     = document.getElementById('tab-table');
     const tabLint      = document.getElementById('tab-lint');
     const tabLintBadge = document.getElementById('lint-tab-badge');
+    const tabTrace     = document.getElementById('tab-trace');
     const graphView    = document.getElementById('graph-view');
     const tableView    = document.getElementById('table-view');
     const lintView     = document.getElementById('lint-view');
     const lintContent  = document.getElementById('lint-content');
     const lintEmpty    = document.getElementById('lint-empty');
     const lintClean    = document.getElementById('lint-clean');
+    const traceView    = document.getElementById('trace-view');
+    const traceEmpty   = document.getElementById('trace-empty');
+    const traceUI      = document.getElementById('trace-ui');
+    const traceForm    = document.getElementById('trace-form');
+    const traceProto   = document.getElementById('trace-proto');
+    const traceState   = document.getElementById('trace-state');
+    const traceSrc     = document.getElementById('trace-src');
+    const traceSport   = document.getElementById('trace-sport');
+    const traceDst     = document.getElementById('trace-dst');
+    const traceDport   = document.getElementById('trace-dport');
+    const traceClear   = document.getElementById('trace-clear');
+    const traceResult  = document.getElementById('trace-result');
+    const traceVerdict = document.getElementById('trace-verdict');
+    const traceFinal   = document.getElementById('trace-final');
+    const traceWarnings= document.getElementById('trace-warnings');
+    const traceSteps   = document.getElementById('trace-steps');
     const graphEmpty   = document.getElementById('graph-empty');
     const tableEmpty   = document.getElementById('table-empty');
     const compareToggle = document.getElementById('compare-toggle');
@@ -130,6 +148,24 @@
     tabGraph.addEventListener('click', () => switchTab('graph'));
     tabTable.addEventListener('click', () => switchTab('table'));
     tabLint .addEventListener('click', () => switchTab('lint'));
+    tabTrace.addEventListener('click', () => switchTab('trace'));
+
+    traceForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      runTrace();
+    });
+    traceClear.addEventListener('click', () => {
+      traceForm.reset();
+      traceProto.value = 'tcp';
+      traceState.value = 'NEW';
+      traceResult.hidden = true;
+      lastTraceReport = null;
+      window.FirewallScope.traceReport = null;
+      // Re-render graph without highlight
+      if (lastResult && !graphView.hidden) {
+        window.FirewallScope.renderGraph(lastResult, lastLintReport, null);
+      }
+    });
 
     const exportWrap   = document.getElementById('export-wrap');
     const exportToggle = document.getElementById('export-toggle');
@@ -158,19 +194,22 @@
       const isGraph = which === 'graph';
       const isTable = which === 'table';
       const isLint  = which === 'lint';
+      const isTrace = which === 'trace';
       tabGraph.classList.toggle('active', isGraph);
       tabTable.classList.toggle('active', isTable);
       tabLint .classList.toggle('active', isLint);
+      tabTrace.classList.toggle('active', isTrace);
       graphView.hidden = !isGraph;
       tableView.hidden = !isTable;
       lintView .hidden = !isLint;
+      traceView.hidden = !isTrace;
       exportWrap.hidden = !isGraph;
       if (!isGraph) {
         exportMenu.hidden = true;
         exportToggle.setAttribute('aria-expanded', 'false');
       }
       if (isGraph && lastResult && window.FirewallScope.renderGraph) {
-        window.FirewallScope.renderGraph(lastResult);
+        window.FirewallScope.renderGraph(lastResult, lastLintReport, lastTraceReport);
       }
     }
 
@@ -299,10 +338,110 @@
       renderLintTab(lintReport, isDiff);
       window.FirewallScope.lintReport = lintReport;
 
+      // Trace tab: a fresh analyze invalidates any previous trace.
+      lastTraceReport = null;
+      window.FirewallScope.traceReport = null;
+      traceResult.hidden = true;
+      if (isDiff) {
+        traceEmpty.hidden = false;
+        traceEmpty.textContent = 'Trace is disabled in diff mode. Exit the diff to trace a single ruleset.';
+        traceUI.hidden = true;
+      } else {
+        traceEmpty.hidden = true;
+        traceUI.hidden = false;
+      }
+
       if (!graphView.hidden) {
-        window.FirewallScope.renderGraph(result, lintReport);
+        window.FirewallScope.renderGraph(result, lintReport, null);
       }
       window.FirewallScope.renderTable(result, lintReport);
+    }
+
+    function runTrace() {
+      if (!lastResult) return;
+      const packet = {
+        protocol: traceProto.value,
+        source: traceSrc.value.trim() || undefined,
+        destination: traceDst.value.trim() || undefined,
+        dport: traceDport.value ? +traceDport.value : undefined,
+        sport: traceSport.value ? +traceSport.value : undefined,
+        state: traceState.value || undefined
+      };
+      const report = window.FirewallScope.trace(lastResult, packet);
+      lastTraceReport = report;
+      window.FirewallScope.traceReport = report;
+      renderTraceResult(report, packet);
+      // Re-render graph with the path highlighted so the Graph tab reflects the new trace.
+      if (lastResult) {
+        window.FirewallScope.renderGraph(lastResult, lastLintReport, report);
+      }
+    }
+
+    function renderTraceResult(report, packet) {
+      traceResult.hidden = false;
+      if (report.error) {
+        traceVerdict.className = 'trace-verdict v-NO_MATCH';
+        traceVerdict.textContent = 'ERROR';
+        traceFinal.textContent = report.error;
+        traceWarnings.hidden = true;
+        traceSteps.innerHTML = '';
+        return;
+      }
+      const v = report.verdict || 'NO_MATCH';
+      traceVerdict.className = 'trace-verdict v-' + v;
+      traceVerdict.textContent = v;
+      const pktBits = [];
+      pktBits.push(`<span class="code">${escapeHtml(packet.protocol)}</span>`);
+      if (packet.source)      pktBits.push(`from <span class="code">${escapeHtml(packet.source)}</span>`);
+      if (packet.sport)       pktBits.push(`:<span class="code">${packet.sport}</span>`);
+      if (packet.destination) pktBits.push(`to <span class="code">${escapeHtml(packet.destination)}</span>`);
+      if (packet.dport)       pktBits.push(`:<span class="code">${packet.dport}</span>`);
+      if (packet.state)       pktBits.push(`state=<span class="code">${escapeHtml(packet.state)}</span>`);
+      let finalLine = `Packet: ${pktBits.join(' ')}`;
+      if (report.finalRule) {
+        const r = report.finalRule;
+        finalLine += ` &nbsp;·&nbsp; decided by <span class="code">${escapeHtml(r.table)}/${escapeHtml(r.chain)}</span>`;
+        finalLine += r.ruleIdx == null ? ' (chain policy)' : ` rule <span class="code">#${r.ruleIdx + 1}</span>`;
+      }
+      traceFinal.innerHTML = finalLine;
+
+      if (report.warnings && report.warnings.length) {
+        traceWarnings.hidden = false;
+        traceWarnings.innerHTML = report.warnings.map(w => `<span class="w">⚠ ${escapeHtml(w)}</span>`).join('');
+      } else {
+        traceWarnings.hidden = true;
+      }
+
+      traceSteps.innerHTML = '';
+      for (const s of report.steps) {
+        const li = document.createElement('li');
+        li.className = 'k-' + s.type;
+        const kind = document.createElement('span'); kind.className = 'kind'; kind.textContent = s.type;
+        const where = document.createElement('span'); where.className = 'where';
+        if (s.table && s.chain) {
+          where.textContent = `${s.table}/${s.chain}` + (s.ruleIdx != null ? ` #${s.ruleIdx + 1}` : '');
+        }
+        const body = document.createElement('span'); body.className = 'body';
+        if (s.type === 'enter-chain') body.textContent = `entering chain ${s.chain}`;
+        else if (s.type === 'match')   body.textContent = `MATCH · ${s.action} · ${shorten(s.ruleRaw)}`;
+        else if (s.type === 'no-match')body.textContent = `${shorten(s.ruleRaw)}`;
+        else if (s.type === 'skip')    body.textContent = `SKIP — ${s.reason} · ${shorten(s.ruleRaw)}`;
+        else if (s.type === 'jump')    body.textContent = `jump → ${s.jumpedTo}`;
+        else if (s.type === 'return')  body.textContent = s.reason ? `return (${s.reason})` : 'return';
+        else if (s.type === 'policy')  body.textContent = `fell through → policy ${s.action}${s.reason ? ' (' + s.reason + ')' : ''}`;
+        else if (s.type === 'log')     body.textContent = `${s.action} (non-terminal, continues)`;
+        else if (s.type === 'verdict') body.textContent = `final verdict: ${s.action}`;
+        else                           body.textContent = JSON.stringify(s);
+        li.appendChild(kind);
+        li.appendChild(where);
+        li.appendChild(body);
+        traceSteps.appendChild(li);
+      }
+    }
+
+    function shorten(s) {
+      const str = String(s || '');
+      return str.length > 120 ? str.slice(0, 117) + '…' : str;
     }
 
     function renderLintTab(report, isDiff) {

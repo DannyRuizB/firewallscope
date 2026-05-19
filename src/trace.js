@@ -1,0 +1,265 @@
+// FirewallScope trace-a-packet — simulates how a single packet flows through
+// the INPUT chain of the filter table, returns the verdict and a step-by-step
+// log of which rules matched, which were skipped, which jumps were taken.
+// Strictly client-side, single chain entry point for v0.5; FORWARD / OUTPUT
+// and the full PREROUTING/mangle/raw pipeline are out of scope.
+(function () {
+  'use strict';
+
+  const MAX_DEPTH = 50;
+
+  function trace(result, packet) {
+    const report = {
+      verdict: null,
+      finalRule: null,
+      steps: [],
+      visitedChains: [],   // ordered list of "table::chain" strings
+      jumpedEdges: [],     // ordered list of "table::from -> table::to" strings
+      warnings: [],
+      error: null
+    };
+    if (!result || !result.tables || result.error) {
+      report.error = (result && result.error) || 'no parsed ruleset';
+      return report;
+    }
+
+    const filterTable = result.tables.find(t => isFilterTableName(t.name));
+    if (!filterTable) {
+      report.error = 'No filter table found — nothing to trace against.';
+      return report;
+    }
+    const inputChain = filterTable.chains.find(c => isInputChain(c, result.format));
+    if (!inputChain) {
+      report.error = `Filter table has no INPUT-like chain (built-in with hook input).`;
+      return report;
+    }
+
+    const visitedSet = new Set();
+    const finalVerdict = evaluateChain(filterTable, inputChain, packet, 0, report, visitedSet, result.format);
+    report.verdict = finalVerdict.kind === 'RETURN' ? 'NO_MATCH' : finalVerdict.kind;
+    if (finalVerdict.table) {
+      report.finalRule = { table: finalVerdict.table, chain: finalVerdict.chain, ruleIdx: finalVerdict.ruleIdx };
+    }
+    report.steps.push({ type: 'verdict', action: report.verdict });
+    return report;
+  }
+
+  function evaluateChain(table, chain, packet, depth, report, visitedSet, format) {
+    if (depth > MAX_DEPTH) {
+      report.warnings.push(`Recursion limit reached at ${chain.name}; aborting trace.`);
+      return { kind: 'DROP', table: table.name, chain: chain.name, ruleIdx: null };
+    }
+    const chainKey = `${table.name}::${chain.name}`;
+    if (!visitedSet.has(chainKey)) {
+      visitedSet.add(chainKey);
+      report.visitedChains.push(chainKey);
+    }
+    report.steps.push({ type: 'enter-chain', table: table.name, chain: chain.name, depth });
+
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      const mr = matchesPacket(rule, packet);
+      if (mr.skipped) {
+        report.steps.push({
+          type: 'skip',
+          table: table.name, chain: chain.name, ruleIdx: i,
+          ruleRaw: rule.raw, reason: mr.reason, depth
+        });
+        report.warnings.push(`${chain.name} rule #${i + 1} skipped — ${mr.reason}`);
+        continue;
+      }
+      if (!mr.matched) {
+        report.steps.push({
+          type: 'no-match',
+          table: table.name, chain: chain.name, ruleIdx: i,
+          ruleRaw: rule.raw, depth
+        });
+        continue;
+      }
+
+      const actionRaw = rule.action || '';
+      const action = String(actionRaw).toUpperCase();
+      report.steps.push({
+        type: 'match',
+        table: table.name, chain: chain.name, ruleIdx: i,
+        ruleRaw: rule.raw, action, depth
+      });
+
+      if (action === 'ACCEPT' || action === 'DROP' || action === 'REJECT') {
+        return { kind: action, table: table.name, chain: chain.name, ruleIdx: i };
+      }
+      if (action === 'RETURN') {
+        return { kind: 'RETURN', table: table.name, chain: chain.name, ruleIdx: i };
+      }
+      if (rule.isJumpToChain) {
+        // The target chain name lives in rule.action (original case);
+        // rule.actionDetail is the leftover argument string after "-j NAME"
+        // and is irrelevant for the trace.
+        const targetName = actionRaw;
+        const targetChain = table.chains.find(c => c.name === targetName);
+        if (!targetChain) {
+          report.warnings.push(`Jump target ${targetName} not found in table ${table.name}; treating as continue.`);
+          continue;
+        }
+        const edgeKey = `${chainKey}->${table.name}::${targetName}`;
+        report.jumpedEdges.push(edgeKey);
+        report.steps.push({ type: 'jump', table: table.name, chain: chain.name, ruleIdx: i, jumpedTo: targetName, depth });
+        const sub = evaluateChain(table, targetChain, packet, depth + 1, report, visitedSet, format);
+        if (sub.kind === 'ACCEPT' || sub.kind === 'DROP' || sub.kind === 'REJECT') return sub;
+        // RETURN (or fall-through, which we also map to RETURN below): continue evaluating the current chain at i+1.
+        continue;
+      }
+      // Non-terminal action (LOG, NFLOG, MARK, COUNTER, MASQUERADE in nat, …): record and continue.
+      // We deliberately don't whitelist — anything we don't recognise as terminal is treated as continue.
+      report.steps.push({ type: 'log', table: table.name, chain: chain.name, ruleIdx: i, action, depth });
+    }
+
+    // Chain reached the end without a verdict.
+    if (chain.builtIn !== false) {
+      const policy = String(chain.policy || '').toUpperCase();
+      if (policy === 'ACCEPT' || policy === 'DROP' || policy === 'REJECT') {
+        report.steps.push({ type: 'policy', table: table.name, chain: chain.name, action: policy, depth });
+        return { kind: policy, table: table.name, chain: chain.name, ruleIdx: null };
+      }
+      // No explicit policy on a built-in chain → default to ACCEPT (iptables built-in default).
+      report.steps.push({ type: 'policy', table: table.name, chain: chain.name, action: 'ACCEPT', depth, reason: 'no explicit policy, defaulting to ACCEPT' });
+      return { kind: 'ACCEPT', table: table.name, chain: chain.name, ruleIdx: null };
+    }
+    // User-defined chain fell through → implicit RETURN.
+    report.steps.push({ type: 'return', table: table.name, chain: chain.name, reason: 'end-of-chain', depth });
+    return { kind: 'RETURN' };
+  }
+
+  // ── match logic ────────────────────────────────────────────────────────
+
+  function matchesPacket(rule, packet) {
+    if (hasUnmodeledMatch(rule)) {
+      return { matched: false, skipped: true, reason: 'rule has matches the simulator does not model (-i / -o / -m limit / -m recent / -m mark / -m mac / -m string / nft meter)' };
+    }
+
+    const t = rule.tokens || {};
+
+    const ruleProto = normalizeProto(t.protocol || extractProtoFromRaw(rule.raw));
+    if (ruleProto && ruleProto !== (packet.protocol || '').toLowerCase()) return { matched: false };
+
+    if (t.source && !isAnyCidr(t.source)) {
+      if (!packet.source) return { matched: false, skipped: true, reason: `rule restricts source to ${t.source} but the packet has no source IP filled in` };
+      const r = ipInCidr(packet.source, t.source);
+      if (r === 'indeterminate') return { matched: false, skipped: true, reason: `source CIDR ${t.source} could not be evaluated (IPv6 arithmetic is limited in this simulator)` };
+      if (!r) return { matched: false };
+    }
+    if (t.destination && !isAnyCidr(t.destination)) {
+      if (!packet.destination) return { matched: false, skipped: true, reason: `rule restricts destination to ${t.destination} but the packet has no destination IP filled in` };
+      const r = ipInCidr(packet.destination, t.destination);
+      if (r === 'indeterminate') return { matched: false, skipped: true, reason: `destination CIDR ${t.destination} could not be evaluated` };
+      if (!r) return { matched: false };
+    }
+    if (t.dport) {
+      if (packet.dport == null || packet.dport === '') return { matched: false };
+      if (!portInExpr(+packet.dport, t.dport)) return { matched: false };
+    }
+    if (t.sport) {
+      if (packet.sport == null || packet.sport === '') return { matched: false };
+      if (!portInExpr(+packet.sport, t.sport)) return { matched: false };
+    }
+
+    const cts = ctState(rule);
+    if (cts) {
+      if (!packet.state) return { matched: false };
+      const required = cts.toUpperCase().split(',');
+      if (!required.includes(packet.state.toUpperCase())) return { matched: false };
+    }
+
+    return { matched: true };
+  }
+
+  // ── shared helpers (duplicated from linter.js to keep modules independent) ──
+
+  function isFilterTableName(name) {
+    if (!name) return true;
+    return String(name).toLowerCase() === 'filter';
+  }
+  function isInputChain(chain, format) {
+    if (format === 'nftables') return chain.builtIn && chain.hook === 'input';
+    return chain.name === 'INPUT';
+  }
+  function normalizeProto(p) {
+    if (!p) return null;
+    const s = String(p).toLowerCase().trim();
+    if (s === 'all' || s === '*') return null;
+    return s;
+  }
+  function extractProtoFromRaw(raw) {
+    const s = String(raw || '');
+    let m;
+    if ((m = s.match(/(?:^|\s)-p\s+(\S+)/)))       return m[1].toLowerCase();
+    if ((m = s.match(/\bmeta\s+l4proto\s+(\S+)/))) return m[1].toLowerCase();
+    if ((m = s.match(/\bip6\s+nexthdr\s+(\S+)/)))  return m[1].toLowerCase();
+    if ((m = s.match(/\bip\s+protocol\s+(\S+)/)))  return m[1].toLowerCase();
+    return null;
+  }
+  function hasUnmodeledMatch(rule) {
+    const raw = String(rule.raw || '');
+    if (/(?:^|\s)-i\s+\S/.test(raw)) return true;
+    if (/(?:^|\s)-o\s+\S/.test(raw)) return true;
+    if (/\b(?:iifname|oifname|iif|oif)\s+/.test(raw)) return true;
+    if (/-m\s+(?:limit|recent|hashlimit|connlimit|owner|mark|mac|string|hexstring|set|policy|conntrack(?!\s+--ctstate))/.test(raw)) return true;
+    if (/\b(?:limit\s+rate|meter\s)/.test(raw)) return true;
+    return false;
+  }
+  function ctState(rule) {
+    const raw = String(rule.raw || '');
+    const m1 = raw.match(/-m\s+conntrack\s+--ctstate\s+([A-Z,_]+)/i) || raw.match(/--ctstate\s+([A-Z,_]+)/i);
+    if (m1) return m1[1].toUpperCase().split(',').sort().join(',');
+    const m2 = raw.match(/\bct\s+state\s+([A-Za-z,_\s]+?)(?:\s+(accept|drop|reject|return|jump|goto|log|counter|$)|$)/);
+    if (m2) return m2[1].toLowerCase().replace(/\s+/g, '').split(',').filter(Boolean).sort().join(',').toUpperCase();
+    return '';
+  }
+  function isAnyCidr(s) {
+    const v = String(s || '').trim();
+    return v === '' || v === '0.0.0.0/0' || v === '::/0' || /^any(where)?$/i.test(v);
+  }
+
+  // Returns true / false / 'indeterminate' (for v6 outside the trivial cases).
+  function ipInCidr(ip, cidr) {
+    if (!ip || !cidr) return false;
+    const cParts = String(cidr).trim();
+    if (cParts.includes(':')) {
+      // IPv6: only trivial textual equality / unspecified prefix.
+      if (cParts === '::/0') return true;
+      return ip.trim() === cParts ? true : 'indeterminate';
+    }
+    const m = cParts.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)(?:\/(\d+))?$/);
+    if (!m) return false;
+    const cVal =
+      (BigInt(+m[1]) << 24n) | (BigInt(+m[2]) << 16n) | (BigInt(+m[3]) <<  8n) | BigInt(+m[4]);
+    const bits = m[5] !== undefined ? +m[5] : 32;
+    const ipM = String(ip).trim().match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (!ipM) return 'indeterminate';
+    const iVal =
+      (BigInt(+ipM[1]) << 24n) | (BigInt(+ipM[2]) << 16n) | (BigInt(+ipM[3]) <<  8n) | BigInt(+ipM[4]);
+    if (bits === 0) return true;
+    const shift = 32n - BigInt(bits);
+    return (iVal >> shift) === (cVal >> shift);
+  }
+
+  function portInExpr(port, expr) {
+    const str = String(expr).trim();
+    const setM = str.match(/^\{([^}]+)\}$/);
+    const inner = setM ? setM[1] : str;
+    const parts = inner.includes(',') ? inner.split(',').map(s => s.trim()) : [inner];
+    for (const part of parts) {
+      const r = part.match(/^(\d+)[:\-](\d+)$/);
+      if (r) {
+        if (port >= +r[1] && port <= +r[2]) return true;
+      } else if (/^\d+$/.test(part)) {
+        if (port === +part) return true;
+      }
+    }
+    return false;
+  }
+
+  window.FirewallScope = window.FirewallScope || {};
+  window.FirewallScope.trace = trace;
+})();

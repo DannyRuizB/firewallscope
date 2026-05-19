@@ -622,6 +622,159 @@ button.active {
 }
 .tbl-chain-lint.has-error { background: rgba(220,38,38,.18); color: #fca5a5; }
 
+/* ── trace view ───────────────────────────────── */
+
+#trace-view { overflow: auto; padding: 14px 18px; }
+
+.trace-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 14px;
+}
+.trace-row {
+  display: flex;
+  gap: 14px;
+}
+.trace-row label {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--text-dim);
+}
+.trace-row input,
+.trace-row select {
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 5px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+}
+.trace-row input:focus,
+.trace-row select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.trace-actions {
+  justify-content: flex-end;
+  align-items: center;
+}
+#trace-run { padding: 6px 14px; font-size: 13px; }
+#trace-clear {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.trace-verdict {
+  display: inline-block;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 18px;
+  font-weight: 700;
+  font-family: var(--mono);
+  letter-spacing: .04em;
+  margin-bottom: 8px;
+}
+.trace-verdict.v-ACCEPT { background: var(--accept-bg); color: #4ade80; border: 1px solid var(--accept); }
+.trace-verdict.v-DROP   { background: var(--drop-bg);   color: #fff;    border: 1px solid var(--drop); }
+.trace-verdict.v-REJECT { background: rgba(245,158,11,.18); color: #fcd34d; border: 1px solid var(--warn); }
+.trace-verdict.v-NO_MATCH { background: var(--bg-elev-2); color: var(--text-dim); border: 1px solid var(--border); }
+
+#trace-final {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+#trace-final .code {
+  background: var(--bg);
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: var(--text);
+}
+
+.trace-warnings {
+  background: rgba(245,158,11,.08);
+  border-left: 3px solid var(--warn);
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--warn);
+}
+.trace-warnings .w {
+  display: block;
+  padding: 2px 0;
+}
+
+.trace-steps-title {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--text-dim);
+  margin: 12px 0 6px;
+}
+.trace-steps {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.trace-steps li {
+  padding: 4px 8px;
+  border-left: 2px solid var(--border);
+  margin-bottom: 2px;
+  display: flex;
+  gap: 8px;
+}
+.trace-steps li .kind {
+  flex: 0 0 70px;
+  font-size: 10px;
+  text-transform: uppercase;
+  font-weight: 700;
+  letter-spacing: .04em;
+  padding-top: 1px;
+}
+.trace-steps li .where {
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+.trace-steps li .body { flex: 1; color: var(--text); word-break: break-all; }
+.trace-steps li.k-match     { border-left-color: var(--accept); }
+.trace-steps li.k-match     .kind { color: #4ade80; }
+.trace-steps li.k-no-match  { color: var(--text-dim); }
+.trace-steps li.k-no-match  .kind { color: var(--text-dim); }
+.trace-steps li.k-skip      { border-left-color: var(--warn); }
+.trace-steps li.k-skip      .kind { color: #fcd34d; }
+.trace-steps li.k-jump      { border-left-color: #3b82f6; }
+.trace-steps li.k-jump      .kind { color: #93c5fd; }
+.trace-steps li.k-return    { border-left-color: #a78bfa; }
+.trace-steps li.k-return    .kind { color: #c4b5fd; }
+.trace-steps li.k-policy    { border-left-color: var(--accent); }
+.trace-steps li.k-policy    .kind { color: var(--accent); }
+.trace-steps li.k-verdict   { border-left-color: var(--accent); background: var(--bg-elev); }
+.trace-steps li.k-verdict   .kind { color: var(--accent); }
+.trace-steps li.k-enter-chain { border-left-color: var(--text-dim); }
+.trace-steps li.k-enter-chain .kind { color: var(--text-dim); }
+.trace-steps li.k-log       { border-left-color: var(--text-dim); }
+
 .legend {
   display: flex;
   gap: 12px;

@@ -6,7 +6,8 @@
     ip6tables: 'samples/ip6tables-save.txt',
     nftables:  'samples/nft-ruleset.txt',
     ufw:       'samples/ufw-status.txt',
-    leaky:     'samples/iptables-leaky.txt'
+    leaky:     'samples/iptables-leaky.txt',
+    shadowed:  'samples/iptables-shadowed.txt'
   };
 
   const FORMAT_LABELS = {

@@ -29,6 +29,7 @@
           flagMissingInputDrop(chain, table, findings);
         }
         scanChainRules(chain, table, findings);
+        detectShadowedRules(chain, table, findings, result.format);
       }
     }
 
@@ -198,6 +199,225 @@
       (byKey[key] = byKey[key] || []).push(f);
     }
     return { findings, counts, byKey };
+  }
+
+  // ── shadow detection ─────────────────────────────────────────────────
+  // For each terminal rule N, check whether any earlier terminal rule M in
+  // the same chain already captures every packet that N matches. Strict
+  // subset semantics on protocol / source / destination / dport / sport;
+  // jumps are not considered terminal (they could RETURN); rules with
+  // divergent ct-state markers are not comparable.
+
+  function detectShadowedRules(chain, table, findings, format) {
+    const rules = chain.rules || [];
+    for (let j = 1; j < rules.length; j++) {
+      const N = rules[j];
+      if (!isTerminalAction(N)) continue;
+      for (let i = 0; i < j; i++) {
+        const M = rules[i];
+        if (!isTerminalAction(M)) continue;
+        if (!sameCtStateContext(M, N)) continue;
+        if (!sameFamily(M, N, table, format)) continue;
+        if (!isPacketSpaceSubset(N, M)) continue;
+
+        const aM = String(M.action || '').toUpperCase();
+        const aN = String(N.action || '').toUpperCase();
+        const sameAction = aM === aN;
+        findings.push({
+          id: 'shadowed-rule',
+          severity: 'warning',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: j,
+          title: sameAction
+            ? `Rule never fires — redundant after rule #${i + 1} which already accepts/drops this traffic`
+            : `Rule never fires — earlier rule #${i + 1} (${aM}) intercepts this traffic before it reaches a ${aN}`,
+          details: (N.raw || '') + ` — shadowed by: ${M.raw || ('rule #' + (i + 1))}`,
+          shadowedBy: i
+        });
+        break; // first (oldest) shadower wins
+      }
+    }
+  }
+
+  function isTerminalAction(rule) {
+    const a = String(rule.action || '').toUpperCase();
+    return a === 'ACCEPT' || a === 'DROP' || a === 'REJECT' || a === 'RETURN';
+  }
+
+  // Two rules are only comparable for shadow purposes if they share the same
+  // ct-state context. "Same" means both unset, or both set to the exact same
+  // (order-independent) state list.
+  function sameCtStateContext(m, n) {
+    return ctState(m) === ctState(n);
+  }
+  function ctState(rule) {
+    const raw = String(rule.raw || '');
+    const m1 = raw.match(/-m\s+conntrack\s+--ctstate\s+([A-Z,_]+)/i) || raw.match(/--ctstate\s+([A-Z,_]+)/i);
+    if (m1) return m1[1].toUpperCase().split(',').sort().join(',');
+    const m2 = raw.match(/\bct\s+state\s+([A-Za-z,_\s]+?)(?:\s+(accept|drop|reject|return|jump|goto|log|counter|$)|$)/);
+    if (m2) return m2[1].toLowerCase().replace(/\s+/g, '').split(',').filter(Boolean).sort().join(',');
+    return '';
+  }
+
+  function isPacketSpaceSubset(n, m) {
+    // The subset check only models 5 dimensions (protocol, src, dst, dport,
+    // sport). Any rule that uses a match we don't model — interface (-i/-o),
+    // rate limit, recent, mac, mark, etc. — is treated as not comparable so
+    // we don't claim "subset" when an unseen constraint might actually rule
+    // it out.
+    if (hasUnmodeledMatch(n) || hasUnmodeledMatch(m)) return false;
+
+    const tN = n.tokens || {};
+    const tM = m.tokens || {};
+
+    // Protocol: if M doesn't constrain it, N is free. If M does, N must agree.
+    const protoM = normalizeProto(tM.protocol || extractProtoFromRaw(m.raw));
+    const protoN = normalizeProto(tN.protocol || extractProtoFromRaw(n.raw));
+    if (protoM && protoM !== protoN) return false;
+
+    if (!cidrSubsetOrAny(tN.source, tM.source)) return false;
+    if (!cidrSubsetOrAny(tN.destination, tM.destination)) return false;
+    if (!portSubsetOrAny(tN.dport, tM.dport)) return false;
+    if (!portSubsetOrAny(tN.sport, tM.sport)) return false;
+    return true;
+  }
+
+  function hasUnmodeledMatch(rule) {
+    const raw = String(rule.raw || '');
+    // Interface restrictions
+    if (/(?:^|\s)-i\s+\S/.test(raw)) return true;
+    if (/(?:^|\s)-o\s+\S/.test(raw)) return true;
+    if (/\b(?:iifname|oifname|iif|oif)\s+/.test(raw)) return true;
+    // Layer-7 / rate / per-host counters
+    if (/-m\s+(?:limit|recent|hashlimit|connlimit|owner|mark|mac|string|hexstring|set|policy|conntrack(?!\s+--ctstate))/.test(raw)) return true;
+    if (/\b(?:limit\s+rate|meter\s)/.test(raw)) return true;
+    return false;
+  }
+
+  function normalizeProto(p) {
+    if (!p) return null;
+    const s = String(p).toLowerCase().trim();
+    if (s === 'all' || s === '*') return null;
+    return s;
+  }
+  function extractProtoFromRaw(raw) {
+    const s = String(raw || '');
+    let m;
+    if ((m = s.match(/(?:^|\s)-p\s+(\S+)/)))                return m[1].toLowerCase(); // iptables: -p tcp
+    if ((m = s.match(/\bmeta\s+l4proto\s+(\S+)/)))          return m[1].toLowerCase(); // nft: meta l4proto tcp
+    if ((m = s.match(/\bip6\s+nexthdr\s+(\S+)/)))           return m[1].toLowerCase(); // nft v6: ip6 nexthdr icmpv6
+    if ((m = s.match(/\bip\s+protocol\s+(\S+)/)))           return m[1].toLowerCase(); // nft v4: ip protocol icmp
+    return null;
+  }
+
+  // Same family (v4 vs v6) is required for two rules to shadow each other.
+  // For iptables/ip6tables the format itself fixes the family. For ufw, IPv6
+  // rules are tagged with "(v6)" in the To column. For nft, the address
+  // family is on the table (ip, ip6, inet, …).
+  function sameFamily(m, n, table, format) {
+    const fM = ruleFamily(m, table, format);
+    const fN = ruleFamily(n, table, format);
+    if (fM === 'any' || fN === 'any') return true;
+    return fM === fN;
+  }
+  function ruleFamily(rule, table, format) {
+    if (format === 'iptables')   return 'v4';
+    if (format === 'ip6tables')  return 'v6';
+    if (format === 'ufw') {
+      return /\(v6\)/i.test(String(rule.raw || '')) ? 'v6' : 'v4';
+    }
+    if (format === 'nftables') {
+      const fam = String((table && table.family) || '').toLowerCase();
+      if (fam === 'ip6') return 'v6';
+      if (fam === 'ip')  return 'v4';
+      // 'inet' / 'bridge' / 'netdev' / 'arp' carry mixed traffic; inspect rule
+      // syntax for the family-specific keywords.
+      const raw = String(rule.raw || '');
+      if (/\bip6\s+/.test(raw))  return 'v6';
+      if (/\bip\s+(?:saddr|daddr|protocol)\b/.test(raw)) return 'v4';
+      return 'any';
+    }
+    return 'any';
+  }
+
+  // CIDR subset: is `nSrc` ⊆ `mSrc`? "any" on either side means any.
+  function cidrSubsetOrAny(nSrc, mSrc) {
+    if (!mSrc || isAnyCidr(mSrc)) return true;          // M unconstrained → anything fits
+    if (!nSrc || isAnyCidr(nSrc)) return false;         // M restricts, N doesn't → N is wider
+    const nP = parseCidr(nSrc);
+    const mP = parseCidr(mSrc);
+    if (!nP || !mP) return false;                       // unparseable → be safe
+    if (nP.family !== mP.family) return false;
+    if (nP.family === 'v6') {
+      // Avoid building a v6 BigInt parser for v0.4.1 — only accept the trivial
+      // cases: identical text or M is the all-zeroes default route.
+      return nSrc.trim() === mSrc.trim();
+    }
+    if (nP.bits < mP.bits) return false;                // n's prefix is shorter → wider
+    const totalBits = 32n;
+    const shift = totalBits - BigInt(mP.bits);
+    return (nP.value >> shift) === (mP.value >> shift);
+  }
+  function isAnyCidr(s) {
+    const v = String(s || '').trim();
+    return v === '' || v === '0.0.0.0/0' || v === '::/0' || /^any(where)?$/i.test(v);
+  }
+  function parseCidr(s) {
+    const str = String(s).trim();
+    if (str.includes(':')) {
+      const m = str.match(/^([0-9a-f:]+)(?:\/(\d+))?$/i);
+      if (!m) return null;
+      return { family: 'v6', bits: m[2] !== undefined ? +m[2] : 128 };
+    }
+    const m = str.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)(?:\/(\d+))?$/);
+    if (!m) return null;
+    const value =
+      (BigInt(+m[1]) << 24n) |
+      (BigInt(+m[2]) << 16n) |
+      (BigInt(+m[3]) <<  8n) |
+       BigInt(+m[4]);
+    const bits = m[5] !== undefined ? +m[5] : 32;
+    return { family: 'v4', value: value & 0xFFFFFFFFn, bits };
+  }
+
+  // Port subset using interval lists. A port expression is converted to a
+  // list of [lo, hi] inclusive intervals; subset is established when every
+  // interval on the left fits inside some interval on the right.
+  function portSubsetOrAny(nPort, mPort) {
+    if (!mPort) return true;
+    if (!nPort) return false;
+    const nIv = portIntervals(nPort);
+    const mIv = portIntervals(mPort);
+    if (!nIv || !mIv) return false;
+    for (const [aL, aH] of nIv) {
+      let covered = false;
+      for (const [bL, bH] of mIv) {
+        if (aL >= bL && aH <= bH) { covered = true; break; }
+      }
+      if (!covered) return false;
+    }
+    return true;
+  }
+  function portIntervals(p) {
+    const str = String(p).trim();
+    const setM = str.match(/^\{([^}]+)\}$/);
+    const inner = setM ? setM[1] : str;
+    const parts = inner.includes(',') ? inner.split(',').map(s => s.trim()) : [inner];
+    const out = [];
+    for (const part of parts) {
+      const r = part.match(/^(\d+)[:\-](\d+)$/);
+      if (r) {
+        out.push([+r[1], +r[2]]);
+      } else if (/^\d+$/.test(part)) {
+        const v = +part;
+        out.push([v, v]);
+      } else {
+        return null;
+      }
+    }
+    return out;
   }
 
   window.FirewallScope = window.FirewallScope || {};

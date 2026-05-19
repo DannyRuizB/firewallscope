@@ -1,6 +1,11 @@
 (function () {
   'use strict';
 
+  if (typeof cytoscape !== 'undefined' && typeof cytoscapeGridGuide !== 'undefined' && !window.__fsGridGuideRegistered) {
+    try { cytoscape.use(cytoscapeGridGuide); } catch (_) { /* already registered */ }
+    window.__fsGridGuideRegistered = true;
+  }
+
   let cyInstance = null;
 
   function renderGraph(result) {
@@ -27,6 +32,38 @@
 
     cyInstance.fit(undefined, 30);
     cyInstance.center();
+
+    if (typeof cyInstance.gridGuide === 'function') {
+      cyInstance.gridGuide({
+        snapToGridOnRelease: false,
+        snapToGridDuringDrag: false,
+        snapToAlignmentLocationOnRelease: false,
+        snapToAlignmentLocationDuringDrag: false,
+        distributionGuidelines: true,
+        geometricGuideline: true,
+        initPosAlignment: true,
+        centerToEdgeAlignment: true,
+        drawGrid: false,
+        resize: false,
+        parentPadding: false,
+        guidelinesStackOrder: 4,
+        guidelinesTolerance: 4,
+        guidelinesStyle: {
+          strokeStyle: '#dc2626',
+          geometricGuidelineRange: 600,
+          range: 200,
+          minDistRange: 10,
+          distGuidelineOffset: 10,
+          horizontalDistColor: '#94a3b8',
+          verticalDistColor: '#94a3b8',
+          initPosAlignmentColor: '#a16207',
+          lineDash: [4, 3],
+          horizontalDistLine: [0, 0],
+          verticalDistLine: [0, 0],
+          initPosAlignmentLine: [2, 2]
+        }
+      });
+    }
 
     cyInstance.on('tap', 'node[type = "chain"]', (e) => {
       const data = e.target.data();

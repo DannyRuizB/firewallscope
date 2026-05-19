@@ -5,7 +5,8 @@
     iptables:  'samples/iptables-save.txt',
     ip6tables: 'samples/ip6tables-save.txt',
     nftables:  'samples/nft-ruleset.txt',
-    ufw:       'samples/ufw-status.txt'
+    ufw:       'samples/ufw-status.txt',
+    leaky:     'samples/iptables-leaky.txt'
   };
 
   const FORMAT_LABELS = {
@@ -16,6 +17,7 @@
   };
 
   let lastResult = null;
+  let lastLintReport = null;
 
   document.addEventListener('DOMContentLoaded', () => {
     const textarea     = document.getElementById('ruleset-input');
@@ -31,8 +33,14 @@
     const dropOverlay  = document.getElementById('drop-overlay');
     const tabGraph     = document.getElementById('tab-graph');
     const tabTable     = document.getElementById('tab-table');
+    const tabLint      = document.getElementById('tab-lint');
+    const tabLintBadge = document.getElementById('lint-tab-badge');
     const graphView    = document.getElementById('graph-view');
     const tableView    = document.getElementById('table-view');
+    const lintView     = document.getElementById('lint-view');
+    const lintContent  = document.getElementById('lint-content');
+    const lintEmpty    = document.getElementById('lint-empty');
+    const lintClean    = document.getElementById('lint-clean');
     const graphEmpty   = document.getElementById('graph-empty');
     const tableEmpty   = document.getElementById('table-empty');
     const compareToggle = document.getElementById('compare-toggle');
@@ -120,6 +128,7 @@
 
     tabGraph.addEventListener('click', () => switchTab('graph'));
     tabTable.addEventListener('click', () => switchTab('table'));
+    tabLint .addEventListener('click', () => switchTab('lint'));
 
     const exportWrap   = document.getElementById('export-wrap');
     const exportToggle = document.getElementById('export-toggle');
@@ -146,10 +155,14 @@
 
     function switchTab(which) {
       const isGraph = which === 'graph';
+      const isTable = which === 'table';
+      const isLint  = which === 'lint';
       tabGraph.classList.toggle('active', isGraph);
-      tabTable.classList.toggle('active', !isGraph);
+      tabTable.classList.toggle('active', isTable);
+      tabLint .classList.toggle('active', isLint);
       graphView.hidden = !isGraph;
-      tableView.hidden = isGraph;
+      tableView.hidden = !isTable;
+      lintView .hidden = !isLint;
       exportWrap.hidden = !isGraph;
       if (!isGraph) {
         exportMenu.hidden = true;
@@ -274,10 +287,111 @@
       lastResult = result;
       graphEmpty.hidden = true;
       tableEmpty.hidden = true;
+
+      // In diff mode the linter is skipped — a merged ruleset doesn't represent
+      // a single deployable state, and pills on diff rows would clash with the
+      // moved / added / removed colour-coding.
+      const lintReport = isDiff
+        ? { findings: [], counts: { error: 0, warning: 0, info: 0, total: 0 }, byKey: {} }
+        : window.FirewallScope.lint(result);
+      lastLintReport = lintReport;
+      renderLintTab(lintReport, isDiff);
+      window.FirewallScope.lintReport = lintReport;
+
       if (!graphView.hidden) {
-        window.FirewallScope.renderGraph(result);
+        window.FirewallScope.renderGraph(result, lintReport);
       }
-      window.FirewallScope.renderTable(result);
+      window.FirewallScope.renderTable(result, lintReport);
+    }
+
+    function renderLintTab(report, isDiff) {
+      lintContent.innerHTML = '';
+      lintEmpty.hidden = true;
+      lintClean.hidden = true;
+      const c = report.counts;
+      const total = c.total;
+      tabLintBadge.hidden = total === 0;
+      if (total > 0) {
+        tabLintBadge.textContent = String(total);
+        tabLintBadge.style.background = c.error > 0
+          ? 'var(--drop)'
+          : (c.warning > 0 ? 'var(--warn)' : '#3b82f6');
+      }
+      if (isDiff) {
+        lintEmpty.hidden = false;
+        lintEmpty.innerHTML = 'Linter is disabled in <b>diff mode</b>. Exit the diff to lint a single ruleset.';
+        return;
+      }
+      if (total === 0) {
+        lintClean.hidden = false;
+        return;
+      }
+
+      const summary = document.createElement('div');
+      summary.className = 'lint-summary';
+      if (c.error)   summary.innerHTML += `<span class="pill error">${c.error} error${c.error !== 1 ? 's' : ''}</span>`;
+      if (c.warning) summary.innerHTML += `<span class="pill warning">${c.warning} warning${c.warning !== 1 ? 's' : ''}</span>`;
+      if (c.info)    summary.innerHTML += `<span class="pill info">${c.info} info</span>`;
+      lintContent.appendChild(summary);
+
+      const list = document.createElement('div');
+      list.className = 'lint-findings';
+      // Sort: errors first, then warnings, then info; within severity, by table/chain/ruleIdx.
+      const order = { error: 0, warning: 1, info: 2 };
+      const sorted = report.findings.slice().sort((a, b) =>
+        order[a.severity] - order[b.severity] ||
+        (a.table || '').localeCompare(b.table || '') ||
+        (a.chain || '').localeCompare(b.chain || '') ||
+        ((a.ruleIdx == null ? -1 : a.ruleIdx) - (b.ruleIdx == null ? -1 : b.ruleIdx))
+      );
+      for (const f of sorted) {
+        const row = document.createElement('div');
+        row.className = `lint-finding sev-${f.severity}`;
+        row.dataset.table = f.table;
+        row.dataset.chain = f.chain;
+        if (f.ruleIdx != null) row.dataset.ruleIdx = String(f.ruleIdx);
+
+        const sev = document.createElement('span');
+        sev.className = 'lint-finding-sev';
+        sev.textContent = f.severity;
+        row.appendChild(sev);
+
+        const body = document.createElement('div');
+        body.className = 'lint-finding-body';
+        const title = document.createElement('div');
+        title.className = 'lint-finding-title';
+        title.textContent = f.title;
+        body.appendChild(title);
+        const loc = document.createElement('div');
+        loc.className = 'lint-finding-loc';
+        const codeT = `<span class="code">${escapeHtml(f.table)}${f.tableFamily ? ' [' + escapeHtml(f.tableFamily) + ']' : ''}</span>`;
+        const codeC = `<span class="code">${escapeHtml(f.chain)}</span>`;
+        const codeR = f.ruleIdx == null ? '' : ` · rule <span class="code">#${f.ruleIdx + 1}</span>`;
+        loc.innerHTML = `${codeT} · ${codeC}${codeR} · <span class="code">${f.id}</span>`;
+        body.appendChild(loc);
+        if (f.details) {
+          const det = document.createElement('div');
+          det.className = 'lint-finding-details';
+          det.textContent = f.details;
+          body.appendChild(det);
+        }
+        row.appendChild(body);
+
+        row.addEventListener('click', () => {
+          switchTab('table');
+          // The table view is already rendered with pills; scroll to the target rule.
+          window.FirewallScope.scrollToRule &&
+            window.FirewallScope.scrollToRule(f.table, f.chain, f.ruleIdx);
+        });
+        list.appendChild(row);
+      }
+      lintContent.appendChild(list);
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
     }
 
     function countStats(result) {

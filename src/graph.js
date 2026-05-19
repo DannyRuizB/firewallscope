@@ -8,7 +8,7 @@
 
   let cyInstance = null;
 
-  function renderGraph(result) {
+  function renderGraph(result, lintReport) {
     const container = document.getElementById('graph');
     if (!container) return;
 
@@ -17,7 +17,7 @@
       cyInstance = null;
     }
 
-    const elements = buildElements(result);
+    const elements = buildElements(result, lintReport);
     if (!elements.length) return;
 
     cyInstance = cytoscape({
@@ -149,9 +149,10 @@
       .replace(/'/g, '&#39;');
   }
 
-  function buildElements(result) {
+  function buildElements(result, lintReport) {
     const elements = [];
     const chainIdSet = new Set();
+    const byKey = (lintReport && lintReport.byKey) || {};
 
     for (const table of result.tables) {
       const tableId = `t:${table.name}${table.family ? '@' + table.family : ''}`;
@@ -170,7 +171,9 @@
         const stats = countRuleActions(chain.rules);
         const policyText = chain.policy ? ` · policy ${chain.policy}` : (chain.builtIn ? '' : ' · user');
         const ruleSummary = `${chain.rules.length} rule${chain.rules.length !== 1 ? 's' : ''}`;
-        const label = `${chain.name}\n${ruleSummary}${policyText}`;
+        const chainFindings = collectChainFindings(byKey, table.name, chain.name);
+        const lintSuffix = chainFindings.length ? `\n⚠ ${chainFindings.length} lint` : '';
+        const label = `${chain.name}\n${ruleSummary}${policyText}${lintSuffix}`;
         const comments = chain.rules.map(r => r.comment).filter(Boolean);
 
         let chainDiff = chain.diffState || null;
@@ -378,10 +381,11 @@
 
   /* ─── table view ────────────────────────────── */
 
-  function renderTable(result) {
+  function renderTable(result, lintReport) {
     const root = document.getElementById('table-content');
     if (!root) return;
     root.innerHTML = '';
+    const byKey = (lintReport && lintReport.byKey) || {};
 
     for (const table of result.tables) {
       const section = document.createElement('div');
@@ -398,14 +402,14 @@
       section.appendChild(h3);
 
       for (const chain of table.chains) {
-        section.appendChild(renderChain(chain));
+        section.appendChild(renderChain(chain, table.name, byKey));
       }
 
       root.appendChild(section);
     }
   }
 
-  function renderChain(chain) {
+  function renderChain(chain, tableName, byKey) {
     const wrap = document.createElement('div');
     wrap.className = 'tbl-chain';
     wrap.dataset.chainName = chain.name;
@@ -440,6 +444,22 @@
       stateBadge.textContent = chain.diffState === 'added' ? '+ added' : '− removed';
       nameSpan.appendChild(stateBadge);
     }
+
+    // Lint badge: collapse all findings on this chain (including chain-level
+    // ones at ruleIdx=null) into a single ⚠N pill; if any of them are errors
+    // we use the red variant.
+    if (byKey && tableName) {
+      const chainFindings = collectChainFindings(byKey, tableName, chain.name);
+      if (chainFindings.length) {
+        const hasErr = chainFindings.some(f => f.severity === 'error');
+        const b = document.createElement('span');
+        b.className = 'tbl-chain-lint' + (hasErr ? ' has-error' : '');
+        b.textContent = `⚠ ${chainFindings.length}`;
+        b.title = chainFindings.map(f => `[${f.severity}] ${f.title}`).join('\n');
+        nameSpan.appendChild(b);
+      }
+    }
+
     header.appendChild(nameSpan);
 
     const meta = document.createElement('span');
@@ -464,6 +484,7 @@
     tbl.className = 'tbl-rules';
     chain.rules.forEach((rule, i) => {
       const tr = document.createElement('tr');
+      tr.dataset.ruleIdx = String(i);
       if (rule.diffState === 'added')   tr.classList.add('diff-added');
       if (rule.diffState === 'removed') tr.classList.add('diff-removed');
       if (rule.diffState === 'moved')   tr.classList.add('diff-moved');
@@ -484,6 +505,18 @@
         badge.title = `was at position ${rule.movedFrom + 1}, now at ${rule.movedTo + 1}`;
         tdMatch.appendChild(document.createTextNode(' '));
         tdMatch.appendChild(badge);
+      }
+      // Lint pills for this specific rule (one pill per finding).
+      if (byKey && tableName) {
+        const ruleFindings = byKey[`${tableName}::${chain.name}::${i}`] || [];
+        for (const f of ruleFindings) {
+          const pill = document.createElement('span');
+          pill.className = `lint-pill sev-${f.severity}`;
+          pill.textContent = `⚠ ${f.id}`;
+          pill.title = `[${f.severity}] ${f.title}`;
+          tdMatch.appendChild(document.createTextNode(' '));
+          tdMatch.appendChild(pill);
+        }
       }
       tr.appendChild(tdMatch);
 
@@ -543,6 +576,38 @@
     });
   }
 
+  // Jumps from the Lint tab straight to the specific offending rule. The
+  // table view is already rendered with pills; we only need to scroll and
+  // briefly outline the target tr so the user can spot it.
+  function scrollToRule(tableName, chainName, ruleIdx) {
+    requestAnimationFrame(() => {
+      const chainSel = `.tbl-table[data-table-name="${cssEscape(tableName)}"] .tbl-chain[data-chain-name="${cssEscape(chainName)}"]`;
+      const chainEl = document.querySelector(chainSel);
+      if (!chainEl) return;
+      if (ruleIdx == null) {
+        chainEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        chainEl.style.outline = '2px solid var(--warn)';
+        setTimeout(() => { chainEl.style.outline = ''; }, 1500);
+        return;
+      }
+      const tr = chainEl.querySelector(`tr[data-rule-idx="${ruleIdx}"]`);
+      if (tr) {
+        tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        tr.style.outline = '2px solid var(--warn)';
+        setTimeout(() => { tr.style.outline = ''; }, 1500);
+      }
+    });
+  }
+
+  function collectChainFindings(byKey, tableName, chainName) {
+    const out = [];
+    const prefix = `${tableName}::${chainName}::`;
+    for (const key in byKey) {
+      if (key.startsWith(prefix)) out.push(...byKey[key]);
+    }
+    return out;
+  }
+
   function cssEscape(s) {
     return String(s).replace(/(["\\])/g, '\\$1');
   }
@@ -579,4 +644,5 @@
   window.FirewallScope.renderGraph = renderGraph;
   window.FirewallScope.renderTable = renderTable;
   window.FirewallScope.exportGraph = exportGraph;
+  window.FirewallScope.scrollToRule = scrollToRule;
 })();

@@ -6,7 +6,7 @@
 
 ![FirewallScope on the iptables sample: the graph view renders the filter and nat tables as dashed compound boxes; built-in chains are colour-coded by policy (INPUT and FORWARD red for DROP, OUTPUT and the four nat chains green for ACCEPT), user-defined chains (DOCKER-USER, WEB, DOCKER) carry a dashed red border, and the jump edges between chains show a 2x counter where INPUT jumps to WEB on both port 80 and 443.](screenshots/screenshot.png)
 
-🟠 **v0.3.1** — early alpha. Four parsers, structural view, chain tooltips with action distribution and comments, PNG / SVG export, **alignment guidelines** when dragging chains, and **diff view** — paste two rulesets of the same format and see what was added, removed, **reordered**, or had its policy changed. The "trace a packet" view is still on the roadmap.
+🟠 **v0.4.0** — early alpha. Four parsers, structural view, chain tooltips with action distribution and comments, PNG / SVG export, alignment guidelines when dragging chains, diff view (added / removed / reordered / policy change), and a **linter** that flags three classes of common smell (overly permissive ACCEPT, exposed admin ports, missing default-deny on INPUT). The "trace a packet" view is still on the roadmap.
 
 ---
 
@@ -52,8 +52,9 @@ FirewallScope parses every format into the same intermediate model — `{ tables
 
 - **Graph** (default) — tables as dashed compound boxes, chains as nodes inside them. Built-in chains are coloured by their default policy (ACCEPT green, DROP red, REJECT orange). User-defined chains carry a dashed red border. **Jumps between chains** are drawn as arrows; when multiple rules in a chain jump to the same target, the arrow carries a multiplier (`2×`). Click a chain to jump to its rules in the Table view.
 - **Table** — every chain rendered as a small block with: a policy pill, the rule list with index, the match condition (`-p tcp --dport 22`), the action as a pill (green `ACCEPT`, red `DROP`, orange `REJECT`, dashed `jump <name>` for chain references, neutral for `LOG`, `RETURN`, `MASQUERADE`, `REDIRECT`, `DNAT`, `SNAT` with their detail kept), and any `--comment "…"` extracted into its own column.
+- **Lint** — a built-in static analysis pass over the parsed ruleset. Three smell classes are reported today: `missing-input-drop` (error, INPUT-like chain has no default-deny), `exposed-admin-port` (error, sensitive admin service accessible from any source), and `permissive-accept` (warning, ACCEPT from any source with no port restriction). Findings are shown as a list with severity badges; clicking one jumps to the offending rule in the Table view. Rules and chains with findings also carry an inline `⚠` pill / badge in the Table and a `⚠ N` lint line in the Graph chain label. The linter is disabled in diff mode.
 
-Both views are derived from the same model, so swapping is instant.
+All three views are derived from the same model, so swapping is instant.
 
 **Diff mode**: click *Compare* in the input header to open a second pane, paste a second ruleset of the **same format**, and hit *Analyze*. FirewallScope merges both into one annotated model and highlights:
 - **Added** rules (green, `+` prefix) and **removed** rules (red, struck-through, `−` prefix) inside each common chain.
@@ -78,7 +79,8 @@ FirewallScope's direction: cover the common firewall surfaces and gradually add 
 - [x] **v0.2** — Hover a chain in the graph to get an enriched tooltip with the action distribution (X ACCEPT / Y DROP / Z jump / other) and the `--comment` values found in its rules (truncated to 5). Export the graph as **PNG** (2× scale) or **SVG** (vector, editable in Inkscape / Figma) from the ⤓ button in the graph header.
 - [x] **v0.3** — Diff view: paste two rulesets of the same format, see what rules and chains were added / removed and which chains had their policy changed, colour-coded in both the graph and the table.
 - [x] **v0.3.1** — Diff now detects **reordering**: per chain, the longest common subsequence of rules forms the unchanged anchor and the rules outside it that exist on both sides are flagged as *moved*, with a `moved ↑N` / `moved ↓N` badge showing how many positions they shifted.
-- [ ] **v0.4** — Linter pass: flag common smells (overly permissive `0.0.0.0/0 ACCEPT`, exposed admin ports like 22 / 3306 open to Anywhere, missing default `DROP` policy on INPUT, conflicting rules where a later one is shadowed by an earlier one).
+- [x] **v0.4** — Linter pass with three smells: **permissive-accept** (warning — ACCEPT from any source with no port restriction, excluding loopback and conntrack-established), **exposed-admin-port** (error — ssh / telnet / mysql / rdp / postgres / redis / mongodb open from any source), and **missing-input-drop** (error — built-in INPUT chain of the filter table with policy ACCEPT and no catch-all DROP). A new **Lint** tab lists the findings with severity icons and a click jumps to the offending rule in the Table view; affected rules carry an inline `⚠` pill and chains with findings get a `⚠ N` badge in both the Table and the Graph.
+- [ ] **v0.4.1** — Add the fourth smell from the original v0.4 plan: **shadowed rule** detection (a rule that never fires because an earlier one with a superset of its match has the same action). Requires predicate-subset analysis over `-p` / `-s` / `-d` / `--dport`.
 - [ ] **v0.5** — *Trace a packet* view: type a packet description (`tcp from 10.0.0.5 to host:22`) and FirewallScope walks the chains rule by rule, highlighting the path through the graph and the final verdict.
 
 ## Stack

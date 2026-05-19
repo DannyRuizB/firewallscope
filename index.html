@@ -28,6 +28,7 @@
               <button type="button" data-sample="ip6tables">ip6tables-save (IPv6)</button>
               <button type="button" data-sample="nftables">nft list ruleset</button>
               <button type="button" data-sample="ufw">ufw status verbose</button>
+              <button type="button" data-sample="leaky">iptables (leaky — for linter)</button>
             </div>
           </div>
           <button id="upload" type="button">Upload</button>
@@ -74,6 +75,7 @@
         <div class="tabs">
           <button id="tab-graph" class="tab active" type="button">Graph</button>
           <button id="tab-table" class="tab" type="button">Table</button>
+          <button id="tab-lint"  class="tab" type="button">Lint <span id="lint-tab-badge" class="tab-badge" hidden></span></button>
         </div>
         <div class="legend">
           <span><i class="dot table-node"></i>table</span>
@@ -99,11 +101,16 @@
         <div id="table-content"></div>
         <div id="table-empty" class="empty-state">Paste a ruleset and click <b>Analyze</b> to see the rules table.</div>
       </div>
+      <div id="lint-view" class="view-container" hidden>
+        <div id="lint-content"></div>
+        <div id="lint-empty" class="empty-state">Paste a ruleset and click <b>Analyze</b> to run the linter.</div>
+        <div id="lint-clean" class="empty-state" hidden>No smells found. Your ruleset passes the v0.4 checks.</div>
+      </div>
     </section>
   </main>
 
   <footer class="bottombar">
-    <span>v0.3.1</span>
+    <span>v0.4.0</span>
     <span>·</span>
     <span>MIT</span>
     <span>·</span>
@@ -121,6 +128,7 @@
   <script src="src/parsers/ufw.js"></script>
   <script src="src/parser.js"></script>
   <script src="src/diff.js"></script>
+  <script src="src/linter.js"></script>
   <script src="src/graph.js"></script>
   <script src="src/app.js"></script>
 </body>

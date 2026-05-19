@@ -19,7 +19,7 @@
       return 'ip6tables';
     }
 
-    if (/^\*(filter|nat|mangle|raw|security)\b/m.test(head)) {
+    if (/(?:^|\n)\s*\*(filter|nat|mangle|raw|security)\b/.test(head)) {
       const looksV6 = /\b([0-9a-f]{1,4}:){2,}/i.test(text) &&
                       !/\b\d+\.\d+\.\d+\.\d+\b/.test(text);
       return looksV6 ? 'ip6tables' : 'iptables';

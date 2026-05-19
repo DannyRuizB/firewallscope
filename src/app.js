@@ -35,6 +35,31 @@
     const tableView    = document.getElementById('table-view');
     const graphEmpty   = document.getElementById('graph-empty');
     const tableEmpty   = document.getElementById('table-empty');
+    const compareToggle = document.getElementById('compare-toggle');
+    const comparePane   = document.getElementById('compare-pane');
+    const compareInput  = document.getElementById('compare-input');
+    const labelA        = document.getElementById('label-a');
+    const diffBanner    = document.getElementById('diff-banner');
+    const diffSummary   = document.getElementById('diff-summary');
+    const exitDiffBtn   = document.getElementById('exit-diff');
+
+    compareToggle.addEventListener('click', () => {
+      const willOpen = comparePane.hidden;
+      comparePane.hidden = !willOpen;
+      labelA.hidden = !willOpen;
+      compareToggle.classList.toggle('active', willOpen);
+      if (willOpen) compareInput.focus();
+      else compareInput.value = '';
+    });
+
+    exitDiffBtn.addEventListener('click', () => {
+      comparePane.hidden = true;
+      labelA.hidden = true;
+      compareToggle.classList.remove('active');
+      compareInput.value = '';
+      diffBanner.hidden = true;
+      analyze();
+    });
 
     analyzeBtn.addEventListener('click', analyze);
 
@@ -161,8 +186,11 @@
 
     function analyze() {
       const text = textarea.value;
+      const textB = !comparePane.hidden ? compareInput.value : '';
       hideError();
       hideWarnings();
+      diffBanner.hidden = true;
+
       if (!text.trim()) {
         formatBadge.hidden = true;
         graphEmpty.hidden = false;
@@ -175,10 +203,10 @@
 
       const override = formatSelect.value;
       const opts = override === 'auto' ? {} : { format: override };
-      const result = window.FirewallScope.parse(text, opts);
+      const resultA = window.FirewallScope.parse(text, opts);
 
-      if (result.error) {
-        showError(result.error);
+      if (resultA.error) {
+        showError(resultA.error);
         formatBadge.hidden = true;
         graphEmpty.hidden = false;
         tableEmpty.hidden = false;
@@ -188,10 +216,55 @@
         return;
       }
 
-      const stats = countStats(result);
-      formatBadge.innerHTML =
-        `<b>${FORMAT_LABELS[result.format] || result.format}</b> · ${stats.tables} table${stats.tables !== 1 ? 's' : ''} · ${stats.chains} chain${stats.chains !== 1 ? 's' : ''} · ${stats.rules} rule${stats.rules !== 1 ? 's' : ''}`;
-      formatBadge.hidden = false;
+      let result = resultA;
+      let isDiff = false;
+
+      if (textB.trim()) {
+        const resultB = window.FirewallScope.parse(textB, opts);
+        if (resultB.error) {
+          showError(`Compare side: ${resultB.error}`);
+          formatBadge.hidden = true;
+          graphEmpty.hidden = false;
+          tableEmpty.hidden = false;
+          lastResult = null;
+          clearGraph();
+          clearTable();
+          return;
+        }
+
+        const merged = window.FirewallScope.mergeForDiff(resultA, resultB);
+        if (merged.error) {
+          showError(merged.error);
+          formatBadge.hidden = true;
+          graphEmpty.hidden = false;
+          tableEmpty.hidden = false;
+          lastResult = null;
+          clearGraph();
+          clearTable();
+          return;
+        }
+        result = merged;
+        isDiff = true;
+      }
+
+      if (isDiff) {
+        const d = result.diff;
+        formatBadge.innerHTML =
+          `<b>${FORMAT_LABELS[result.format] || result.format}</b> · diff mode (left → right)`;
+        formatBadge.hidden = false;
+        diffSummary.innerHTML =
+          `Diff: <span class="badge badge-added">+${d.addedRules}</span> added, ` +
+          `<span class="badge badge-removed">−${d.removedRules}</span> removed, ` +
+          `<span class="badge badge-same">=${d.sameRules}</span> unchanged · ` +
+          `<span class="badge badge-added">+${d.addedChains}</span> chains, ` +
+          `<span class="badge badge-removed">−${d.removedChains}</span> chains`;
+        diffBanner.hidden = false;
+      } else {
+        const stats = countStats(result);
+        formatBadge.innerHTML =
+          `<b>${FORMAT_LABELS[result.format] || result.format}</b> · ${stats.tables} table${stats.tables !== 1 ? 's' : ''} · ${stats.chains} chain${stats.chains !== 1 ? 's' : ''} · ${stats.rules} rule${stats.rules !== 1 ? 's' : ''}`;
+        formatBadge.hidden = false;
+      }
 
       if (result.warnings && result.warnings.length) {
         showWarnings(result.warnings);

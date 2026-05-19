@@ -31,6 +31,7 @@
             </div>
           </div>
           <button id="upload" type="button">Upload</button>
+          <button id="compare-toggle" type="button" title="Diff this ruleset against a second one">Compare</button>
           <select id="format-override" title="Auto-detected unless overridden">
             <option value="auto">Auto-detect</option>
             <option value="iptables">iptables-save</option>
@@ -44,6 +45,7 @@
       <input id="file-input" type="file" accept=".txt,.conf,text/plain" hidden />
       <div id="format-badge" class="format-badge" hidden></div>
       <div class="textarea-wrap">
+        <div class="textarea-label" id="label-a" hidden>BEFORE (left)</div>
         <textarea
           id="ruleset-input"
           spellcheck="false"
@@ -51,11 +53,23 @@
         ></textarea>
         <div id="drop-overlay" class="drop-overlay" hidden>Drop ruleset file here</div>
       </div>
+      <div class="textarea-wrap textarea-wrap-b" id="compare-pane" hidden>
+        <div class="textarea-label">AFTER (right) — paste a second ruleset to diff against the one above</div>
+        <textarea
+          id="compare-input"
+          spellcheck="false"
+          placeholder="Paste the second ruleset of the same format here, then click Analyze."
+        ></textarea>
+      </div>
       <div id="parse-error" class="error" hidden></div>
       <div id="parse-warnings" class="warnings" hidden></div>
     </section>
 
     <section class="output-pane">
+      <div id="diff-banner" class="diff-banner" hidden>
+        <span id="diff-summary"></span>
+        <button id="exit-diff" type="button" class="diff-exit">Exit diff</button>
+      </div>
       <div class="pane-header tabs-header">
         <div class="tabs">
           <button id="tab-graph" class="tab active" type="button">Graph</button>
@@ -105,6 +119,7 @@
   <script src="src/parsers/nftables.js"></script>
   <script src="src/parsers/ufw.js"></script>
   <script src="src/parser.js"></script>
+  <script src="src/diff.js"></script>
   <script src="src/graph.js"></script>
   <script src="src/app.js"></script>
 </body>

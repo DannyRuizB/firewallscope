@@ -1,0 +1,39 @@
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iifname "lo" accept
+		ct state established,related accept
+		ip protocol icmp accept
+		ip6 nexthdr icmpv6 accept
+		tcp dport 22 jump ratelimit
+		tcp dport { 80, 443 } accept
+		ip saddr 10.0.0.0/8 tcp dport 8006 accept comment "proxmox vpn"
+		log prefix "DROP-INPUT: "
+		drop
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		ct state established,related accept
+		jump docker-user
+	}
+	chain output {
+		type filter hook output priority filter; policy accept;
+	}
+	chain docker-user {
+		return
+	}
+	chain ratelimit {
+		ct state new limit rate 4/minute accept
+		drop
+	}
+}
+table ip nat {
+	chain prerouting {
+		type nat hook prerouting priority dstnat;
+		tcp dport 8080 redirect to :8006 comment "proxmox web ui"
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat;
+		ip saddr 172.17.0.0/16 oifname "eth0" masquerade
+	}
+}

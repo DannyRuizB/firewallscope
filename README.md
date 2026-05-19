@@ -6,7 +6,7 @@
 
 ![FirewallScope on the iptables sample: the graph view renders the filter and nat tables as dashed compound boxes; built-in chains are colour-coded by policy (INPUT and FORWARD red for DROP, OUTPUT and the four nat chains green for ACCEPT), user-defined chains (DOCKER-USER, WEB, DOCKER) carry a dashed red border, and the jump edges between chains show a 2x counter where INPUT jumps to WEB on both port 80 and 443.](screenshots/screenshot.png)
 
-🟠 **v0.2.0** — early alpha. Four parsers, structural view, chain tooltips with action distribution and comments, PNG / SVG export. The "trace a packet" view is still on the roadmap.
+🟠 **v0.3.0** — early alpha. Four parsers, structural view, chain tooltips with action distribution and comments, PNG / SVG export, and **diff view** — paste two rulesets of the same format and see what was added, removed, or had its policy changed. The "trace a packet" view is still on the roadmap.
 
 ---
 
@@ -44,7 +44,7 @@ FirewallScope auto-detects the format from the input. You can also force one fro
 | **nftables** | `sudo nft list ruleset` | Native nftables output. Tables (`ip` / `ip6` / `inet` / `bridge` / `arp` / `netdev`) and their family are preserved. |
 | **UFW** | `sudo ufw status verbose` | The human-readable column output, including default policies (`Default: deny (incoming)`) and per-rule actions (`ALLOW IN`, `DENY IN`, `REJECT IN`, `LIMIT IN`, with `OUT` and `FWD` variants). |
 
-The samples in `samples/` show one realistic input per format — pick one from the *Load sample* dropdown in the UI.
+The samples in `samples/` show one realistic input per format — pick one from the *Load sample* dropdown in the UI. Each format also ships an `*-after.txt` companion sample for trying out the **diff view** (see *What you see* below).
 
 ## What you see
 
@@ -54,6 +54,14 @@ FirewallScope parses every format into the same intermediate model — `{ tables
 - **Table** — every chain rendered as a small block with: a policy pill, the rule list with index, the match condition (`-p tcp --dport 22`), the action as a pill (green `ACCEPT`, red `DROP`, orange `REJECT`, dashed `jump <name>` for chain references, neutral for `LOG`, `RETURN`, `MASQUERADE`, `REDIRECT`, `DNAT`, `SNAT` with their detail kept), and any `--comment "…"` extracted into its own column.
 
 Both views are derived from the same model, so swapping is instant.
+
+**Diff mode**: click *Compare* in the input header to open a second pane, paste a second ruleset of the **same format**, and hit *Analyze*. FirewallScope merges both into one annotated model and highlights:
+- **Added** rules (green, `+` prefix) and **removed** rules (red, struck-through, `−` prefix) inside each common chain.
+- **Added** and **removed** chains as a whole (green / dashed-red border in the graph; `+ added` / `− removed` badge in the table).
+- **Policy changes** on a common chain as `policy DROP → ACCEPT` next to the chain name.
+- A summary banner at the top of the output pane with rule and chain deltas.
+
+Cross-format diffs (e.g. iptables vs nftables) are rejected with a clear error — both inputs must come from the same tool.
 
 ## How it works
 
@@ -67,7 +75,8 @@ FirewallScope's direction: cover the common firewall surfaces and gradually add 
 
 - [x] **v0.1** — Four parsers (iptables / ip6tables / nftables / ufw), format auto-detection with manual override, structural graph view, table view, paste / upload / drag & drop input, four realistic samples.
 - [x] **v0.2** — Hover a chain in the graph to get an enriched tooltip with the action distribution (X ACCEPT / Y DROP / Z jump / other) and the `--comment` values found in its rules (truncated to 5). Export the graph as **PNG** (2× scale) or **SVG** (vector, editable in Inkscape / Figma) from the ⤓ button in the graph header.
-- [ ] **v0.3** — Diff view: paste two rulesets and see what rules were added / removed / reordered between them, colour-coded.
+- [x] **v0.3** — Diff view: paste two rulesets of the same format, see what rules and chains were added / removed and which chains had their policy changed, colour-coded in both the graph and the table.
+- [ ] **v0.3.1** — Extend diff with **reorder detection**: rules that exist on both sides but at a different position are flagged as moved rather than left as unchanged.
 - [ ] **v0.4** — Linter pass: flag common smells (overly permissive `0.0.0.0/0 ACCEPT`, exposed admin ports like 22 / 3306 open to Anywhere, missing default `DROP` policy on INPUT, conflicting rules where a later one is shadowed by an earlier one).
 - [ ] **v0.5** — *Trace a packet* view: type a packet description (`tcp from 10.0.0.5 to host:22`) and FirewallScope walks the chains rule by rule, highlighting the path through the graph and the final verdict.
 

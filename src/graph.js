@@ -135,6 +135,16 @@
         const ruleSummary = `${chain.rules.length} rule${chain.rules.length !== 1 ? 's' : ''}`;
         const label = `${chain.name}\n${ruleSummary}${policyText}`;
         const comments = chain.rules.map(r => r.comment).filter(Boolean);
+
+        let chainDiff = chain.diffState || null;
+        let hasInnerDiff = false;
+        if (chainDiff === 'same' && Array.isArray(chain.rules)) {
+          for (const r of chain.rules) {
+            if (r.diffState === 'added' || r.diffState === 'removed') { hasInnerDiff = true; break; }
+          }
+        }
+        const diffState = chainDiff === 'same' && hasInnerDiff ? 'changed' : chainDiff;
+
         elements.push({
           data: {
             id: chainId,
@@ -153,7 +163,8 @@
             reject: stats.reject,
             jump: stats.jump,
             other: stats.other,
-            comments
+            comments,
+            diffState
           }
         });
       }
@@ -290,6 +301,35 @@
         }
       },
       {
+        selector: 'node[type = "chain"][diffState = "added"]',
+        style: {
+          'border-color': '#22c55e',
+          'border-style': 'solid',
+          'border-width': 3,
+          'background-color': '#14532d',
+          'color': '#86efac'
+        }
+      },
+      {
+        selector: 'node[type = "chain"][diffState = "removed"]',
+        style: {
+          'border-color': '#dc2626',
+          'border-style': 'dashed',
+          'border-width': 3,
+          'background-color': '#1f0f10',
+          'color': '#fca5a5',
+          'opacity': 0.6
+        }
+      },
+      {
+        selector: 'node[type = "chain"][diffState = "changed"]',
+        style: {
+          'border-color': '#f59e0b',
+          'border-style': 'solid',
+          'border-width': 3
+        }
+      },
+      {
         selector: 'node:selected',
         style: {
           'border-color': '#dc2626',
@@ -332,6 +372,8 @@
     const wrap = document.createElement('div');
     wrap.className = 'tbl-chain';
     wrap.dataset.chainName = chain.name;
+    if (chain.diffState === 'added')   wrap.classList.add('diff-added');
+    if (chain.diffState === 'removed') wrap.classList.add('diff-removed');
 
     const header = document.createElement('div');
     header.className = 'tbl-chain-header';
@@ -339,7 +381,12 @@
     const nameSpan = document.createElement('span');
     nameSpan.className = 'tbl-chain-name';
     nameSpan.textContent = chain.name;
-    if (chain.policy) {
+    if (chain.policyChanged) {
+      const pill = document.createElement('span');
+      pill.className = 'policy-pill policy-none';
+      pill.textContent = `policy ${chain.policyA || '—'} → ${chain.policyB || '—'}`;
+      nameSpan.appendChild(pill);
+    } else if (chain.policy) {
       const pill = document.createElement('span');
       pill.className = 'policy-pill ' + policyClass(chain.policy);
       pill.textContent = `policy ${chain.policy}`;
@@ -349,6 +396,12 @@
       pill.className = 'policy-pill policy-none';
       pill.textContent = 'user';
       nameSpan.appendChild(pill);
+    }
+    if (chain.diffState === 'added' || chain.diffState === 'removed') {
+      const stateBadge = document.createElement('span');
+      stateBadge.className = 'tbl-chain-state ' + chain.diffState;
+      stateBadge.textContent = chain.diffState === 'added' ? '+ added' : '− removed';
+      nameSpan.appendChild(stateBadge);
     }
     header.appendChild(nameSpan);
 
@@ -374,6 +427,8 @@
     tbl.className = 'tbl-rules';
     chain.rules.forEach((rule, i) => {
       const tr = document.createElement('tr');
+      if (rule.diffState === 'added')   tr.classList.add('diff-added');
+      if (rule.diffState === 'removed') tr.classList.add('diff-removed');
 
       const tdNum = document.createElement('td');
       tdNum.className = 'col-num';

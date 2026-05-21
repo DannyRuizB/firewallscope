@@ -539,6 +539,9 @@ button.active {
 .lint-summary .pill.warning { background: rgba(245,158,11,.18); color: #fcd34d; }
 .lint-summary .pill.info    { background: rgba(59,130,246,.18); color: #93c5fd; }
 
+.lint-export { margin-left: auto; display: flex; gap: 6px; }
+.lint-export button { padding: 4px 10px; font-size: 12px; }
+
 .lint-findings {
   display: flex;
   flex-direction: column;

@@ -488,6 +488,20 @@
       if (c.error)   summary.innerHTML += `<span class="pill error">${c.error} error${c.error !== 1 ? 's' : ''}</span>`;
       if (c.warning) summary.innerHTML += `<span class="pill warning">${c.warning} warning${c.warning !== 1 ? 's' : ''}</span>`;
       if (c.info)    summary.innerHTML += `<span class="pill info">${c.info} info</span>`;
+
+      const exportGroup = document.createElement('div');
+      exportGroup.className = 'lint-export';
+      const btnJson = document.createElement('button');
+      btnJson.type = 'button';
+      btnJson.textContent = 'Export JSON';
+      btnJson.addEventListener('click', () => exportLint('json', report));
+      const btnMd = document.createElement('button');
+      btnMd.type = 'button';
+      btnMd.textContent = 'Export Markdown';
+      btnMd.addEventListener('click', () => exportLint('md', report));
+      exportGroup.append(btnJson, btnMd);
+      summary.appendChild(exportGroup);
+
       lintContent.appendChild(summary);
 
       const list = document.createElement('div');
@@ -548,6 +562,79 @@
         list.appendChild(row);
       }
       lintContent.appendChild(list);
+    }
+
+    function exportLint(kind, report) {
+      const fmt = (lastResult && lastResult.format) || 'unknown';
+      const generatedAt = new Date().toISOString();
+      const today = generatedAt.slice(0, 10);
+      if (kind === 'json') {
+        const payload = {
+          generator: 'FirewallScope',
+          generatedAt,
+          source: { format: fmt },
+          counts: report.counts,
+          findings: report.findings
+        };
+        downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }),
+                     `firewallscope-lint-${today}.json`);
+        return;
+      }
+      if (kind === 'md') {
+        const text = buildLintMarkdown(report, fmt, generatedAt);
+        downloadBlob(new Blob([text], { type: 'text/markdown' }),
+                     `firewallscope-lint-${today}.md`);
+      }
+    }
+
+    function buildLintMarkdown(report, format, generatedAt) {
+      const lines = ['# FirewallScope lint report', ''];
+      lines.push(`- Source format: \`${format}\``);
+      lines.push(`- Generated: ${generatedAt}`);
+      lines.push('', '## Summary', '');
+      const c = report.counts;
+      if (c.error)   lines.push(`- ${c.error} error${c.error !== 1 ? 's' : ''}`);
+      if (c.warning) lines.push(`- ${c.warning} warning${c.warning !== 1 ? 's' : ''}`);
+      if (c.info)    lines.push(`- ${c.info} info`);
+      if (c.total === 0) lines.push('- No findings.');
+      lines.push('');
+
+      const order = { error: 0, warning: 1, info: 2 };
+      const sorted = report.findings.slice().sort((a, b) =>
+        order[a.severity] - order[b.severity] ||
+        (a.table || '').localeCompare(b.table || '') ||
+        (a.chain || '').localeCompare(b.chain || '') ||
+        ((a.ruleIdx == null ? -1 : a.ruleIdx) - (b.ruleIdx == null ? -1 : b.ruleIdx))
+      );
+
+      let lastSev = null;
+      for (const f of sorted) {
+        if (f.severity !== lastSev) {
+          lastSev = f.severity;
+          const label = f.severity.charAt(0).toUpperCase() + f.severity.slice(1);
+          lines.push(`## ${label}s`, '');
+        }
+        const loc = `\`${f.table}\` / \`${f.chain}\``;
+        const r = f.ruleIdx == null ? '' : ` rule #${f.ruleIdx + 1}`;
+        lines.push(`### ${loc}${r} — \`${f.id}\``, '');
+        lines.push(f.title);
+        if (f.details) {
+          lines.push('', '```', f.details, '```');
+        }
+        lines.push('');
+      }
+      return lines.join('\n');
+    }
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     }
 
     function escapeHtml(s) {

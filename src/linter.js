@@ -30,6 +30,9 @@
         }
         scanChainRules(chain, table, findings);
         detectShadowedRules(chain, table, findings, result.format);
+        if (isFilterTable) {
+          detectFallthroughAccept(result, chain, table, result.format, findings);
+        }
       }
     }
 
@@ -418,6 +421,55 @@
       }
     }
     return out;
+  }
+
+  // Probes the chain with a representative inbound packet by replaying it
+  // through the trace engine. If the packet falls through to the chain's
+  // policy (no explicit rule matched) and the verdict is ACCEPT, we flag it.
+  // Complements `missing-input-drop` (structural) with a dynamic check that
+  // also catches near-misses where catch-all rules don't cover the probe.
+  function detectFallthroughAccept(result, chain, table, format, findings) {
+    if (!window.FirewallScope || typeof window.FirewallScope.trace !== 'function') return;
+    const direction = inboundDirection(chain, format);
+    if (!direction) return;
+
+    const probe = {
+      direction,
+      protocol: 'tcp',
+      source: '1.2.3.4',
+      destination: '10.0.0.1',
+      dport: 22,
+      state: 'NEW'
+    };
+    const report = window.FirewallScope.trace(result, probe);
+    if (!report || report.error) return;
+    if (report.verdict !== 'ACCEPT') return;
+    if (!report.finalRule || report.finalRule.ruleIdx != null) return;
+    if (report.finalRule.chain !== chain.name) return;
+
+    findings.push({
+      id: 'fallthrough-accept',
+      severity: 'warning',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: null,
+      title: `${chain.name} lets a probe tcp/22 from any fall through to policy ACCEPT`,
+      details: 'No rule matched a representative inbound SSH probe — the chain policy is what accepted it. Click to inspect the trace.',
+      probePacket: probe
+    });
+  }
+
+  function inboundDirection(chain, format) {
+    if (format === 'nftables') {
+      if (!chain.builtIn) return null;
+      if (chain.hook === 'input')   return 'input';
+      if (chain.hook === 'forward') return 'forward';
+      return null;
+    }
+    if (chain.name === 'INPUT')   return 'input';
+    if (chain.name === 'FORWARD') return 'forward';
+    return null;
   }
 
   window.FirewallScope = window.FirewallScope || {};

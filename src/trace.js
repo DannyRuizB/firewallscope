@@ -46,6 +46,11 @@
     if (finalVerdict.table) {
       report.finalRule = { table: finalVerdict.table, chain: finalVerdict.chain, ruleIdx: finalVerdict.ruleIdx };
     }
+    if (report.verdict === 'ACCEPT' && report.finalRule && report.finalRule.ruleIdx == null) {
+      report.warnings.push(
+        `Packet ACCEPTED by ${report.finalRule.chain} policy fall-through — no rule matched explicitly. Consider an explicit ACCEPT for expected traffic or a default-deny policy.`
+      );
+    }
     report.steps.push({ type: 'verdict', action: report.verdict });
     return report;
   }

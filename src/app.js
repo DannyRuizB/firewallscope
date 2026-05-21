@@ -359,6 +359,16 @@
       window.FirewallScope.renderTable(result, lintReport);
     }
 
+    function fillTraceForm(p) {
+      traceDirection.value = p.direction || 'input';
+      traceProto.value     = p.protocol  || 'tcp';
+      traceSrc.value       = p.source       != null ? String(p.source)      : '';
+      traceDst.value       = p.destination  != null ? String(p.destination) : '';
+      traceDport.value     = p.dport        != null ? String(p.dport)       : '';
+      traceSport.value     = p.sport        != null ? String(p.sport)       : '';
+      traceState.value     = p.state || '';
+    }
+
     function runTrace() {
       if (!lastResult) return;
       const packet = {
@@ -524,6 +534,12 @@
         row.appendChild(body);
 
         row.addEventListener('click', () => {
+          if (f.id === 'fallthrough-accept' && f.probePacket) {
+            switchTab('trace');
+            fillTraceForm(f.probePacket);
+            runTrace();
+            return;
+          }
           switchTab('table');
           // The table view is already rendered with pills; scroll to the target rule.
           window.FirewallScope.scrollToRule &&

@@ -151,6 +151,17 @@
 
     const t = rule.tokens || {};
 
+    const ruleIif = extractIfaceFromRaw(rule.raw, 'in');
+    if (ruleIif) {
+      if (!packet.iif) return { matched: false };
+      if (ruleIif !== packet.iif) return { matched: false };
+    }
+    const ruleOif = extractIfaceFromRaw(rule.raw, 'out');
+    if (ruleOif) {
+      if (!packet.oif) return { matched: false };
+      if (ruleOif !== packet.oif) return { matched: false };
+    }
+
     const ruleProto = normalizeProto(t.protocol || extractProtoFromRaw(rule.raw));
     if (ruleProto && ruleProto !== (packet.protocol || '').toLowerCase()) return { matched: false };
 
@@ -215,12 +226,32 @@
   }
   function hasUnmodeledMatch(rule) {
     const raw = String(rule.raw || '');
-    if (/(?:^|\s)-i\s+\S/.test(raw)) return true;
-    if (/(?:^|\s)-o\s+\S/.test(raw)) return true;
-    if (/\b(?:iifname|oifname|iif|oif)\s+/.test(raw)) return true;
+    // Interfaces (-i / -o / iifname / oifname / iif / oif) are now modeled
+    // explicitly in matchesPacket; removed from this list as of v0.8.0.
     if (/-m\s+(?:limit|recent|hashlimit|connlimit|owner|mark|mac|string|hexstring|set|policy|conntrack(?!\s+--ctstate))/.test(raw)) return true;
     if (/\b(?:limit\s+rate|meter\s)/.test(raw)) return true;
     return false;
+  }
+
+  // Pulls the interface name out of a rule. Supports iptables / ufw "-i eth0"
+  // / "-o eth0" syntax and nftables "iifname \"eth0\"" / "iif eth0" /
+  // "oifname \"eth0\"" / "oif eth0". Negation ("! -i lo"), comma sets and
+  // wildcards are not handled — single literal interface only for v0.8.0.
+  function extractIfaceFromRaw(raw, kind) {
+    const s = String(raw || '');
+    let m;
+    if (kind === 'in') {
+      if ((m = s.match(/(?:^|\s)-i\s+(\S+)/)))            return m[1];
+      if ((m = s.match(/\biifname\s+"([^"]+)"/)))         return m[1];
+      if ((m = s.match(/\biifname\s+([\w@.\-]+)/)))       return m[1];
+      if ((m = s.match(/\biif\s+([\w@.\-]+)/)))           return m[1];
+    } else {
+      if ((m = s.match(/(?:^|\s)-o\s+(\S+)/)))            return m[1];
+      if ((m = s.match(/\boifname\s+"([^"]+)"/)))         return m[1];
+      if ((m = s.match(/\boifname\s+([\w@.\-]+)/)))       return m[1];
+      if ((m = s.match(/\boif\s+([\w@.\-]+)/)))           return m[1];
+    }
+    return null;
   }
   function ctState(rule) {
     const raw = String(rule.raw || '');

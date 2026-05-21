@@ -55,6 +55,8 @@
     const traceSport   = document.getElementById('trace-sport');
     const traceDst     = document.getElementById('trace-dst');
     const traceDport   = document.getElementById('trace-dport');
+    const traceIif     = document.getElementById('trace-iif');
+    const traceOif     = document.getElementById('trace-oif');
     const traceClear   = document.getElementById('trace-clear');
     const traceResult  = document.getElementById('trace-result');
     const traceVerdict = document.getElementById('trace-verdict');
@@ -366,6 +368,8 @@
       traceDst.value       = p.destination  != null ? String(p.destination) : '';
       traceDport.value     = p.dport        != null ? String(p.dport)       : '';
       traceSport.value     = p.sport        != null ? String(p.sport)       : '';
+      traceIif.value       = p.iif || '';
+      traceOif.value       = p.oif || '';
       traceState.value     = p.state || '';
     }
 
@@ -378,6 +382,8 @@
         destination: traceDst.value.trim() || undefined,
         dport: traceDport.value ? +traceDport.value : undefined,
         sport: traceSport.value ? +traceSport.value : undefined,
+        iif: traceIif.value.trim() || undefined,
+        oif: traceOif.value.trim() || undefined,
         state: traceState.value || undefined
       };
       const report = window.FirewallScope.trace(lastResult, packet);
@@ -409,6 +415,8 @@
       if (packet.sport)       pktBits.push(`:<span class="code">${packet.sport}</span>`);
       if (packet.destination) pktBits.push(`to <span class="code">${escapeHtml(packet.destination)}</span>`);
       if (packet.dport)       pktBits.push(`:<span class="code">${packet.dport}</span>`);
+      if (packet.iif)         pktBits.push(`iif=<span class="code">${escapeHtml(packet.iif)}</span>`);
+      if (packet.oif)         pktBits.push(`oif=<span class="code">${escapeHtml(packet.oif)}</span>`);
       if (packet.state)       pktBits.push(`state=<span class="code">${escapeHtml(packet.state)}</span>`);
       const dirLabel = packet.direction === 'output' ? 'OUTPUT'
                      : packet.direction === 'forward' ? 'FORWARD'

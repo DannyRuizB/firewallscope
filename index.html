@@ -113,6 +113,13 @@
         <div id="trace-ui" hidden>
           <form id="trace-form" class="trace-form">
             <div class="trace-row">
+              <label>Direction
+                <select id="trace-direction">
+                  <option value="input">incoming (INPUT)</option>
+                  <option value="output">outgoing (OUTPUT)</option>
+                  <option value="forward">forwarded (FORWARD)</option>
+                </select>
+              </label>
               <label>Protocol
                 <select id="trace-proto">
                   <option value="tcp">tcp</option>
@@ -157,7 +164,7 @@
   </main>
 
   <footer class="bottombar">
-    <span>v0.5.0</span>
+    <span>v0.5.1</span>
     <span>·</span>
     <span>MIT</span>
     <span>·</span>

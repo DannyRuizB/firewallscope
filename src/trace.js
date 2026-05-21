@@ -23,19 +23,25 @@
       return report;
     }
 
+    const direction = String(packet.direction || 'input').toLowerCase();
+    if (direction !== 'input' && direction !== 'output' && direction !== 'forward') {
+      report.error = `Unknown direction "${packet.direction}". Use 'input', 'output' or 'forward'.`;
+      return report;
+    }
+
     const filterTable = result.tables.find(t => isFilterTableName(t.name));
     if (!filterTable) {
       report.error = 'No filter table found — nothing to trace against.';
       return report;
     }
-    const inputChain = filterTable.chains.find(c => isInputChain(c, result.format));
-    if (!inputChain) {
-      report.error = `Filter table has no INPUT-like chain (built-in with hook input).`;
+    const entryChain = filterTable.chains.find(c => isBuiltInDirectionChain(c, direction, result.format));
+    if (!entryChain) {
+      report.error = `Filter table has no ${direction.toUpperCase()}-like chain (built-in with hook ${direction}).`;
       return report;
     }
 
     const visitedSet = new Set();
-    const finalVerdict = evaluateChain(filterTable, inputChain, packet, 0, report, visitedSet, result.format);
+    const finalVerdict = evaluateChain(filterTable, entryChain, packet, 0, report, visitedSet, result.format);
     report.verdict = finalVerdict.kind === 'RETURN' ? 'NO_MATCH' : finalVerdict.kind;
     if (finalVerdict.table) {
       report.finalRule = { table: finalVerdict.table, chain: finalVerdict.chain, ruleIdx: finalVerdict.ruleIdx };
@@ -180,9 +186,12 @@
     if (!name) return true;
     return String(name).toLowerCase() === 'filter';
   }
-  function isInputChain(chain, format) {
-    if (format === 'nftables') return chain.builtIn && chain.hook === 'input';
-    return chain.name === 'INPUT';
+  // direction is one of 'input' / 'output' / 'forward'. For nftables the
+  // hook attribute on the chain is matched directly; for iptables / ip6tables
+  // / ufw the chain is named INPUT / OUTPUT / FORWARD in upper-case.
+  function isBuiltInDirectionChain(chain, direction, format) {
+    if (format === 'nftables') return chain.builtIn && chain.hook === direction;
+    return chain.name === direction.toUpperCase();
   }
   function normalizeProto(p) {
     if (!p) return null;

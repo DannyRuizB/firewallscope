@@ -48,6 +48,7 @@
     const traceEmpty   = document.getElementById('trace-empty');
     const traceUI      = document.getElementById('trace-ui');
     const traceForm    = document.getElementById('trace-form');
+    const traceDirection = document.getElementById('trace-direction');
     const traceProto   = document.getElementById('trace-proto');
     const traceState   = document.getElementById('trace-state');
     const traceSrc     = document.getElementById('trace-src');
@@ -156,6 +157,7 @@
     });
     traceClear.addEventListener('click', () => {
       traceForm.reset();
+      traceDirection.value = 'input';
       traceProto.value = 'tcp';
       traceState.value = 'NEW';
       traceResult.hidden = true;
@@ -360,6 +362,7 @@
     function runTrace() {
       if (!lastResult) return;
       const packet = {
+        direction: traceDirection.value,
         protocol: traceProto.value,
         source: traceSrc.value.trim() || undefined,
         destination: traceDst.value.trim() || undefined,
@@ -397,7 +400,10 @@
       if (packet.destination) pktBits.push(`to <span class="code">${escapeHtml(packet.destination)}</span>`);
       if (packet.dport)       pktBits.push(`:<span class="code">${packet.dport}</span>`);
       if (packet.state)       pktBits.push(`state=<span class="code">${escapeHtml(packet.state)}</span>`);
-      let finalLine = `Packet: ${pktBits.join(' ')}`;
+      const dirLabel = packet.direction === 'output' ? 'OUTPUT'
+                     : packet.direction === 'forward' ? 'FORWARD'
+                     : 'INPUT';
+      let finalLine = `<span class="code">${dirLabel}</span> packet: ${pktBits.join(' ')}`;
       if (report.finalRule) {
         const r = report.finalRule;
         finalLine += ` &nbsp;·&nbsp; decided by <span class="code">${escapeHtml(r.table)}/${escapeHtml(r.chain)}</span>`;

@@ -27,9 +27,11 @@
       for (const chain of table.chains) {
         if (isFilterTable && isBuiltInInputChain(chain, result.format)) {
           flagMissingInputDrop(chain, table, findings);
+          flagLoopbackNotAllowed(chain, table, findings);
         }
         scanChainRules(chain, table, findings);
         detectShadowedRules(chain, table, findings, result.format);
+        detectRuleAfterPolicyDrop(chain, table, findings);
         if (isFilterTable) {
           detectFallthroughAccept(result, chain, table, result.format, findings);
         }
@@ -506,6 +508,70 @@
     if (chain.name === 'INPUT')   return 'input';
     if (chain.name === 'FORWARD') return 'forward';
     return null;
+  }
+
+  // Any rule placed after a catch-all DROP / REJECT is unreachable: the
+  // catch-all sweeps every packet first. We surface one finding per dead
+  // rule so the Lint tab can pinpoint each line. Overlaps intentionally
+  // with `shadowed-rule` on terminal actions (each angle is descriptive
+  // on its own; jumps / LOG / counter rules after the catch-all are only
+  // caught here because shadowed-rule excludes non-terminals).
+  function detectRuleAfterPolicyDrop(chain, table, findings) {
+    const rules = chain.rules || [];
+    let catchAllIdx = -1;
+    for (let i = 0; i < rules.length; i++) {
+      if (isCatchAllDeny(rules[i])) { catchAllIdx = i; break; }
+    }
+    if (catchAllIdx === -1 || catchAllIdx >= rules.length - 1) return;
+    const catchAll = rules[catchAllIdx];
+    const catchAllAction = String(catchAll.action || '').toUpperCase();
+    for (let j = catchAllIdx + 1; j < rules.length; j++) {
+      findings.push({
+        id: 'rule-after-policy-drop',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: j,
+        title: `Dead rule — unreachable after catch-all ${catchAllAction} at rule #${catchAllIdx + 1}`,
+        details: rules[j].raw || ''
+      });
+    }
+  }
+
+  function isCatchAllDeny(rule) {
+    const a = String(rule.action || '').toUpperCase();
+    if (a !== 'DROP' && a !== 'REJECT') return false;
+    const t = rule.tokens || {};
+    if (t.source || t.destination || t.dport || t.sport || t.protocol) return false;
+    if (t.iif || t.oif || t.in_interface || t.out_interface) return false;
+    if (ctState(rule)) return false;
+    if (hasUnmodeledMatch(rule)) return false;
+    return true;
+  }
+
+  // INPUT chains with a deny posture (policy DROP/REJECT, or a final
+  // catch-all DROP) that omit an explicit `-i lo -j ACCEPT` rule will
+  // block loopback traffic — a classic source of broken local services
+  // (Postgres on 127.0.0.1, systemd-resolved, X11 sockets, etc.).
+  function flagLoopbackNotAllowed(chain, table, findings) {
+    const hasDenyPosture =
+      isDropPolicy(chain.policy) ||
+      isRejectPolicy(chain.policy) ||
+      hasFinalCatchAllDrop(chain);
+    if (!hasDenyPosture) return;
+    const allowsLoopback = (chain.rules || []).some(r => isAcceptAction(r) && isLoopbackRule(r));
+    if (allowsLoopback) return;
+    findings.push({
+      id: 'loopback-not-allowed',
+      severity: 'warning',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: null,
+      title: `${chain.name} has default-deny but does not explicitly allow loopback`,
+      details: 'No `-i lo -j ACCEPT` (or nft `iifname "lo" accept`) rule found. Local services that bind to 127.0.0.1 will be blocked.'
+    });
   }
 
   window.FirewallScope = window.FirewallScope || {};

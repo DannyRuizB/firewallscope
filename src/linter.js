@@ -423,29 +423,50 @@
     return out;
   }
 
-  // Probes the chain with a representative inbound packet by replaying it
-  // through the trace engine. If the packet falls through to the chain's
-  // policy (no explicit rule matched) and the verdict is ACCEPT, we flag it.
-  // Complements `missing-input-drop` (structural) with a dynamic check that
-  // also catches near-misses where catch-all rules don't cover the probe.
+  // Probes the chain with a battery of representative inbound packets (one
+  // per admin port) by replaying them through the trace engine. Each probe
+  // whose verdict comes from chain policy ACCEPT — i.e. nothing matched it
+  // explicitly — contributes to a single finding for this chain. The probe
+  // packet attached to the finding is the first one that fell through, so
+  // clicking it reproduces a concrete failure in the Trace tab.
   function detectFallthroughAccept(result, chain, table, format, findings) {
     if (!window.FirewallScope || typeof window.FirewallScope.trace !== 'function') return;
+    if (!isV4ProbeApplicable(table, format)) return;
     const direction = inboundDirection(chain, format);
     if (!direction) return;
 
-    const probe = {
-      direction,
-      protocol: 'tcp',
-      source: '1.2.3.4',
-      destination: '10.0.0.1',
-      dport: 22,
-      state: 'NEW'
-    };
-    const report = window.FirewallScope.trace(result, probe);
-    if (!report || report.error) return;
-    if (report.verdict !== 'ACCEPT') return;
-    if (!report.finalRule || report.finalRule.ruleIdx != null) return;
-    if (report.finalRule.chain !== chain.name) return;
+    const fallenServices = [];
+    let firstFallenProbe = null;
+
+    for (const portStr of Object.keys(ADMIN_PORTS)) {
+      const port = +portStr;
+      const probe = {
+        direction,
+        protocol: 'tcp',
+        source: '1.2.3.4',
+        destination: '10.0.0.1',
+        dport: port,
+        state: 'NEW'
+      };
+      const report = window.FirewallScope.trace(result, probe);
+      if (!report || report.error) continue;
+      if (report.verdict !== 'ACCEPT') continue;
+      if (!report.finalRule || report.finalRule.ruleIdx != null) continue;
+      if (report.finalRule.chain !== chain.name) continue;
+
+      fallenServices.push(`${ADMIN_PORTS[portStr]} (${port})`);
+      if (!firstFallenProbe) firstFallenProbe = probe;
+    }
+
+    if (!firstFallenProbe) return;
+
+    const listed = fallenServices.join(', ');
+    const title = fallenServices.length === 1
+      ? `${chain.name} lets a probe for ${listed} fall through to policy ACCEPT`
+      : `${chain.name} lets probes for ${listed} fall through to policy ACCEPT`;
+    const details =
+      `Representative inbound probes landed on the chain's default policy with no rule matching. ` +
+      `Click to inspect the trace for ${fallenServices[0]}.`;
 
     findings.push({
       id: 'fallthrough-accept',
@@ -454,10 +475,25 @@
       tableFamily: table.family || null,
       chain: chain.name,
       ruleIdx: null,
-      title: `${chain.name} lets a probe tcp/22 from any fall through to policy ACCEPT`,
-      details: 'No rule matched a representative inbound SSH probe — the chain policy is what accepted it. Click to inspect the trace.',
-      probePacket: probe
+      title,
+      details,
+      probePacket: firstFallenProbe
     });
+  }
+
+  // The probe synthesises an IPv4 packet. ip6tables rulesets and nft `ip6`
+  // family tables wouldn't be probed faithfully (the trace's v6 arithmetic
+  // is limited and many rules would be silently skipped), so we exclude
+  // them to avoid false positives. nft `inet` and `ip` are kept — they are
+  // either v4 or dual-stack and the worst-case is a missed v6-only ACCEPT,
+  // which the user can spot in the trace anyway.
+  function isV4ProbeApplicable(table, format) {
+    if (format === 'ip6tables') return false;
+    if (format === 'nftables') {
+      const fam = String(table.family || '').toLowerCase();
+      if (fam === 'ip6') return false;
+    }
+    return true;
   }
 
   function inboundDirection(chain, format) {

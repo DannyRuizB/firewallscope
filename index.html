@@ -30,6 +30,7 @@
               <button type="button" data-sample="ufw">ufw status verbose</button>
               <button type="button" data-sample="leaky">iptables (leaky — for linter)</button>
               <button type="button" data-sample="shadowed">iptables (shadowed rules)</button>
+              <button type="button" data-sample="portforward">iptables (port-forward / DNAT)</button>
             </div>
           </div>
           <button id="upload" type="button">Upload</button>
@@ -147,8 +148,8 @@
               <label>Destination port <input id="trace-dport" type="number" min="1" max="65535" placeholder="22"></label>
             </div>
             <div class="trace-row">
-              <label>In iface <input id="trace-iif" type="text" placeholder="eth0 / lo / (any)"></label>
-              <label>Out iface <input id="trace-oif" type="text" placeholder="eth0 / lo / (any)"></label>
+              <label>Incoming iface (-i) <input id="trace-iif" type="text" placeholder="eth0 / lo / (any)"></label>
+              <label>Outgoing iface (-o) <input id="trace-oif" type="text" placeholder="eth0 / lo / (any)"></label>
             </div>
             <div class="trace-row trace-actions">
               <button id="trace-run" type="submit" class="primary">Run trace</button>
@@ -168,7 +169,7 @@
   </main>
 
   <footer class="bottombar">
-    <span>v0.11.0</span>
+    <span>v0.11.1</span>
     <span>·</span>
     <span>MIT</span>
     <span>·</span>

@@ -7,7 +7,8 @@
     nftables:  'samples/nft-ruleset.txt',
     ufw:       'samples/ufw-status.txt',
     leaky:     'samples/iptables-leaky.txt',
-    shadowed:  'samples/iptables-shadowed.txt'
+    shadowed:  'samples/iptables-shadowed.txt',
+    portforward: 'samples/iptables-portforward.txt'
   };
 
   const FORMAT_LABELS = {

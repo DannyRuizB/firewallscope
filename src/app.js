@@ -712,5 +712,22 @@
     function clearTable() {
       document.getElementById('table-content').innerHTML = '';
     }
+
+    // Deep-link support: ?sample=portforward&tab=graph auto-loads a built-in
+    // sample and switches to the requested tab. Useful for shareable demo
+    // URLs and for capturing screenshots from a headless browser without
+    // having to click through the UI.
+    const params = new URLSearchParams(window.location.search);
+    const sampleKey = params.get('sample');
+    const tabKey = params.get('tab');
+    if (sampleKey && SAMPLE_URLS[sampleKey]) {
+      loadSample(sampleKey).then(() => {
+        if (tabKey && ['graph', 'table', 'lint', 'trace'].includes(tabKey)) {
+          switchTab(tabKey);
+        }
+      });
+    } else if (tabKey && ['graph', 'table', 'lint', 'trace'].includes(tabKey)) {
+      switchTab(tabKey);
+    }
   });
 })();

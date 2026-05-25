@@ -40,15 +40,16 @@
       return report;
     }
 
-    // PREROUTING NAT happens before the routing decision feeds the packet
-    // into filter/INPUT or filter/FORWARD, so we walk it first for both of
-    // those directions and apply any DNAT/REDIRECT rewrite to the packet
-    // that filter will actually see. OUTPUT-direction NAT (`nat/OUTPUT`)
-    // is not modeled in v0.9.0 — only the inbound side, which covers the
-    // typical port-forward use case.
+    // NAT walks around the filter chain. PREROUTING (DNAT/REDIRECT) runs
+    // before filter/INPUT and filter/FORWARD. OUTPUT-direction DNAT runs
+    // before filter/OUTPUT. POSTROUTING (SNAT/MASQUERADE) runs *after*
+    // filter accepts the packet, on the forward and output paths only —
+    // INPUT packets terminate locally and never hit POSTROUTING.
     let workingPacket = packet;
     if (direction === 'input' || direction === 'forward') {
-      workingPacket = walkNatPrerouting(result, packet, report);
+      workingPacket = walkNatPrerouting(result, workingPacket, report);
+    } else if (direction === 'output') {
+      workingPacket = walkNatOutput(result, workingPacket, report);
     }
 
     const visitedSet = new Set();
@@ -57,6 +58,11 @@
     if (finalVerdict.table) {
       report.finalRule = { table: finalVerdict.table, chain: finalVerdict.chain, ruleIdx: finalVerdict.ruleIdx };
     }
+
+    if ((direction === 'forward' || direction === 'output') && report.verdict === 'ACCEPT') {
+      workingPacket = walkNatPostrouting(result, workingPacket, report);
+    }
+
     if (report.verdict === 'ACCEPT' && report.finalRule && report.finalRule.ruleIdx == null) {
       report.warnings.push(
         `Packet ACCEPTED by ${report.finalRule.chain} policy fall-through — no rule matched explicitly. Consider an explicit ACCEPT for expected traffic or a default-deny policy.`
@@ -316,61 +322,90 @@
     return false;
   }
 
-  // ── NAT PREROUTING walk ─────────────────────────────────────────────
-  // Iterates nat/PREROUTING rules looking for the first DNAT / REDIRECT
-  // that matches the packet. Applies the rewrite (destination IP and/or
-  // dport) and exits the chain — DNAT in iptables semantically terminates
-  // the nat-table chain for that packet, so we mirror that behavior. The
-  // (possibly rewritten) packet is returned so the caller can hand it to
-  // the filter chain.
-  function walkNatPrerouting(result, packet, report) {
+  // ── NAT walks ──────────────────────────────────────────────────────
+  // PREROUTING (DNAT/REDIRECT, rewrites destination) runs before filter
+  // for input/forward. OUTPUT-direction DNAT runs before filter/OUTPUT.
+  // POSTROUTING (SNAT/MASQUERADE, rewrites source) runs after filter
+  // accepts on forward/output. iptables semantics terminate the nat-table
+  // chain on the first matching rewrite, so we mirror that and exit the
+  // loop on the first match.
+  function walkNatChain(result, packet, report, opts) {
     const natTable = findNatTable(result);
     if (!natTable) return packet;
-    const preChain = natTable.chains.find(c => isPreroutingChain(c, result.format));
-    if (!preChain) return packet;
+    const chain = natTable.chains.find(c => opts.isChain(c, result.format));
+    if (!chain) return packet;
 
-    report.steps.push({ type: 'enter-chain', table: natTable.name, chain: preChain.name, depth: 0 });
-    const visitedKey = `${natTable.name}::${preChain.name}`;
+    report.steps.push({ type: 'enter-chain', table: natTable.name, chain: chain.name, depth: 0 });
+    const visitedKey = `${natTable.name}::${chain.name}`;
     if (!report.visitedChains.includes(visitedKey)) report.visitedChains.push(visitedKey);
 
-    const rules = preChain.rules || [];
+    const rules = chain.rules || [];
     for (let i = 0; i < rules.length; i++) {
       const rule = rules[i];
       const mr = matchesPacket(rule, packet);
       if (mr.skipped) {
-        report.steps.push({ type: 'skip', table: natTable.name, chain: preChain.name, ruleIdx: i, ruleRaw: rule.raw, reason: mr.reason, depth: 0 });
+        report.steps.push({ type: 'skip', table: natTable.name, chain: chain.name, ruleIdx: i, ruleRaw: rule.raw, reason: mr.reason, depth: 0 });
         continue;
       }
       if (!mr.matched) {
-        report.steps.push({ type: 'no-match', table: natTable.name, chain: preChain.name, ruleIdx: i, ruleRaw: rule.raw, depth: 0 });
+        report.steps.push({ type: 'no-match', table: natTable.name, chain: chain.name, ruleIdx: i, ruleRaw: rule.raw, depth: 0 });
         continue;
       }
-      const rewrite = extractDnatRewrite(rule);
+      const rewrite = opts.extractRewrite(rule, packet);
       if (!rewrite) {
-        report.steps.push({ type: 'match', table: natTable.name, chain: preChain.name, ruleIdx: i, ruleRaw: rule.raw, action: String(rule.action || '').toUpperCase(), depth: 0 });
+        report.steps.push({ type: 'match', table: natTable.name, chain: chain.name, ruleIdx: i, ruleRaw: rule.raw, action: String(rule.action || '').toUpperCase(), depth: 0 });
         continue;
       }
       const rewritten = applyRewrite(packet, rewrite);
+      const [ipField, portField] = opts.fields;
       report.steps.push({
-        type: 'dnat',
-        table: natTable.name, chain: preChain.name, ruleIdx: i,
+        type: opts.stepType,
+        table: natTable.name, chain: chain.name, ruleIdx: i,
         ruleRaw: rule.raw,
-        before: { destination: packet.destination || null, dport: packet.dport != null ? packet.dport : null },
-        after:  { destination: rewritten.destination || null, dport: rewritten.dport != null ? rewritten.dport : null },
+        before: { [ipField]: packet[ipField] || null, [portField]: packet[portField] != null ? packet[portField] : null },
+        after:  { [ipField]: rewritten[ipField] || null, [portField]: rewritten[portField] != null ? rewritten[portField] : null },
         depth: 0
       });
-      report.natPacket = { destination: rewritten.destination, dport: rewritten.dport };
+      report[opts.reportKey] = { [ipField]: rewritten[ipField], [portField]: rewritten[portField] };
       return rewritten;
     }
     return packet;
   }
 
+  function walkNatPrerouting(result, packet, report) {
+    return walkNatChain(result, packet, report, {
+      isChain: isPreroutingChain,
+      extractRewrite: extractDnatRewrite,
+      stepType: 'dnat',
+      fields: ['destination', 'dport'],
+      reportKey: 'natPacket'
+    });
+  }
+  function walkNatOutput(result, packet, report) {
+    return walkNatChain(result, packet, report, {
+      isChain: isNatOutputChain,
+      extractRewrite: extractDnatRewrite,
+      stepType: 'dnat',
+      fields: ['destination', 'dport'],
+      reportKey: 'natPacket'
+    });
+  }
+  function walkNatPostrouting(result, packet, report) {
+    return walkNatChain(result, packet, report, {
+      isChain: isPostroutingChain,
+      extractRewrite: extractSnatRewrite,
+      stepType: 'snat',
+      fields: ['source', 'sport'],
+      reportKey: 'snatPacket'
+    });
+  }
+
   function findNatTable(result) {
     if (!result || !Array.isArray(result.tables)) return null;
     if (result.format === 'nftables') {
-      // nft: any table that contains a chain of type "nat" hooked at prerouting.
+      // nft: any table that contains a chain of type "nat" hooked anywhere.
       return result.tables.find(t =>
-        (t.chains || []).some(c => c.builtIn && c.hook === 'prerouting')
+        (t.chains || []).some(c => c.builtIn && (c.hook === 'prerouting' || c.hook === 'postrouting' || c.hook === 'output'))
       ) || null;
     }
     return result.tables.find(t => String(t.name || '').toLowerCase() === 'nat') || null;
@@ -378,6 +413,14 @@
   function isPreroutingChain(chain, format) {
     if (format === 'nftables') return chain.builtIn && chain.hook === 'prerouting';
     return String(chain.name || '').toUpperCase() === 'PREROUTING';
+  }
+  function isPostroutingChain(chain, format) {
+    if (format === 'nftables') return chain.builtIn && chain.hook === 'postrouting';
+    return String(chain.name || '').toUpperCase() === 'POSTROUTING';
+  }
+  function isNatOutputChain(chain, format) {
+    if (format === 'nftables') return chain.builtIn && chain.hook === 'output';
+    return String(chain.name || '').toUpperCase() === 'OUTPUT';
   }
 
   // Recognizes DNAT and REDIRECT targets across iptables / nft syntaxes
@@ -438,6 +481,52 @@
     const out = Object.assign({}, packet);
     if (rewrite.destination) out.destination = rewrite.destination;
     if (rewrite.dport != null) out.dport = rewrite.dport;
+    if (rewrite.source)      out.source = rewrite.source;
+    if (rewrite.sport != null) out.sport = rewrite.sport;
+    return out;
+  }
+
+  // Recognizes SNAT and MASQUERADE targets across iptables / nft syntaxes
+  // and returns { source?, sport? } or null when the rule is not a source
+  // rewrite. MASQUERADE uses the outgoing interface IP at runtime, which
+  // the trace cannot know — we tag the rewrite with the oif name (or a
+  // generic placeholder) so the user sees that the source was rewritten
+  // even though the literal IP is not derivable from the ruleset.
+  function extractSnatRewrite(rule, packet) {
+    const raw = String(rule.raw || '');
+    const action = String(rule.action || '').toUpperCase();
+
+    // iptables: -j SNAT --to-source IP[:PORT]
+    if (action === 'SNAT') {
+      const m = raw.match(/--to-source\s+([^\s]+)/);
+      if (!m) return null;
+      return parseSnatTarget(m[1]);
+    }
+    // iptables: -j MASQUERADE
+    if (action === 'MASQUERADE') {
+      const iface = packet.oif || 'outgoing-iface';
+      return { source: `<${iface}>` };
+    }
+    // nft: "snat to 10.0.0.1[:PORT]" or "snat ip to 10.0.0.1"
+    let m;
+    if ((m = raw.match(/\bsnat\s+(?:ip\s+|ip6\s+)?to\s+([^\s,;]+)/))) {
+      return parseSnatTarget(m[1]);
+    }
+    // nft: "masquerade"
+    if (/\bmasquerade\b/.test(raw)) {
+      const iface = packet.oif || 'outgoing-iface';
+      return { source: `<${iface}>` };
+    }
+    return null;
+  }
+
+  function parseSnatTarget(s) {
+    const str = String(s).trim();
+    if (/[,\-]\d+\b/.test(str.replace(/^\d+\.\d+\.\d+\.\d+/, ''))) return null;
+    const m = str.match(/^(\d+\.\d+\.\d+\.\d+)(?::(\d+))?$/);
+    if (!m) return null;
+    const out = { source: m[1] };
+    if (m[2]) out.sport = +m[2];
     return out;
   }
 

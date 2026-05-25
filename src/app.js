@@ -423,12 +423,16 @@
                      : 'INPUT';
       let finalLine = `<span class="code">${dirLabel}</span> packet: ${pktBits.join(' ')}`;
       if (report.natPacket) {
-        finalLine += ` &nbsp;·&nbsp; rewritten by <span class="code">nat/PREROUTING</span> → <span class="code">${escapeHtml(formatNatPair(report.natPacket))}</span>`;
+        const natChain = packet.direction === 'output' ? 'nat/OUTPUT' : 'nat/PREROUTING';
+        finalLine += ` &nbsp;·&nbsp; rewritten by <span class="code">${natChain}</span> → <span class="code">${escapeHtml(formatNatPair(report.natPacket))}</span>`;
       }
       if (report.finalRule) {
         const r = report.finalRule;
         finalLine += ` &nbsp;·&nbsp; decided by <span class="code">${escapeHtml(r.table)}/${escapeHtml(r.chain)}</span>`;
         finalLine += r.ruleIdx == null ? ' (chain policy)' : ` rule <span class="code">#${r.ruleIdx + 1}</span>`;
+      }
+      if (report.snatPacket) {
+        finalLine += ` &nbsp;·&nbsp; SNAT by <span class="code">nat/POSTROUTING</span> → <span class="code">${escapeHtml(formatNatPair(report.snatPacket))}</span>`;
       }
       traceFinal.innerHTML = finalLine;
 
@@ -458,6 +462,7 @@
         else if (s.type === 'policy')  body.textContent = `fell through → policy ${s.action}${s.reason ? ' (' + s.reason + ')' : ''}`;
         else if (s.type === 'log')     body.textContent = `${s.action} (non-terminal, continues)`;
         else if (s.type === 'dnat')    body.textContent = `DNAT · ${formatNatPair(s.before)} → ${formatNatPair(s.after)}`;
+        else if (s.type === 'snat')    body.textContent = `SNAT · ${formatNatPair(s.before)} → ${formatNatPair(s.after)}`;
         else if (s.type === 'verdict') body.textContent = `final verdict: ${s.action}`;
         else                           body.textContent = JSON.stringify(s);
         li.appendChild(kind);
@@ -640,8 +645,9 @@
 
     function formatNatPair(p) {
       if (!p) return '?';
-      const ip = p.destination || 'any';
-      return p.dport != null ? `${ip}:${p.dport}` : ip;
+      const ip = p.destination || p.source || 'any';
+      const port = p.dport != null ? p.dport : (p.sport != null ? p.sport : null);
+      return port != null ? `${ip}:${port}` : ip;
     }
 
     function downloadBlob(blob, filename) {

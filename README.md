@@ -6,7 +6,7 @@
 
 ![FirewallScope on the iptables sample: the graph view renders the filter and nat tables as dashed compound boxes; built-in chains are colour-coded by policy (INPUT and FORWARD red for DROP, OUTPUT and the four nat chains green for ACCEPT), user-defined chains (DOCKER-USER, WEB, DOCKER) carry a dashed red border, and the jump edges between chains show a 2x counter where INPUT jumps to WEB on both port 80 and 443.](screenshots/screenshot.png)
 
-🟠 **v0.5.0** — early alpha. Four parsers, structural view, chain tooltips with action distribution and comments, PNG / SVG export, alignment guidelines when dragging chains, diff view (added / removed / reordered / policy change), a **linter** that flags four classes of common smell (overly permissive ACCEPT, exposed admin ports, missing default-deny on INPUT, shadowed rules), and **Trace a packet** — describe a single packet and FirewallScope walks the chains rule by rule, returning the verdict and a step-by-step trace, with the visited chains and taken jumps highlighted live in the Graph view.
+🟠 **v0.9.0** — early alpha. Four parsers, structural view, chain tooltips with action distribution and comments, PNG / SVG export, alignment guidelines when dragging chains, diff view (added / removed / reordered / policy change), a **linter** that flags four classes of common smell (overly permissive ACCEPT, exposed admin ports, missing default-deny on INPUT, shadowed rules), and **Trace a packet** — describe a single packet and FirewallScope walks the chains rule by rule, returning the verdict and a step-by-step trace, with the visited chains and taken jumps highlighted live in the Graph view.
 
 ---
 

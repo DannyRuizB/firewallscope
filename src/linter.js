@@ -35,6 +35,9 @@
         if (isFilterTable) {
           detectFallthroughAccept(result, chain, table, result.format, findings);
         }
+        if (isNatPreroutingChain(table, chain, result.format)) {
+          detectExposedViaDnat(table, chain, findings);
+        }
       }
     }
 
@@ -572,6 +575,53 @@
       title: `${chain.name} has default-deny but does not explicitly allow loopback`,
       details: 'No `-i lo -j ACCEPT` (or nft `iifname "lo" accept`) rule found. Local services that bind to 127.0.0.1 will be blocked.'
     });
+  }
+
+  // ── exposed-via-dnat ───────────────────────────────────────────────
+  // A port-forward from the public side to an admin port (ssh, mysql,
+  // rdp, postgres, redis, mongodb) is a NAT rule like:
+  //   -A PREROUTING -p tcp --dport 2222 -j DNAT --to-destination 10.0.0.5:22
+  // If the rule has no source restriction (`-s` / nft `ip saddr`), the
+  // admin service ends up reachable from anyone who can hit the public
+  // interface — the DNAT silently bypasses any default-deny intuition
+  // the operator may have for the filter chain. The rewritten dport is
+  // what we care about, not the externally-visible dport, so we reuse
+  // the trace engine's extractDnatRewrite to discover the real target.
+  function detectExposedViaDnat(table, chain, findings) {
+    if (!window.FirewallScope || typeof window.FirewallScope.extractDnatRewrite !== 'function') return;
+    const extract = window.FirewallScope.extractDnatRewrite;
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      const action = String(rule.action || '').toUpperCase();
+      if (action !== 'DNAT' && action !== 'REDIRECT') continue;
+      const rewrite = extract(rule);
+      if (!rewrite || rewrite.dport == null) continue;
+      const service = ADMIN_PORTS[rewrite.dport];
+      if (!service) continue;
+      if (!isSourceAny(rule)) continue;
+      const targetLabel = rewrite.destination
+        ? `${rewrite.destination}:${rewrite.dport}`
+        : `:${rewrite.dport}`;
+      findings.push({
+        id: 'exposed-via-dnat',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: `Port-forward exposes ${service} (port ${rewrite.dport}) without source restriction`,
+        details: `Rewrites to ${targetLabel}. With no \`-s\` (or nft \`ip saddr\`) the admin port is reachable from any source that can hit this interface. Consider restricting the source to your management network.`
+      });
+    }
+  }
+
+  function isNatPreroutingChain(table, chain, format) {
+    if (format === 'nftables') {
+      return chain.builtIn && chain.hook === 'prerouting';
+    }
+    return String(table.name || '').toLowerCase() === 'nat'
+        && String(chain.name || '').toUpperCase() === 'PREROUTING';
   }
 
   window.FirewallScope = window.FirewallScope || {};

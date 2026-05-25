@@ -532,4 +532,7 @@
 
   window.FirewallScope = window.FirewallScope || {};
   window.FirewallScope.trace = trace;
+  // Exposed so the linter can reuse the DNAT/REDIRECT target extraction
+  // without duplicating the regex set across modules.
+  window.FirewallScope.extractDnatRewrite = extractDnatRewrite;
 })();

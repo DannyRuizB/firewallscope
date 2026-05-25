@@ -40,8 +40,19 @@
       return report;
     }
 
+    // PREROUTING NAT happens before the routing decision feeds the packet
+    // into filter/INPUT or filter/FORWARD, so we walk it first for both of
+    // those directions and apply any DNAT/REDIRECT rewrite to the packet
+    // that filter will actually see. OUTPUT-direction NAT (`nat/OUTPUT`)
+    // is not modeled in v0.9.0 — only the inbound side, which covers the
+    // typical port-forward use case.
+    let workingPacket = packet;
+    if (direction === 'input' || direction === 'forward') {
+      workingPacket = walkNatPrerouting(result, packet, report);
+    }
+
     const visitedSet = new Set();
-    const finalVerdict = evaluateChain(filterTable, entryChain, packet, 0, report, visitedSet, result.format);
+    const finalVerdict = evaluateChain(filterTable, entryChain, workingPacket, 0, report, visitedSet, result.format);
     report.verdict = finalVerdict.kind === 'RETURN' ? 'NO_MATCH' : finalVerdict.kind;
     if (finalVerdict.table) {
       report.finalRule = { table: finalVerdict.table, chain: finalVerdict.chain, ruleIdx: finalVerdict.ruleIdx };
@@ -303,6 +314,131 @@
       }
     }
     return false;
+  }
+
+  // ── NAT PREROUTING walk ─────────────────────────────────────────────
+  // Iterates nat/PREROUTING rules looking for the first DNAT / REDIRECT
+  // that matches the packet. Applies the rewrite (destination IP and/or
+  // dport) and exits the chain — DNAT in iptables semantically terminates
+  // the nat-table chain for that packet, so we mirror that behavior. The
+  // (possibly rewritten) packet is returned so the caller can hand it to
+  // the filter chain.
+  function walkNatPrerouting(result, packet, report) {
+    const natTable = findNatTable(result);
+    if (!natTable) return packet;
+    const preChain = natTable.chains.find(c => isPreroutingChain(c, result.format));
+    if (!preChain) return packet;
+
+    report.steps.push({ type: 'enter-chain', table: natTable.name, chain: preChain.name, depth: 0 });
+    const visitedKey = `${natTable.name}::${preChain.name}`;
+    if (!report.visitedChains.includes(visitedKey)) report.visitedChains.push(visitedKey);
+
+    const rules = preChain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      const mr = matchesPacket(rule, packet);
+      if (mr.skipped) {
+        report.steps.push({ type: 'skip', table: natTable.name, chain: preChain.name, ruleIdx: i, ruleRaw: rule.raw, reason: mr.reason, depth: 0 });
+        continue;
+      }
+      if (!mr.matched) {
+        report.steps.push({ type: 'no-match', table: natTable.name, chain: preChain.name, ruleIdx: i, ruleRaw: rule.raw, depth: 0 });
+        continue;
+      }
+      const rewrite = extractDnatRewrite(rule);
+      if (!rewrite) {
+        report.steps.push({ type: 'match', table: natTable.name, chain: preChain.name, ruleIdx: i, ruleRaw: rule.raw, action: String(rule.action || '').toUpperCase(), depth: 0 });
+        continue;
+      }
+      const rewritten = applyRewrite(packet, rewrite);
+      report.steps.push({
+        type: 'dnat',
+        table: natTable.name, chain: preChain.name, ruleIdx: i,
+        ruleRaw: rule.raw,
+        before: { destination: packet.destination || null, dport: packet.dport != null ? packet.dport : null },
+        after:  { destination: rewritten.destination || null, dport: rewritten.dport != null ? rewritten.dport : null },
+        depth: 0
+      });
+      report.natPacket = { destination: rewritten.destination, dport: rewritten.dport };
+      return rewritten;
+    }
+    return packet;
+  }
+
+  function findNatTable(result) {
+    if (!result || !Array.isArray(result.tables)) return null;
+    if (result.format === 'nftables') {
+      // nft: any table that contains a chain of type "nat" hooked at prerouting.
+      return result.tables.find(t =>
+        (t.chains || []).some(c => c.builtIn && c.hook === 'prerouting')
+      ) || null;
+    }
+    return result.tables.find(t => String(t.name || '').toLowerCase() === 'nat') || null;
+  }
+  function isPreroutingChain(chain, format) {
+    if (format === 'nftables') return chain.builtIn && chain.hook === 'prerouting';
+    return String(chain.name || '').toUpperCase() === 'PREROUTING';
+  }
+
+  // Recognizes DNAT and REDIRECT targets across iptables / nft syntaxes
+  // and returns { destination?, dport? } or null when the rule is not a
+  // rewrite or the rewrite target is too complex to model (ranges, sets,
+  // load-balanced pools).
+  function extractDnatRewrite(rule) {
+    const raw = String(rule.raw || '');
+    const action = String(rule.action || '').toUpperCase();
+
+    // iptables: -j DNAT --to-destination IP[:PORT]  or  --to IP[:PORT]
+    if (action === 'DNAT') {
+      const m = raw.match(/--to-destination\s+([^\s]+)/) || raw.match(/--to\s+([^\s]+)/);
+      if (!m) return null;
+      return parseDnatTarget(m[1]);
+    }
+    // iptables: -j REDIRECT [--to-ports PORT] — rewrites dst to localhost on the same iface.
+    if (action === 'REDIRECT') {
+      const m = raw.match(/--to-ports?\s+(\d+)(?:[:\-]\d+)?/);
+      const port = m ? +m[1] : null;
+      const out = { destination: '127.0.0.1' };
+      if (port != null) out.dport = port;
+      return out;
+    }
+    // nft: "dnat to 192.168.1.10:8080" or "dnat ip to 192.168.1.10"
+    let m;
+    if ((m = raw.match(/\bdnat\s+(?:ip\s+|ip6\s+)?to\s+([^\s,;]+)/))) {
+      return parseDnatTarget(m[1]);
+    }
+    // nft: "redirect to :8080" or "redirect to 8080"
+    if ((m = raw.match(/\bredirect\s+to\s+:?(\d+)\b/))) {
+      return { destination: '127.0.0.1', dport: +m[1] };
+    }
+    return null;
+  }
+
+  // Parses an iptables-style DNAT target like "192.168.1.10", "192.168.1.10:8080"
+  // or "10.0.0.5". Anything fancier (port ranges, multiple targets) yields
+  // null so the trace can fall back to a plain match step.
+  function parseDnatTarget(s) {
+    const str = String(s).trim();
+    // Pure :port form (rare in DNAT but valid in REDIRECT)
+    if (str.startsWith(':')) {
+      const p = +str.slice(1);
+      if (!Number.isFinite(p)) return null;
+      return { dport: p };
+    }
+    // Range or list — bail
+    if (/[,\-]\d+\b/.test(str.replace(/^\d+\.\d+\.\d+\.\d+/, ''))) return null;
+    const m = str.match(/^(\d+\.\d+\.\d+\.\d+)(?::(\d+))?$/);
+    if (!m) return null;
+    const out = { destination: m[1] };
+    if (m[2]) out.dport = +m[2];
+    return out;
+  }
+
+  function applyRewrite(packet, rewrite) {
+    const out = Object.assign({}, packet);
+    if (rewrite.destination) out.destination = rewrite.destination;
+    if (rewrite.dport != null) out.dport = rewrite.dport;
+    return out;
   }
 
   window.FirewallScope = window.FirewallScope || {};

@@ -454,6 +454,7 @@
         else if (s.type === 'return')  body.textContent = s.reason ? `return (${s.reason})` : 'return';
         else if (s.type === 'policy')  body.textContent = `fell through → policy ${s.action}${s.reason ? ' (' + s.reason + ')' : ''}`;
         else if (s.type === 'log')     body.textContent = `${s.action} (non-terminal, continues)`;
+        else if (s.type === 'dnat')    body.textContent = `DNAT · ${formatNatPair(s.before)} → ${formatNatPair(s.after)}`;
         else if (s.type === 'verdict') body.textContent = `final verdict: ${s.action}`;
         else                           body.textContent = JSON.stringify(s);
         li.appendChild(kind);
@@ -632,6 +633,12 @@
         lines.push('');
       }
       return lines.join('\n');
+    }
+
+    function formatNatPair(p) {
+      if (!p) return '?';
+      const ip = p.destination || 'any';
+      return p.dport != null ? `${ip}:${p.dport}` : ip;
     }
 
     function downloadBlob(blob, filename) {

@@ -422,6 +422,9 @@
                      : packet.direction === 'forward' ? 'FORWARD'
                      : 'INPUT';
       let finalLine = `<span class="code">${dirLabel}</span> packet: ${pktBits.join(' ')}`;
+      if (report.natPacket) {
+        finalLine += ` &nbsp;·&nbsp; rewritten by <span class="code">nat/PREROUTING</span> → <span class="code">${escapeHtml(formatNatPair(report.natPacket))}</span>`;
+      }
       if (report.finalRule) {
         const r = report.finalRule;
         finalLine += ` &nbsp;·&nbsp; decided by <span class="code">${escapeHtml(r.table)}/${escapeHtml(r.chain)}</span>`;

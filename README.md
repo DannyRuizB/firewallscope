@@ -2,6 +2,8 @@
 
 > Visual analyzer for `iptables`, `ip6tables`, `nftables` and `ufw` rulesets — paste the output, see the structure.
 
+[![lint](https://github.com/DannyRuizB/firewallscope/actions/workflows/lint.yml/badge.svg)](https://github.com/DannyRuizB/firewallscope/actions/workflows/lint.yml)
+
 ### [Try the live demo →](https://dannyruizb.github.io/firewallscope/)
 
 ![FirewallScope on the port-forward sample: the input pane shows an iptables-save dump with a filter table (INPUT, FORWARD, OUTPUT) and a nat table publishing a web app (DNAT to 10.0.0.10:80/:443) and an SSH jumpbox (DNAT 2222 to 10.0.0.20:22) plus an outbound MASQUERADE. The graph view on the right renders both tables as compound boxes with chains colour-coded by policy (INPUT / FORWARD red for DROP, OUTPUT and nat chains green for ACCEPT).](screenshots/screenshot.png)

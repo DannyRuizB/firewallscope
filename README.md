@@ -18,6 +18,15 @@ The intended audience is **homelab admins, sysadmins learning iptables/nftables,
 
 Everything runs **client-side**. No upload, no daemon, no server.
 
+## What this demonstrates
+
+A project built on in-depth Linux networking and security knowledge. Skills on display:
+
+- **Linux firewalling in depth** — `iptables`, `ip6tables`, `nftables` and `ufw`: tables, chains, policies and rule semantics across all four syntaxes.
+- **Packet flow & NAT** — full `PREROUTING` / `FORWARD` / `POSTROUTING` model, `DNAT` / `SNAT` / `MASQUERADE` rewrites, and packet tracing across the pipeline.
+- **Security-review thinking** — a linter for 8 common ruleset smells (exposed admin ports, permissive accepts, shadowed rules, missing input drop…).
+- **Frontend engineering** — a zero-backend, fully client-side parser and graph renderer, deployed on GitHub Pages.
+
 ## Use it
 
 Live demo: **https://dannyruizb.github.io/firewallscope/** — runs 100% in your browser.
@@ -101,6 +110,10 @@ FirewallScope's direction: cover the common firewall surfaces and gradually add 
 - **Parsing**: vanilla JavaScript, one IIFE per parser, exposed on `window` to keep `file://` debugging cheap.
 - **Visualisation**: [Cytoscape.js](https://js.cytoscape.org/) 3.30 + [dagre](https://github.com/dagrejs/dagre) 0.8 via [cytoscape-dagre](https://github.com/cytoscape/cytoscape.js-dagre) 2.5.
 - **No backend**. Everything is one HTML file, three JS files for the renderer, and four parser files — served statically.
+
+## About
+
+Built by **[Danny Ruiz](https://github.com/DannyRuizB)** — systems & network administrator (ASIR, *Administración de Sistemas Informáticos en Red*). [More projects →](https://github.com/DannyRuizB?tab=repositories)
 
 ## License
 

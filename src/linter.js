@@ -183,7 +183,7 @@
     if (inner.includes(',')) {
       return inner.split(',').map(s => s.trim()).includes(String(port));
     }
-    const range = inner.match(/^(\d+)[:\-](\d+)$/);
+    const range = inner.match(/^(\d+)[:-](\d+)$/);
     if (range) {
       return port >= +range[1] && port <= +range[2];
     }
@@ -415,7 +415,7 @@
     const parts = inner.includes(',') ? inner.split(',').map(s => s.trim()) : [inner];
     const out = [];
     for (const part of parts) {
-      const r = part.match(/^(\d+)[:\-](\d+)$/);
+      const r = part.match(/^(\d+)[:-](\d+)$/);
       if (r) {
         out.push([+r[1], +r[2]]);
       } else if (/^\d+$/.test(part)) {

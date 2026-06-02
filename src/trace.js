@@ -60,7 +60,9 @@
     }
 
     if ((direction === 'forward' || direction === 'output') && report.verdict === 'ACCEPT') {
-      workingPacket = walkNatPostrouting(result, workingPacket, report);
+      // Called for its side-effects on `report`; the rewritten packet isn't
+      // read again before the verdict is returned below.
+      walkNatPostrouting(result, workingPacket, report);
     }
 
     if (report.verdict === 'ACCEPT' && report.finalRule && report.finalRule.ruleIdx == null) {
@@ -260,13 +262,13 @@
     if (kind === 'in') {
       if ((m = s.match(/(?:^|\s)-i\s+(\S+)/)))            return m[1];
       if ((m = s.match(/\biifname\s+"([^"]+)"/)))         return m[1];
-      if ((m = s.match(/\biifname\s+([\w@.\-]+)/)))       return m[1];
-      if ((m = s.match(/\biif\s+([\w@.\-]+)/)))           return m[1];
+      if ((m = s.match(/\biifname\s+([\w@.-]+)/)))       return m[1];
+      if ((m = s.match(/\biif\s+([\w@.-]+)/)))           return m[1];
     } else {
       if ((m = s.match(/(?:^|\s)-o\s+(\S+)/)))            return m[1];
       if ((m = s.match(/\boifname\s+"([^"]+)"/)))         return m[1];
-      if ((m = s.match(/\boifname\s+([\w@.\-]+)/)))       return m[1];
-      if ((m = s.match(/\boif\s+([\w@.\-]+)/)))           return m[1];
+      if ((m = s.match(/\boifname\s+([\w@.-]+)/)))       return m[1];
+      if ((m = s.match(/\boif\s+([\w@.-]+)/)))           return m[1];
     }
     return null;
   }
@@ -312,7 +314,7 @@
     const inner = setM ? setM[1] : str;
     const parts = inner.includes(',') ? inner.split(',').map(s => s.trim()) : [inner];
     for (const part of parts) {
-      const r = part.match(/^(\d+)[:\-](\d+)$/);
+      const r = part.match(/^(\d+)[:-](\d+)$/);
       if (r) {
         if (port >= +r[1] && port <= +r[2]) return true;
       } else if (/^\d+$/.test(part)) {
@@ -439,7 +441,7 @@
     }
     // iptables: -j REDIRECT [--to-ports PORT] — rewrites dst to localhost on the same iface.
     if (action === 'REDIRECT') {
-      const m = raw.match(/--to-ports?\s+(\d+)(?:[:\-]\d+)?/);
+      const m = raw.match(/--to-ports?\s+(\d+)(?:[:-]\d+)?/);
       const port = m ? +m[1] : null;
       const out = { destination: '127.0.0.1' };
       if (port != null) out.dport = port;
@@ -469,7 +471,7 @@
       return { dport: p };
     }
     // Range or list — bail
-    if (/[,\-]\d+\b/.test(str.replace(/^\d+\.\d+\.\d+\.\d+/, ''))) return null;
+    if (/[,-]\d+\b/.test(str.replace(/^\d+\.\d+\.\d+\.\d+/, ''))) return null;
     const m = str.match(/^(\d+\.\d+\.\d+\.\d+)(?::(\d+))?$/);
     if (!m) return null;
     const out = { destination: m[1] };
@@ -522,7 +524,7 @@
 
   function parseSnatTarget(s) {
     const str = String(s).trim();
-    if (/[,\-]\d+\b/.test(str.replace(/^\d+\.\d+\.\d+\.\d+/, ''))) return null;
+    if (/[,-]\d+\b/.test(str.replace(/^\d+\.\d+\.\d+\.\d+/, ''))) return null;
     const m = str.match(/^(\d+\.\d+\.\d+\.\d+)(?::(\d+))?$/);
     if (!m) return null;
     const out = { source: m[1] };

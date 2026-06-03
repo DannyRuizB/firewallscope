@@ -28,4 +28,13 @@ module.exports = [
       }],
     },
   },
+  {
+    // Node-based test suite (node:test + vm), run outside the browser.
+    files: ['test/**/*.js'],
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'commonjs',
+      globals: { ...globals.node },
+    },
+  },
 ];

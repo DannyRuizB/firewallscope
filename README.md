@@ -84,6 +84,16 @@ Cross-format diffs (e.g. iptables vs nftables) are rejected with a clear error �
 - **Renderers**: `src/graph.js` handles both the Cytoscape graph (with the [dagre](https://github.com/dagrejs/dagre) LR layout) and the DOM table.
 - **Stack**: vanilla HTML / CSS / JS, no build step. Cytoscape 3.30, dagre 0.8 and the cytoscape-dagre plugin are pulled via CDN.
 
+## Tests
+
+The parsing, linting, diff and trace logic is covered by a [`node:test`](https://nodejs.org/api/test.html) suite — no extra dependencies. Each module is a browser IIFE that hangs its API off `window`, so the tests load them into a Node `vm` sandbox whose global doubles as `window` (no browser, no bundler) and assert against the realistic fixtures in `samples/`: every format auto-detected, all 8 linter smells raised, packet traces (verdicts + error paths) and same-format / cross-format diffs.
+
+```bash
+npm test    # node --test over test/*.test.js — needs only Node, no install
+```
+
+CI runs ESLint **and** this suite on every push and pull request.
+
 ## Roadmap
 
 FirewallScope's direction: cover the common firewall surfaces and gradually add views that turn the same model into different lenses (structure, flow, diff).

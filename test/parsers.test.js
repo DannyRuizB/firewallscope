@@ -74,3 +74,10 @@ test('parse detects ip6tables and yields a filter table', () => {
   assert.equal(r.format, 'ip6tables');
   assert.ok(r.tables.some((t) => t.name === 'filter'));
 });
+
+test('parse honours an explicit format override', () => {
+  const r = FS.parse(sample('iptables-save.txt'), { format: 'iptables' });
+  assert.equal(r.format, 'iptables');
+  assert.equal(r.error, null);
+  assert.ok(r.tables.length > 0);
+});

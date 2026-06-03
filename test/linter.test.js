@@ -46,6 +46,27 @@ const ALL_SMELLS = [
   'shadowed-rule',
 ];
 
+test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
+  const { findings } = FS.lint(FS.parse(sample('iptables-portforward.txt')));
+  const dnat = findings.filter((f) => f.id === 'exposed-via-dnat');
+  // The 2222→22 ssh publish is flagged; the 8080→8006 redirect (not an admin
+  // port) is not — so exactly one finding, about ssh.
+  assert.equal(dnat.length, 1);
+  assert.match(dnat[0].title, /ssh/);
+});
+
+test('shadowed-rule flags a rule whose CIDR is a subset of an earlier same-action rule', () => {
+  const rs = [
+    '*filter',
+    ':INPUT ACCEPT [0:0]',
+    '-A INPUT -s 10.0.0.0/8 -j DROP',
+    '-A INPUT -s 10.0.0.5/32 -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  assert.ok(findings.some((f) => f.id === 'shadowed-rule'));
+});
+
 test('the sample set exercises all eight smells', () => {
   const seen = new Set();
   for (const name of Object.keys(EXPECTED)) {

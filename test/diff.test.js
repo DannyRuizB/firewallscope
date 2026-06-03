@@ -20,6 +20,13 @@ test('mergeForDiff summarises rule changes between two revisions', () => {
   );
 });
 
+test('mergeForDiff flags rules moved within a chain', () => {
+  const before = FS.parse(sample('iptables-save.txt'));
+  const after = FS.parse(sample('iptables-save-after.txt'));
+  const d = FS.mergeForDiff(before, after);
+  assert.ok(d.diff.movedRules >= 1, 'expected at least one moved rule');
+});
+
 test('mergeForDiff refuses to diff across firewall formats', () => {
   const ipt = FS.parse(sample('iptables-save.txt'));
   const nft = FS.parse(sample('nft-ruleset.txt'));

@@ -54,3 +54,23 @@ test('every sample format parses cleanly into at least one table', () => {
     assert.ok(r.tables.length > 0, `${name} should yield tables`);
   }
 });
+
+test('parse preserves nftables table families', () => {
+  const r = FS.parse(sample('nft-ruleset.txt'));
+  assert.equal(r.format, 'nftables');
+  assert.equal(r.tables.find((t) => t.name === 'filter').family, 'inet');
+  assert.equal(r.tables.find((t) => t.name === 'nat').family, 'ip');
+});
+
+test('parse reads ufw status rules into the common model', () => {
+  const r = FS.parse(sample('ufw-status.txt'));
+  assert.equal(r.format, 'ufw');
+  const rules = r.tables[0].chains.flatMap((c) => [...c.rules]);
+  assert.ok(rules.some((rule) => rule.tokens && rule.tokens.dport === '22'));
+});
+
+test('parse detects ip6tables and yields a filter table', () => {
+  const r = FS.parse(sample('ip6tables-save.txt'));
+  assert.equal(r.format, 'ip6tables');
+  assert.ok(r.tables.some((t) => t.name === 'filter'));
+});

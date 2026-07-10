@@ -6,13 +6,23 @@
 (function () {
   'use strict';
 
+  // Ports that should almost never be reachable from the whole internet:
+  // remote-access shells, databases, and unauthenticated data/admin services.
+  // Accepting any of these from 0.0.0.0/0 is flagged as an error.
   const ADMIN_PORTS = {
+    21:    'ftp',
     22:    'ssh',
     23:    'telnet',
+    445:   'smb',
+    1433:  'mssql',
+    2375:  'docker-api',   // Docker daemon without TLS — remote root, trivially
     3306:  'mysql',
     3389:  'rdp',
     5432:  'postgres',
+    5900:  'vnc',
     6379:  'redis',
+    9200:  'elasticsearch',
+    11211: 'memcached',
     27017: 'mongodb'
   };
 

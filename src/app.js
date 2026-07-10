@@ -8,7 +8,8 @@
     ufw:       'samples/ufw-status.txt',
     leaky:     'samples/iptables-leaky.txt',
     shadowed:  'samples/iptables-shadowed.txt',
-    portforward: 'samples/iptables-portforward.txt'
+    portforward: 'samples/iptables-portforward.txt',
+    exposed:   'samples/iptables-exposed-services.txt'
   };
 
   const FORMAT_LABELS = {

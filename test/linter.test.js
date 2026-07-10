@@ -67,6 +67,18 @@ test('shadowed-rule flags a rule whose CIDR is a subset of an earlier same-actio
   assert.ok(findings.some((f) => f.id === 'shadowed-rule'));
 });
 
+test('exposed-admin-port covers data/admin services beyond ssh', () => {
+  const { findings } = FS.lint(FS.parse(sample('iptables-exposed-services.txt')));
+  const exposed = findings.filter((f) => f.id === 'exposed-admin-port');
+  const services = exposed.map((f) => f.title);
+  // Each authless / high-value service accepted from 0.0.0.0/0 is flagged.
+  for (const svc of ['docker-api', 'elasticsearch', 'memcached', 'smb', 'mssql']) {
+    assert.ok(services.some((t) => t.includes(svc)), `expected ${svc} flagged`);
+  }
+  // VNC is only allowed from 10.0.0.0/8, so it must NOT be flagged as exposed.
+  assert.ok(!services.some((t) => t.includes('vnc')), 'vnc is source-restricted, not exposed');
+});
+
 test('the sample set exercises all eight smells', () => {
   const seen = new Set();
   for (const name of Object.keys(EXPECTED)) {

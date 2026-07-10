@@ -402,13 +402,10 @@
     const mP = parseCidr(mSrc);
     if (!nP || !mP) return false;                       // unparseable → be safe
     if (nP.family !== mP.family) return false;
-    if (nP.family === 'v6') {
-      // Avoid building a v6 BigInt parser for v0.4.1 — only accept the trivial
-      // cases: identical text or M is the all-zeroes default route.
-      return nSrc.trim() === mSrc.trim();
-    }
     if (nP.bits < mP.bits) return false;                // n's prefix is shorter → wider
-    const totalBits = 32n;
+    // N ⊆ M iff they agree on M's prefix bits. Same arithmetic for v4 (32-bit)
+    // and v6 (128-bit) now that both carry a BigInt value.
+    const totalBits = nP.family === 'v6' ? 128n : 32n;
     const shift = totalBits - BigInt(mP.bits);
     return (nP.value >> shift) === (mP.value >> shift);
   }
@@ -416,12 +413,54 @@
     const v = String(s || '').trim();
     return v === '' || v === '0.0.0.0/0' || v === '::/0' || /^any(where)?$/i.test(v);
   }
+  // Parse an IPv6 address to a 128-bit BigInt, or null if malformed. Handles
+  // "::" zero-compression, an optional %zone suffix, and an IPv4-mapped tail
+  // (::ffff:1.2.3.4). Returns null on anything it can't represent exactly, so
+  // the subset check stays conservative.
+  function parseIpv6ToBigInt(addr) {
+    let s = String(addr).trim();
+    const pct = s.indexOf('%');
+    if (pct !== -1) s = s.slice(0, pct);        // drop scope id (fe80::1%eth0)
+
+    // IPv4-mapped suffix → two hex groups.
+    const v4m = s.match(/^(.*:)((?:\d{1,3}\.){3}\d{1,3})$/);
+    if (v4m) {
+      const o = v4m[2].split('.').map(Number);
+      if (o.some((x) => x > 255)) return null;
+      s = v4m[1] + ((o[0] << 8) | o[1]).toString(16) + ':' + ((o[2] << 8) | o[3]).toString(16);
+    }
+
+    const halves = s.split('::');
+    if (halves.length > 2) return null;         // more than one "::" is illegal
+    const head = halves[0] === '' ? [] : halves[0].split(':');
+    let groups;
+    if (halves.length === 1) {
+      if (head.length !== 8) return null;        // no "::" → must be all 8 groups
+      groups = head;
+    } else {
+      const tail = halves[1] === '' ? [] : halves[1].split(':');
+      const missing = 8 - (head.length + tail.length);
+      if (missing < 1) return null;              // "::" must stand for ≥1 group
+      groups = [...head, ...Array(missing).fill('0'), ...tail];
+    }
+    let value = 0n;
+    for (const g of groups) {
+      if (!/^[0-9a-f]{1,4}$/i.test(g)) return null;
+      value = (value << 16n) | BigInt(parseInt(g, 16));
+    }
+    return value & ((1n << 128n) - 1n);
+  }
+
   function parseCidr(s) {
     const str = String(s).trim();
     if (str.includes(':')) {
-      const m = str.match(/^([0-9a-f:]+)(?:\/(\d+))?$/i);
+      const m = str.match(/^([0-9a-f:.%]+)(?:\/(\d+))?$/i);
       if (!m) return null;
-      return { family: 'v6', bits: m[2] !== undefined ? +m[2] : 128 };
+      const value = parseIpv6ToBigInt(m[1]);
+      if (value === null) return null;
+      const bits = m[2] !== undefined ? +m[2] : 128;
+      if (bits < 0 || bits > 128) return null;
+      return { family: 'v6', value, bits };
     }
     const m = str.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)(?:\/(\d+))?$/);
     if (!m) return null;

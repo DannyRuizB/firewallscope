@@ -18,6 +18,7 @@ const EXPECTED = {
   'iptables-shadowed.txt': ['shadowed-rule', 'rule-after-policy-drop'],
   'iptables-portforward.txt': ['exposed-via-dnat'],
   'ufw-status.txt': ['loopback-not-allowed'],
+  'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -44,6 +45,7 @@ const ALL_SMELLS = [
   'permissive-accept',
   'rule-after-policy-drop',
   'shadowed-rule',
+  'wide-open-port-range',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -79,7 +81,24 @@ test('exposed-admin-port covers data/admin services beyond ssh', () => {
   assert.ok(!services.some((t) => t.includes('vnc')), 'vnc is source-restricted, not exposed');
 });
 
-test('the sample set exercises all eight smells', () => {
+test('wide-open-port-range flags a huge dport range but not an ordinary one', () => {
+  const { findings } = FS.lint(FS.parse(sample('iptables-exposed-services.txt')));
+  const wide = findings.filter((f) => f.id === 'wide-open-port-range');
+  // The 1024:65535 rule (64512 ports) is flagged...
+  assert.equal(wide.length, 1);
+  assert.match(wide[0].title, /64512 ports/);
+
+  // ...but a few-hundred-port app range from any source is not.
+  const rs = [
+    '*filter', ':INPUT ACCEPT [0:0]',
+    '-A INPUT -p tcp -m tcp --dport 8000:8200 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('wide-open-port-range'), '201 ports is not "wide"');
+});
+
+test('the sample set exercises all nine smells', () => {
   const seen = new Set();
   for (const name of Object.keys(EXPECTED)) {
     for (const id of lintIds(name)) seen.add(id);

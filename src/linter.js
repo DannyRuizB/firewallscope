@@ -69,12 +69,34 @@
     });
   }
 
+  // A dport that opens more than this many ports at once, from any source, is
+  // almost always a mistake (e.g. `--dport 1024:65535`). Ordinary app ranges
+  // (a few hundred ports) stay under it and are not flagged.
+  const WIDE_PORT_THRESHOLD = 1024;
+
   function scanChainRules(chain, table, findings) {
     const isBuiltIn = chain.builtIn !== false; // many parsers omit the flag for built-ins
     for (let i = 0; i < chain.rules.length; i++) {
       const rule = chain.rules[i];
       if (!isAcceptAction(rule)) continue;
       if (!isSourceAny(rule)) continue;
+
+      // A very wide range subsumes any admin ports it contains, so check it
+      // first and report the range rather than a misleading single-port hit.
+      const span = dportSpan(rule);
+      if (span > WIDE_PORT_THRESHOLD) {
+        findings.push({
+          id: 'wide-open-port-range',
+          severity: 'warning',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: i,
+          title: `Accepts a wide port range (${span} ports) from any source`,
+          details: rule.raw || ''
+        });
+        continue;
+      }
 
       const portHit = matchAdminPort(rule);
       if (portHit) {
@@ -168,6 +190,18 @@
     const raw = String(rule.raw || '');
     return /ctstate[\s=]+[A-Z,_]*(RELATED|ESTABLISHED)/i.test(raw) ||
            /ct\s+state\s+[a-z,_\s]*(established|related)/i.test(raw);
+  }
+
+  // Total number of ports a rule's dport expression opens (0 if it has no
+  // dport, i.e. no port restriction — that's permissive-accept's job).
+  function dportSpan(rule) {
+    const d = rule.tokens && rule.tokens.dport;
+    if (!d) return 0;
+    const iv = portIntervals(String(d));
+    if (!iv) return 0;
+    let n = 0;
+    for (const [lo, hi] of iv) n += (hi - lo + 1);
+    return n;
   }
 
   function matchAdminPort(rule) {

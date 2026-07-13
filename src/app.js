@@ -9,7 +9,8 @@
     leaky:     'samples/iptables-leaky.txt',
     shadowed:  'samples/iptables-shadowed.txt',
     portforward: 'samples/iptables-portforward.txt',
-    exposed:   'samples/iptables-exposed-services.txt'
+    exposed:   'samples/iptables-exposed-services.txt',
+    router:    'samples/iptables-router-sloppy.txt'
   };
 
   const FORMAT_LABELS = {

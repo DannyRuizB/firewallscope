@@ -38,6 +38,10 @@
         if (isFilterTable && isBuiltInInputChain(chain, result.format)) {
           flagMissingInputDrop(chain, table, findings);
           flagLoopbackNotAllowed(chain, table, findings);
+          flagMissingEstablishedAccept(chain, table, findings, result.format);
+        }
+        if (isFilterTable && isBuiltInForwardChain(chain, result.format)) {
+          flagForwardNoDefaultDeny(chain, table, findings);
         }
         scanChainRules(chain, table, findings);
         detectShadowedRules(chain, table, findings, result.format);
@@ -133,6 +137,58 @@
       return chain.builtIn && chain.hook === 'input';
     }
     return chain.name === 'INPUT';
+  }
+
+  function isBuiltInForwardChain(chain, format) {
+    if (format === 'nftables') {
+      return chain.builtIn && chain.hook === 'forward';
+    }
+    return chain.name === 'FORWARD';
+  }
+
+  // FORWARD with policy ACCEPT and no catch-all deny routes anything between
+  // any interfaces the moment ip_forward is on — the classic way a Docker or
+  // VPN host quietly becomes an open router. Warning rather than error: on a
+  // non-routing host (ip_forward=0) the chain never sees a packet, which the
+  // ruleset alone can't tell us.
+  function flagForwardNoDefaultDeny(chain, table, findings) {
+    if (isDropPolicy(chain.policy) || isRejectPolicy(chain.policy)) return;
+    if (hasFinalCatchAllDrop(chain)) return;
+    findings.push({
+      id: 'forward-no-default-deny',
+      severity: 'warning',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: null,
+      title: `Chain ${chain.name} routes anything — no default-deny`,
+      details: `Policy is ${chain.policy || 'ACCEPT'} and there is no catch-all DROP / REJECT rule. If IP forwarding is enabled, this host forwards traffic between any networks it can reach.`
+    });
+  }
+
+  // A deny-posture INPUT without an ESTABLISHED,RELATED accept drops the
+  // replies to the host's own outbound connections — DNS answers, apt/dnf
+  // downloads, everything. Skipped for ufw: its iptables backend inserts the
+  // conntrack rule automatically and `ufw status` never shows it.
+  function flagMissingEstablishedAccept(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const hasDenyPosture =
+      isDropPolicy(chain.policy) ||
+      isRejectPolicy(chain.policy) ||
+      hasFinalCatchAllDrop(chain);
+    if (!hasDenyPosture) return;
+    const allowsEstablished = (chain.rules || []).some(r => isAcceptAction(r) && isEstablishedRule(r));
+    if (allowsEstablished) return;
+    findings.push({
+      id: 'missing-established-accept',
+      severity: 'warning',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: null,
+      title: `${chain.name} has default-deny but never accepts ESTABLISHED traffic`,
+      details: 'No `-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT` (or nft `ct state established,related accept`) rule found. Replies to this host\'s own outbound connections (DNS answers, package downloads) will be dropped.'
+    });
   }
 
   // Only the filter table (and its variants across formats) actually drops

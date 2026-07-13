@@ -19,6 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat'],
   'ufw-status.txt': ['loopback-not-allowed'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -46,6 +47,8 @@ const ALL_SMELLS = [
   'rule-after-policy-drop',
   'shadowed-rule',
   'wide-open-port-range',
+  'forward-no-default-deny',
+  'missing-established-accept',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -129,7 +132,7 @@ test('wide-open-port-range flags a huge dport range but not an ordinary one', ()
   assert.ok(!ids.has('wide-open-port-range'), '201 ports is not "wide"');
 });
 
-test('the sample set exercises all nine smells', () => {
+test('the sample set exercises every smell', () => {
   const seen = new Set();
   for (const name of Object.keys(EXPECTED)) {
     for (const id of lintIds(name)) seen.add(id);
@@ -137,4 +140,48 @@ test('the sample set exercises all nine smells', () => {
   for (const id of ALL_SMELLS) {
     assert.ok(seen.has(id), `no sample triggers '${id}'`);
   }
+});
+
+test('missing-established-accept does NOT fire when the conntrack rule exists', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    '-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('missing-established-accept'));
+});
+
+test('missing-established-accept is skipped for ufw (backend adds it invisibly)', () => {
+  // Deny posture, no conntrack rule visible — exactly what `ufw status` shows.
+  const ids = lintIds('ufw-status.txt');
+  assert.ok(!ids.has('missing-established-accept'));
+});
+
+test('forward-no-default-deny stays quiet on policy DROP or a catch-all tail', () => {
+  const dropPolicy = [
+    '*filter', ':FORWARD DROP [0:0]', 'COMMIT',
+  ].join('\n');
+  assert.ok(!new Set(FS.lint(FS.parse(dropPolicy)).findings.map((f) => f.id)).has('forward-no-default-deny'));
+
+  const catchAll = [
+    '*filter', ':FORWARD ACCEPT [0:0]',
+    '-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT',
+    '-A FORWARD -j DROP',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!new Set(FS.lint(FS.parse(catchAll)).findings.map((f) => f.id)).has('forward-no-default-deny'));
+});
+
+test('nft forward hook with policy accept is flagged too', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain forward {',
+    '		type filter hook forward priority filter; policy accept;',
+    '	}',
+    '}',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  assert.ok(findings.some((f) => f.id === 'forward-no-default-deny'));
 });

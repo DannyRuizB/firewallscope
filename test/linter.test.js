@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat'],
   'ufw-status.txt': ['loopback-not-allowed'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -49,6 +49,8 @@ const ALL_SMELLS = [
   'wide-open-port-range',
   'forward-no-default-deny',
   'missing-established-accept',
+  'masquerade-any-source',
+  'drop-without-log',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -172,6 +174,75 @@ test('forward-no-default-deny stays quiet on policy DROP or a catch-all tail', (
     'COMMIT',
   ].join('\n');
   assert.ok(!new Set(FS.lint(FS.parse(catchAll)).findings.map((f) => f.id)).has('forward-no-default-deny'));
+});
+
+test('masquerade-any-source stays quiet when the source is restricted', () => {
+  const rs = [
+    '*nat', ':POSTROUTING ACCEPT [0:0]',
+    '-A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('masquerade-any-source'));
+});
+
+test('masquerade-any-source flags an unrestricted nft masquerade, not a saddr-scoped one', () => {
+  const flagged = [
+    'table ip nat {',
+    '	chain postrouting {',
+    '		type nat hook postrouting priority srcnat; policy accept;',
+    '		oifname "eth0" masquerade',
+    '	}',
+    '}',
+  ].join('\n');
+  assert.ok(new Set(FS.lint(FS.parse(flagged)).findings.map((f) => f.id)).has('masquerade-any-source'));
+
+  const scoped = [
+    'table ip nat {',
+    '	chain postrouting {',
+    '		type nat hook postrouting priority srcnat; policy accept;',
+    '		ip saddr 10.8.0.0/24 oifname "eth0" masquerade',
+    '	}',
+    '}',
+  ].join('\n');
+  assert.ok(!new Set(FS.lint(FS.parse(scoped)).findings.map((f) => f.id)).has('masquerade-any-source'));
+});
+
+test('drop-without-log stays quiet when a LOG rule exists, and is skipped for ufw', () => {
+  const logged = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    '-A INPUT -m limit --limit 5/min -j LOG --log-prefix "DROP-INPUT: "',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!new Set(FS.lint(FS.parse(logged)).findings.map((f) => f.id)).has('drop-without-log'));
+
+  // ufw's backend logs on its own; `ufw status` can't show it — never flag.
+  assert.ok(!lintIds('ufw-status.txt').has('drop-without-log'));
+});
+
+test('drop-without-log recognizes the nft log statement (not just -j LOG)', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy drop;',
+    '		log prefix "DROP-INPUT: "',
+    '	}',
+    '}',
+  ].join('\n');
+  assert.ok(!new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id)).has('drop-without-log'));
+});
+
+test('drop-without-log fires as info on a silent default-deny', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  const f = findings.find((x) => x.id === 'drop-without-log');
+  assert.ok(f, 'expected drop-without-log');
+  assert.equal(f.severity, 'info');
 });
 
 test('nft forward hook with policy accept is flagged too', () => {

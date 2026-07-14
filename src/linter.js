@@ -43,6 +43,10 @@
         if (isFilterTable && isBuiltInForwardChain(chain, result.format)) {
           flagForwardNoDefaultDeny(chain, table, findings);
         }
+        if (isFilterTable &&
+            (isBuiltInInputChain(chain, result.format) || isBuiltInForwardChain(chain, result.format))) {
+          flagDropWithoutLog(chain, table, findings, result.format);
+        }
         scanChainRules(chain, table, findings);
         detectShadowedRules(chain, table, findings, result.format);
         detectRuleAfterPolicyDrop(chain, table, findings);
@@ -51,6 +55,9 @@
         }
         if (isNatPreroutingChain(table, chain, result.format)) {
           detectExposedViaDnat(table, chain, findings);
+        }
+        if (isNatPostroutingChain(table, chain, result.format)) {
+          detectMasqueradeAnySource(table, chain, findings);
         }
       }
     }
@@ -714,6 +721,76 @@
       title: `${chain.name} has default-deny but does not explicitly allow loopback`,
       details: 'No `-i lo -j ACCEPT` (or nft `iifname "lo" accept`) rule found. Local services that bind to 127.0.0.1 will be blocked.'
     });
+  }
+
+  // ── drop-without-log ───────────────────────────────────────────────
+  // A deny posture that never logs leaves no forensic trail: dropped
+  // probes (port scans, brute-force attempts) simply vanish. Info rather
+  // than warning — the ruleset is not less safe, just blind. Skipped for
+  // ufw, whose backend inserts its own rate-limited LOG rules and reports
+  // them only through `ufw status verbose`'s "Logging:" line.
+  function flagDropWithoutLog(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const hasDenyPosture =
+      isDropPolicy(chain.policy) ||
+      isRejectPolicy(chain.policy) ||
+      hasFinalCatchAllDrop(chain);
+    if (!hasDenyPosture) return;
+    if ((chain.rules || []).some(isLogRule)) return;
+    findings.push({
+      id: 'drop-without-log',
+      severity: 'info',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: null,
+      title: `${chain.name} drops traffic without logging any of it`,
+      details: 'No LOG / NFLOG (or nft `log`) rule found before the default-deny. Dropped packets — port scans, brute-force attempts — leave no trace for later forensics. Consider a rate-limited log rule, e.g. `-m limit --limit 5/min -j LOG --log-prefix "DROP-INPUT: "` (nft: `limit rate 5/minute log prefix "DROP-INPUT: "`).'
+    });
+  }
+
+  function isLogRule(rule) {
+    const a = String(rule.action || '').toUpperCase();
+    if (a === 'LOG' || a === 'NFLOG') return true;
+    // nft: `log` is a statement inside the rule, not its verdict — the parser
+    // reports the verdict (drop/accept/…) as the action, so check the raw
+    // text. The leading \s keeps iptables' own `--log-prefix` from matching.
+    return /(^|\s)log(\s|$)/.test(String(rule.raw || ''));
+  }
+
+  // ── masquerade-any-source ──────────────────────────────────────────
+  // A POSTROUTING MASQUERADE / SNAT with no source restriction rewrites
+  // every packet the host forwards, not just the LAN / VPN subnet it was
+  // meant for. Combined with a permissive FORWARD chain this turns the
+  // host into an anonymizing relay: anything routed through it leaves
+  // wearing its address. Restricting the source is nearly free and
+  // self-documents which network the NAT is for.
+  function detectMasqueradeAnySource(table, chain, findings) {
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      const action = String(rule.action || '').toUpperCase();
+      if (action !== 'MASQUERADE' && action !== 'SNAT') continue;
+      if (!isSourceAny(rule)) continue;
+      findings.push({
+        id: 'masquerade-any-source',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: `${action} without a source restriction NATs anything the host forwards`,
+        details: `${rule.raw || ''} — with no \`-s\` (or nft \`ip saddr\`) every forwarded packet is source-rewritten to this host's address. Restrict it to the subnet it is meant to serve (e.g. \`-s 10.8.0.0/24\`).`
+      });
+    }
+  }
+
+  function isNatPostroutingChain(table, chain, format) {
+    if (format === 'nftables') {
+      return chain.builtIn && chain.hook === 'postrouting';
+    }
+    return String(table.name || '').toLowerCase() === 'nat'
+        && String(chain.name || '').toUpperCase() === 'POSTROUTING';
   }
 
   // ── exposed-via-dnat ───────────────────────────────────────────────

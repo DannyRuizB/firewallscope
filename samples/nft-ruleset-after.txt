@@ -8,7 +8,7 @@ table inet filter {
 		tcp dport 22 jump ratelimit
 		tcp dport { 80, 443 } accept
 		ip saddr 10.0.0.0/8 tcp dport 8006 accept comment "proxmox vpn"
-		log prefix "DROP-INPUT: "
+		limit rate 5/minute log prefix "DROP-INPUT: "
 		drop
 	}
 	chain forward {

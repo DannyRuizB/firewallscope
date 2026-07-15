@@ -8,7 +8,7 @@ table inet filter {
 		tcp dport 22 accept comment "ssh"
 		tcp dport { 80, 443 } accept
 		ip saddr 192.168.1.0/24 tcp dport 8006 accept
-		log prefix "DROP-INPUT: "
+		limit rate 5/minute log prefix "DROP-INPUT: "
 		drop
 	}
 	chain forward {

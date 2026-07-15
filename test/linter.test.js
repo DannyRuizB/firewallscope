@@ -16,11 +16,11 @@ function lintIds(name) {
 const EXPECTED = {
   'iptables-leaky.txt': ['missing-input-drop', 'exposed-admin-port', 'permissive-accept', 'fallthrough-accept'],
   'iptables-shadowed.txt': ['shadowed-rule', 'rule-after-policy-drop'],
-  'iptables-portforward.txt': ['exposed-via-dnat'],
+  'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log'],
   'ufw-status.txt': ['loopback-not-allowed'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range'],
   'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'unused-chain'],
-  'ip6tables-no-icmpv6.txt': ['icmpv6-blocked'],
+  'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -54,6 +54,7 @@ const ALL_SMELLS = [
   'drop-without-log',
   'icmpv6-blocked',
   'unused-chain',
+  'unlimited-log',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -368,6 +369,56 @@ test('unused-chain works for nftables chains without a hook', () => {
   const unused = findings.filter((f) => f.id === 'unused-chain');
   assert.equal(unused.length, 1);
   assert.equal(unused[0].chain, 'orphan');
+});
+
+test('unlimited-log fires on an unthrottled LOG, quiet with -m limit / hashlimit', () => {
+  const bare = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -j LOG --log-prefix "IN: "',
+    'COMMIT',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(bare));
+  const hit = findings.find((f) => f.id === 'unlimited-log');
+  assert.ok(hit, 'expected unlimited-log');
+  assert.equal(hit.severity, 'warning');
+  assert.equal(hit.ruleIdx, 0);
+
+  for (const limited of [
+    '-A INPUT -m limit --limit 5/min -j LOG --log-prefix "IN: "',
+    '-A INPUT -m hashlimit --hashlimit-above 10/min --hashlimit-name lg -j LOG',
+  ]) {
+    const rs = ['*filter', ':INPUT DROP [0:0]', limited, 'COMMIT'].join('\n');
+    const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+    assert.ok(!ids.has('unlimited-log'), `should be quiet for: ${limited}`);
+  }
+});
+
+test('unlimited-log understands the nft limit rate statement', () => {
+  const flagged = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy drop;',
+    '		log prefix "IN: "',
+    '	}',
+    '}',
+  ].join('\n');
+  assert.ok(new Set(FS.lint(FS.parse(flagged)).findings.map((f) => f.id)).has('unlimited-log'));
+
+  const throttled = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy drop;',
+    '		limit rate 5/minute log prefix "IN: "',
+    '	}',
+    '}',
+  ].join('\n');
+  assert.ok(!new Set(FS.lint(FS.parse(throttled)).findings.map((f) => f.id)).has('unlimited-log'));
+});
+
+test('unlimited-log stays quiet on the flagship samples (their LOGs are throttled)', () => {
+  for (const s of ['iptables-save.txt', 'ip6tables-save.txt', 'nft-ruleset.txt', 'ufw-status.txt']) {
+    assert.ok(!lintIds(s).has('unlimited-log'), `expected ${s} clean`);
+  }
 });
 
 test('nft forward hook with policy accept is flagged too', () => {

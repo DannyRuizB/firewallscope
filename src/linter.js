@@ -49,6 +49,7 @@
           flagDropWithoutLog(chain, table, findings, result.format);
         }
         scanChainRules(chain, table, findings);
+        detectUnlimitedLog(chain, table, findings, result.format);
         detectShadowedRules(chain, table, findings, result.format);
         detectRuleAfterPolicyDrop(chain, table, findings);
         if (isFilterTable) {
@@ -862,6 +863,38 @@
     // reports the verdict (drop/accept/…) as the action, so check the raw
     // text. The leading \s keeps iptables' own `--log-prefix` from matching.
     return /(^|\s)log(\s|$)/.test(String(rule.raw || ''));
+  }
+
+  // ── unlimited-log ──────────────────────────────────────────────────
+  // A LOG rule with no rate limit turns logging into an attack surface:
+  // every matching packet writes a syslog line, so a port scan or a plain
+  // packet flood becomes a disk-filling (and log-drowning) primitive. The
+  // fix is one match away: `-m limit --limit 5/min` / nft `limit rate`.
+  // Skipped for ufw — its LOG rules live in the backend and never show in
+  // `ufw status`, so there is nothing to judge.
+  function isRateLimited(rule) {
+    const raw = String(rule.raw || '');
+    return /-m\s+(limit|hashlimit)\b/.test(raw) || /\blimit\s+rate\b/.test(raw);
+  }
+
+  function detectUnlimitedLog(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (!isLogRule(rule)) continue;
+      if (isRateLimited(rule)) continue;
+      findings.push({
+        id: 'unlimited-log',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: 'LOG rule has no rate limit',
+        details: 'Every matching packet writes a log line — a port scan or packet flood becomes a disk-filling attack. Add `-m limit --limit 5/min` (nft: `limit rate 5/minute`) in front of the log action.'
+      });
+    }
   }
 
   // ── masquerade-any-source ──────────────────────────────────────────

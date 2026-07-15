@@ -61,6 +61,7 @@
           detectMasqueradeAnySource(table, chain, findings);
         }
       }
+      detectUnusedChains(table, findings, result.format);
     }
 
     return summarize(findings);
@@ -197,6 +198,55 @@
       title: `${chain.name} has default-deny but never accepts ESTABLISHED traffic`,
       details: 'No `-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT` (or nft `ct state established,related accept`) rule found. Replies to this host\'s own outbound connections (DNS answers, package downloads) will be dropped.'
     });
+  }
+
+  // A user-defined chain that no packet can ever reach is dead configuration —
+  // and worse than clutter: an ACCEPT sitting in an unwired chain reads as if
+  // it were active. Reachability is computed by BFS from the built-in chains
+  // (following jump/goto within the table), so a chain referenced only by
+  // another dead chain is flagged too. Skipped for ufw (its status output has
+  // no user chains) and for tables with no built-in chain at all (a partial
+  // paste — reachability can't be reasoned about).
+  function detectUnusedChains(table, findings, format) {
+    if (format === 'ufw') return;
+    const chains = table.chains || [];
+    const byName = new Map(chains.map(c => [c.name, c]));
+    const visited = new Set();
+    const queue = [];
+    for (const chain of chains) {
+      if (chain.builtIn === true) {
+        visited.add(chain.name);
+        queue.push(chain);
+      }
+    }
+    if (queue.length === 0) return;
+    while (queue.length) {
+      const chain = queue.shift();
+      for (const rule of chain.rules || []) {
+        if (!rule.isJumpToChain || !rule.action) continue;
+        const target = byName.get(rule.action);
+        if (target && !visited.has(target.name)) {
+          visited.add(target.name);
+          queue.push(target);
+        }
+      }
+    }
+    for (const chain of chains) {
+      if (visited.has(chain.name)) continue;
+      const ruleCount = (chain.rules || []).length;
+      findings.push({
+        id: 'unused-chain',
+        severity: ruleCount > 0 ? 'warning' : 'info',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: null,
+        title: `Chain ${chain.name} is never reached`,
+        details: ruleCount > 0
+          ? `No reachable chain jumps to ${chain.name}, so its ${ruleCount} rule${ruleCount === 1 ? '' : 's'} never see a packet. If they were meant to be active, the jump is missing; if not, the chain is dead weight.`
+          : `Defined but empty and never jumped to — dead configuration, safe to delete.`
+      });
+    }
   }
 
   // An IPv6 default-deny INPUT that never accepts ICMPv6 doesn't harden the

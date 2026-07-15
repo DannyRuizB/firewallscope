@@ -3,11 +3,14 @@
 # conntrack ESTABLISHED rule (drops replies to its own outbound connections)
 # and never logs what it drops, FORWARD keeps policy ACCEPT with no catch-all
 # (it routes anything), and the MASQUERADE has no source restriction (it NATs
-# anything the box forwards, not just the LAN it was meant for).
+# anything the box forwards, not just the LAN it was meant for). The LAN_TRUST
+# chain was written but nobody ever wired it in — its ACCEPT never runs.
 *filter
 :INPUT DROP [0:0]
 :FORWARD ACCEPT [0:0]
 :OUTPUT ACCEPT [0:0]
+:LAN_TRUST - [0:0]
+-A LAN_TRUST -s 192.168.0.0/16 -j ACCEPT
 -A INPUT -i lo -j ACCEPT
 -A INPUT -p tcp -m tcp --dport 22 -s 10.0.0.0/8 -j ACCEPT
 -A INPUT -p icmp -j ACCEPT

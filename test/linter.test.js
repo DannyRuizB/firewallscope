@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat'],
   'ufw-status.txt': ['loopback-not-allowed'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'unused-chain'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked'],
 };
 
@@ -53,6 +53,7 @@ const ALL_SMELLS = [
   'masquerade-any-source',
   'drop-without-log',
   'icmpv6-blocked',
+  'unused-chain',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -303,6 +304,70 @@ test('icmpv6-blocked recognizes the nft `ip6 nexthdr icmpv6` spelling', () => {
     '}',
   ].join('\n');
   assert.ok(!new Set(FS.lint(FS.parse(v4only)).findings.map((f) => f.id)).has('icmpv6-blocked'));
+});
+
+test('unused-chain is a warning with rules, info when empty, quiet when referenced', () => {
+  const rs = [
+    '*filter',
+    ':INPUT DROP [0:0]',
+    ':WIRED - [0:0]',
+    ':ORPHAN - [0:0]',
+    ':EMPTY - [0:0]',
+    '-A INPUT -j WIRED',
+    '-A WIRED -p tcp --dport 443 -j ACCEPT',
+    '-A ORPHAN -s 192.168.0.0/16 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  const unused = findings.filter((f) => f.id === 'unused-chain');
+  // JSON compare: the linter runs in a vm sandbox, so its arrays have a
+  // different Array.prototype and deepStrictEqual rejects them cross-realm.
+  assert.equal(
+    JSON.stringify(unused.map((f) => [f.chain, f.severity]).sort()),
+    JSON.stringify([['EMPTY', 'info'], ['ORPHAN', 'warning']]),
+  );
+});
+
+test('unused-chain flags a chain referenced only by another dead chain', () => {
+  const rs = [
+    '*filter',
+    ':INPUT DROP [0:0]',
+    ':DEAD_A - [0:0]',
+    ':DEAD_B - [0:0]',
+    '-A DEAD_A -j DEAD_B',
+    '-A DEAD_B -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  const unused = findings.filter((f) => f.id === 'unused-chain').map((f) => f.chain).sort();
+  assert.equal(JSON.stringify(unused), JSON.stringify(['DEAD_A', 'DEAD_B']));
+});
+
+test('unused-chain stays quiet on the flagship samples (all chains wired)', () => {
+  assert.ok(!lintIds('iptables-save.txt').has('unused-chain'));
+  assert.ok(!lintIds('nft-ruleset.txt').has('unused-chain'));
+  assert.ok(!lintIds('ufw-status.txt').has('unused-chain'));
+});
+
+test('unused-chain works for nftables chains without a hook', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy drop;',
+    '		jump wired',
+    '	}',
+    '	chain wired {',
+    '		tcp dport 22 accept',
+    '	}',
+    '	chain orphan {',
+    '		tcp dport 8080 accept',
+    '	}',
+    '}',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  const unused = findings.filter((f) => f.id === 'unused-chain');
+  assert.equal(unused.length, 1);
+  assert.equal(unused[0].chain, 'orphan');
 });
 
 test('nft forward hook with policy accept is flagged too', () => {

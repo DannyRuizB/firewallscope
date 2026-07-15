@@ -10,7 +10,8 @@
     shadowed:  'samples/iptables-shadowed.txt',
     portforward: 'samples/iptables-portforward.txt',
     exposed:   'samples/iptables-exposed-services.txt',
-    router:    'samples/iptables-router-sloppy.txt'
+    router:    'samples/iptables-router-sloppy.txt',
+    noicmpv6:  'samples/ip6tables-no-icmpv6.txt'
   };
 
   const FORMAT_LABELS = {

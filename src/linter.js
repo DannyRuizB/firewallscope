@@ -39,6 +39,7 @@
           flagMissingInputDrop(chain, table, findings);
           flagLoopbackNotAllowed(chain, table, findings);
           flagMissingEstablishedAccept(chain, table, findings, result.format);
+          flagIcmpv6Blocked(chain, table, findings, result.format);
         }
         if (isFilterTable && isBuiltInForwardChain(chain, result.format)) {
           flagForwardNoDefaultDeny(chain, table, findings);
@@ -196,6 +197,61 @@
       title: `${chain.name} has default-deny but never accepts ESTABLISHED traffic`,
       details: 'No `-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT` (or nft `ct state established,related accept`) rule found. Replies to this host\'s own outbound connections (DNS answers, package downloads) will be dropped.'
     });
+  }
+
+  // An IPv6 default-deny INPUT that never accepts ICMPv6 doesn't harden the
+  // host — it breaks it. Neighbor Discovery (the IPv6 replacement for ARP)
+  // runs over ICMPv6, so dropping it kills address resolution, SLAAC and
+  // router discovery; Path MTU Discovery dies with it (IPv6 routers never
+  // fragment, so black-holed big packets just hang). Skipped for ufw (its
+  // before6.rules accepts ICMPv6 invisibly) and for plain iptables (an
+  // IPv4-only ruleset says nothing about the host's IPv6 posture).
+  function flagIcmpv6Blocked(chain, table, findings, format) {
+    if (format === 'ufw' || format === 'iptables') return;
+    if (format === 'nftables') {
+      const fam = String(table.family || '').toLowerCase();
+      if (fam !== 'ip6' && fam !== 'inet') return;
+    }
+    const hasDenyPosture =
+      isDropPolicy(chain.policy) ||
+      isRejectPolicy(chain.policy) ||
+      hasFinalCatchAllDrop(chain);
+    if (!hasDenyPosture) return;
+    if (chainAcceptsIcmpv6(chain, table, new Set())) return;
+    findings.push({
+      id: 'icmpv6-blocked',
+      severity: 'error',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: null,
+      title: `${chain.name} default-denies IPv6 but never accepts ICMPv6`,
+      details: 'IPv6 needs ICMPv6 to function: Neighbor Discovery (the ARP replacement) and Path MTU Discovery both run over it. Blocking it breaks address resolution and black-holes large packets. Add `-p ipv6-icmp -j ACCEPT` (nft: `meta l4proto ipv6-icmp accept`) before the deny.'
+    });
+  }
+
+  // True if the chain — or any chain it jumps to, followed recursively within
+  // the same table — has an ACCEPT that matches ICMPv6.
+  function chainAcceptsIcmpv6(chain, table, seen) {
+    if (seen.has(chain.name)) return false;
+    seen.add(chain.name);
+    for (const rule of chain.rules || []) {
+      if (isAcceptAction(rule) && isIcmpv6Rule(rule)) return true;
+      if (rule.isJumpToChain && rule.action) {
+        const target = (table.chains || []).find(c => c.name === rule.action);
+        if (target && chainAcceptsIcmpv6(target, table, seen)) return true;
+      }
+    }
+    return false;
+  }
+
+  function isIcmpv6Rule(rule) {
+    const proto = String((rule.tokens && rule.tokens.protocol) || '').toLowerCase();
+    if (proto === 'icmpv6' || proto === 'ipv6-icmp' || proto === 'icmp6') return true;
+    // nftables spellings never land in tokens.protocol: `ip6 nexthdr icmpv6`,
+    // `meta l4proto ipv6-icmp`, `icmpv6 type ...`
+    const text = `${rule.raw || ''} ${rule.match || ''}`;
+    return /icmpv6|ipv6-icmp|icmp6/i.test(text);
   }
 
   // Only the filter table (and its variants across formats) actually drops

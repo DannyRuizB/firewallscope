@@ -50,6 +50,7 @@
         }
         scanChainRules(chain, table, findings);
         detectUnlimitedLog(chain, table, findings, result.format);
+        detectDuplicateRules(chain, table, findings, result.format);
         detectShadowedRules(chain, table, findings, result.format);
         detectRuleAfterPolicyDrop(chain, table, findings);
         if (isFilterTable) {
@@ -423,12 +424,53 @@
     return { findings, counts, byKey };
   }
 
+  // ── duplicate-rule ───────────────────────────────────────────────────
+  // The same rule appearing twice in a chain is the signature of a
+  // non-idempotent provisioning script — an `iptables -A …` in rc.local or
+  // a deploy hook that appends on every boot / release. A duplicated
+  // terminal rule at least never fires, but a duplicated side-effect rule
+  // runs twice: a LOG writes two lines per packet, a jump traverses its
+  // subchain again, a second MASQUERADE is dead weight hiding drift.
+  // Exact textual copies are this smell's domain — detectShadowedRules
+  // skips them so each duplicate is reported once, with the right cause.
+  // Skipped for ufw: its CLI refuses to add an already-existing rule.
+  function normalizedRaw(rule) {
+    return String(rule.raw || '').trim().replace(/\s+/g, ' ');
+  }
+
+  function detectDuplicateRules(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const rules = chain.rules || [];
+    const firstSeen = new Map();
+    for (let i = 0; i < rules.length; i++) {
+      const key = normalizedRaw(rules[i]);
+      if (!key) continue;
+      if (!firstSeen.has(key)) {
+        firstSeen.set(key, i);
+        continue;
+      }
+      const orig = firstSeen.get(key);
+      findings.push({
+        id: 'duplicate-rule',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: `Duplicate rule — identical to rule #${orig + 1}`,
+        details: `${rules[i].raw || ''} — byte-for-byte copy of rule #${orig + 1}, usually left behind by a provisioning script that appends instead of checking (\`iptables -A\` on every boot). A duplicated LOG logs every packet twice and a duplicated jump traverses its chain again; a duplicated terminal rule never fires. Either way the copy hides drift — delete it and make the script idempotent (\`iptables -C … || iptables -A …\`).`,
+        duplicateOf: orig
+      });
+    }
+  }
+
   // ── shadow detection ─────────────────────────────────────────────────
   // For each terminal rule N, check whether any earlier terminal rule M in
   // the same chain already captures every packet that N matches. Strict
   // subset semantics on protocol / source / destination / dport / sport;
   // jumps are not considered terminal (they could RETURN); rules with
-  // divergent ct-state markers are not comparable.
+  // divergent ct-state markers are not comparable. Byte-identical copies
+  // are excluded — those are duplicate-rule findings, not shadowing.
 
   function detectShadowedRules(chain, table, findings, format) {
     const rules = chain.rules || [];
@@ -438,6 +480,7 @@
       for (let i = 0; i < j; i++) {
         const M = rules[i];
         if (!isTerminalAction(M)) continue;
+        if (normalizedRaw(M) === normalizedRaw(N)) continue; // duplicate-rule's domain
         if (!sameCtStateContext(M, N)) continue;
         if (!sameFamily(M, N, table, format)) continue;
         if (!isPacketSpaceSubset(N, M)) continue;

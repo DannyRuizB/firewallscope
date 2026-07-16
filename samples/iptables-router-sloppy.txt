@@ -4,7 +4,8 @@
 # and never logs what it drops, FORWARD keeps policy ACCEPT with no catch-all
 # (it routes anything), and the MASQUERADE has no source restriction (it NATs
 # anything the box forwards, not just the LAN it was meant for). The LAN_TRUST
-# chain was written but nobody ever wired it in — its ACCEPT never runs.
+# chain was written but nobody ever wired it in — its ACCEPT never runs. The
+# MASQUERADE appears twice: the rc.local script appends it on every boot.
 *filter
 :INPUT DROP [0:0]
 :FORWARD ACCEPT [0:0]
@@ -20,5 +21,6 @@ COMMIT
 :INPUT ACCEPT [0:0]
 :OUTPUT ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -o eth0 -j MASQUERADE
 -A POSTROUTING -o eth0 -j MASQUERADE
 COMMIT

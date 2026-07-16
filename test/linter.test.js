@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log'],
   'ufw-status.txt': ['loopback-not-allowed'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'unused-chain'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'unused-chain', 'duplicate-rule'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
 };
 
@@ -55,6 +55,7 @@ const ALL_SMELLS = [
   'icmpv6-blocked',
   'unused-chain',
   'unlimited-log',
+  'duplicate-rule',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -418,6 +419,60 @@ test('unlimited-log understands the nft limit rate statement', () => {
 test('unlimited-log stays quiet on the flagship samples (their LOGs are throttled)', () => {
   for (const s of ['iptables-save.txt', 'ip6tables-save.txt', 'nft-ruleset.txt', 'ufw-status.txt']) {
     assert.ok(!lintIds(s).has('unlimited-log'), `expected ${s} clean`);
+  }
+});
+
+test('duplicate-rule flags the copy, points at the original, and skips near-duplicates', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -m limit --limit 5/min -j LOG --log-prefix "IN: "',
+    '-A INPUT -p tcp -m tcp --dport 22 -s 10.0.0.0/8 -j ACCEPT',
+    '-A INPUT -m limit --limit 5/min -j LOG --log-prefix "IN: "',
+    '-A INPUT -p tcp -m tcp --dport 22 -s 10.0.1.0/24 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  const dups = findings.filter((f) => f.id === 'duplicate-rule');
+  assert.equal(dups.length, 1, 'only the byte-identical LOG copy is a duplicate');
+  assert.equal(dups[0].ruleIdx, 2);
+  assert.equal(dups[0].duplicateOf, 0);
+  assert.equal(dups[0].severity, 'warning');
+});
+
+test('an exact terminal copy is duplicate-rule, not shadowed-rule; a subset is still shadowed-rule', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --dport 22 -s 10.0.0.0/8 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  const dup = findings.filter((f) => f.id === 'duplicate-rule');
+  const shadowed = findings.filter((f) => f.id === 'shadowed-rule');
+  assert.equal(dup.length, 1);
+  assert.equal(dup[0].ruleIdx, 1);
+  assert.equal(shadowed.length, 1, 'the narrower rule is shadowing, not duplication');
+  assert.equal(shadowed[0].ruleIdx, 2);
+});
+
+test('duplicate-rule understands nft rulesets and ignores whitespace differences', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy drop;',
+    '		limit rate 5/minute log prefix "IN: "',
+    '		limit rate 5/minute  log prefix "IN: "',
+    '	}',
+    '}',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  assert.ok(findings.some((f) => f.id === 'duplicate-rule'));
+});
+
+test('duplicate-rule stays quiet on the flagship samples', () => {
+  for (const s of ['iptables-save.txt', 'ip6tables-save.txt', 'nft-ruleset.txt', 'ufw-status.txt', 'iptables-shadowed.txt']) {
+    assert.ok(!lintIds(s).has('duplicate-rule'), `expected ${s} clean`);
   }
 });
 

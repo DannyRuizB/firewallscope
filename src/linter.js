@@ -47,6 +47,7 @@
         if (isFilterTable &&
             (isBuiltInInputChain(chain, result.format) || isBuiltInForwardChain(chain, result.format))) {
           flagDropWithoutLog(chain, table, findings, result.format);
+          flagMissingInvalidDrop(chain, table, findings, result.format);
         }
         scanChainRules(chain, table, findings);
         detectUnlimitedLog(chain, table, findings, result.format);
@@ -906,6 +907,55 @@
     // reports the verdict (drop/accept/…) as the action, so check the raw
     // text. The leading \s keeps iptables' own `--log-prefix` from matching.
     return /(^|\s)log(\s|$)/.test(String(rule.raw || ''));
+  }
+
+  // ── missing-invalid-drop ───────────────────────────────────────────
+  // Standard hardening drops conntrack INVALID before any accept: a bare
+  // `--dport 80 -j ACCEPT` matches malformed / out-of-window TCP just as
+  // happily as a legitimate SYN, so crafted packets ride every open port.
+  // The default-deny only catches traffic that matches NO accept — this
+  // gap is about traffic that does. Only worth raising when the chain
+  // actually accepts something a crafted packet could ride (a non-loopback,
+  // non-conntrack accept); an INVALID drop placed AFTER those accepts is
+  // flagged too, pointing at the misplaced rule. Info severity, like
+  // drop-without-log: a hardening gap, not an open door. Skipped for ufw,
+  // whose backend drops INVALID in ufw-before-input without showing it.
+  function flagMissingInvalidDrop(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const hasDenyPosture =
+      isDropPolicy(chain.policy) ||
+      isRejectPolicy(chain.policy) ||
+      hasFinalCatchAllDrop(chain);
+    if (!hasDenyPosture) return;
+    const rules = chain.rules || [];
+    const firstRideableAccept = rules.findIndex(r =>
+      isAcceptAction(r) && !isLoopbackRule(r) && !isEstablishedRule(r));
+    if (firstRideableAccept === -1) return;
+    const invalidIdx = rules.findIndex(isInvalidDropRule);
+    if (invalidIdx !== -1 && invalidIdx < firstRideableAccept) return;
+    const misplaced = invalidIdx !== -1;
+    findings.push({
+      id: 'missing-invalid-drop',
+      severity: 'info',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: misplaced ? invalidIdx : null,
+      title: misplaced
+        ? `${chain.name} drops INVALID packets only after its ACCEPT rules`
+        : `${chain.name} never drops INVALID packets`,
+      details: misplaced
+        ? 'The `ctstate INVALID` drop sits below ACCEPT rules, so malformed / out-of-window packets aimed at an open port are accepted before it is ever consulted. Move it above the first ACCEPT.'
+        : 'No `-m conntrack --ctstate INVALID -j DROP` (nft: `ct state invalid drop`) rule found before the port accepts. Malformed / out-of-window packets match a plain `--dport` ACCEPT just like legitimate traffic — drop INVALID early, right after the loopback rule.'
+    });
+  }
+
+  function isInvalidDropRule(rule) {
+    const a = String(rule.action || '').toUpperCase();
+    if (a !== 'DROP' && a !== 'REJECT') return false;
+    const raw = String(rule.raw || '');
+    return /ctstate[\s=]+[A-Z,_]*INVALID/i.test(raw) ||
+           /ct\s+state\s+[a-z,_\s]*invalid/.test(raw);
   }
 
   // ── unlimited-log ──────────────────────────────────────────────────

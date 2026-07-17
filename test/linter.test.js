@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log'],
   'ufw-status.txt': ['loopback-not-allowed'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'unused-chain', 'duplicate-rule'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
 };
 
@@ -52,6 +52,7 @@ const ALL_SMELLS = [
   'missing-established-accept',
   'masquerade-any-source',
   'drop-without-log',
+  'missing-invalid-drop',
   'icmpv6-blocked',
   'unused-chain',
   'unlimited-log',
@@ -164,6 +165,68 @@ test('missing-established-accept is skipped for ufw (backend adds it invisibly)'
   // Deny posture, no conntrack rule visible — exactly what `ufw status` shows.
   const ids = lintIds('ufw-status.txt');
   assert.ok(!ids.has('missing-established-accept'));
+});
+
+test('missing-invalid-drop stays quiet when INVALID is dropped before the accepts', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    '-A INPUT -m conntrack --ctstate INVALID -j DROP',
+    '-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --dport 80 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('missing-invalid-drop'));
+});
+
+test('missing-invalid-drop flags an INVALID drop placed below the accepts', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --dport 80 -j ACCEPT',
+    '-A INPUT -m conntrack --ctstate INVALID -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'missing-invalid-drop');
+  assert.equal(hits.length, 1);
+  // Points at the misplaced drop itself (rule index 2), not at the chain.
+  assert.equal(hits[0].ruleIdx, 2);
+  assert.match(hits[0].title, /after its ACCEPT rules/);
+});
+
+test('missing-invalid-drop needs an accept a crafted packet could ride', () => {
+  // Deny posture but only loopback + conntrack accepts: nothing to ride, no
+  // finding — a chain like this is missing-established-accept's business.
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    '-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('missing-invalid-drop'));
+});
+
+test('missing-invalid-drop understands the nft spelling and is skipped for ufw', () => {
+  const clean = [
+    'table inet filter {',
+    '  chain input {',
+    '    type filter hook input priority 0; policy drop;',
+    '    iifname "lo" accept',
+    '    ct state invalid drop',
+    '    ct state established,related accept',
+    '    tcp dport 22 accept',
+    '  }',
+    '}',
+  ].join('\n');
+  assert.ok(!new Set(FS.lint(FS.parse(clean)).findings.map((f) => f.id)).has('missing-invalid-drop'));
+
+  const dirty = clean.replace('    ct state invalid drop\n', '');
+  assert.ok(new Set(FS.lint(FS.parse(dirty)).findings.map((f) => f.id)).has('missing-invalid-drop'));
+
+  // ufw's backend drops INVALID in ufw-before-input without ever showing it.
+  assert.ok(!lintIds('ufw-status.txt').has('missing-invalid-drop'));
 });
 
 test('forward-no-default-deny stays quiet on policy DROP or a catch-all tail', () => {

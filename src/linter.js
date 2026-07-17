@@ -50,6 +50,9 @@
           flagMissingInvalidDrop(chain, table, findings, result.format);
         }
         scanChainRules(chain, table, findings);
+        if (isFilterTable) {
+          detectOverbroadSource(chain, table, findings);
+        }
         detectUnlimitedLog(chain, table, findings, result.format);
         detectDuplicateRules(chain, table, findings, result.format);
         detectShadowedRules(chain, table, findings, result.format);
@@ -310,6 +313,52 @@
   // Only the filter table (and its variants across formats) actually drops
   // packets. nat / mangle / raw / security chains with policy ACCEPT are
   // normal and must not be flagged for missing default-deny.
+  // ── overbroad-source-trust ─────────────────────────────────────────
+  // A source prefix this short is "any" wearing a costume: 0.0.0.0/1 is
+  // half the internet, a public /8 is 16M addresses — yet none of them
+  // match isSourceAny, so an admin port "restricted" to 128.0.0.0/2
+  // sails past every any-source check (and past most human reviews,
+  // which see "-s something" and move on). Private space is exempt: a
+  // 10.0.0.0/8 or ULA trust is a normal site-wide rule. Flagged per
+  // ACCEPT rule in filter tables only; the fix is to scope the CIDR to
+  // the real network — or drop the pretence so the any-source smells
+  // can see it for what it is.
+  const OVERBROAD_V4_BITS = 8;   // /0../8 public v4 → flag
+  const OVERBROAD_V6_BITS = 16;  // /0../16 public v6 → flag (2000::/3 = all global unicast)
+
+  const PRIVATE_EXEMPT = ['10.0.0.0/8', '127.0.0.0/8', 'fc00::/7', 'fe80::/10', '::1/128'];
+
+  // cidrSubsetOrAny already handles family mismatch and unparseable input
+  // (both → false), so membership is a plain subset test per exempt net.
+  function isPrivateExempt(src) {
+    return PRIVATE_EXEMPT.some(net => cidrSubsetOrAny(src, net));
+  }
+
+  function detectOverbroadSource(chain, table, findings) {
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (!isAcceptAction(rule)) continue;
+      const src = rule.tokens && rule.tokens.source;
+      if (!src || isAnyCidr(src)) continue;      // true "any" is the other smells' job
+      const parsed = parseCidr(src);
+      if (!parsed) continue;
+      const threshold = parsed.family === 'v6' ? OVERBROAD_V6_BITS : OVERBROAD_V4_BITS;
+      if (parsed.bits > threshold) continue;
+      if (isPrivateExempt(src)) continue;
+      findings.push({
+        id: 'overbroad-source-trust',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: `Accepts from ${src} — a /${parsed.bits} public range is "any" in costume`,
+        details: `A source prefix this short${parsed.family === 'v4' && parsed.bits === 1 ? ' (half the internet)' : ''} evades every any-source check while restricting almost nothing. Scope it to the real network, or remove the source match so the any-source smells can judge the rule honestly. Rule: ${rule.raw || ''}`
+      });
+    }
+  }
+
   function isFilterTableName(name) {
     if (!name) return true; // some formats lack table names (ufw): treat as filter
     const n = String(name).toLowerCase();

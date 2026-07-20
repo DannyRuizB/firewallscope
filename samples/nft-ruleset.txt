@@ -3,7 +3,7 @@ table inet filter {
 		type filter hook input priority filter; policy drop;
 		iifname "lo" accept
 		ct state established,related accept
-		ip protocol icmp accept
+		ip protocol icmp limit rate 10/second accept
 		ip6 nexthdr icmpv6 accept
 		tcp dport 22 accept comment "ssh"
 		tcp dport { 80, 443 } accept

@@ -54,6 +54,9 @@
           detectOverbroadSource(chain, table, findings);
         }
         detectUnlimitedLog(chain, table, findings, result.format);
+        if (isFilterTable) {
+          detectUnlimitedIcmpEcho(chain, table, findings, result.format);
+        }
         detectDuplicateRules(chain, table, findings, result.format);
         detectShadowedRules(chain, table, findings, result.format);
         detectRuleAfterPolicyDrop(chain, table, findings);
@@ -1035,6 +1038,59 @@
         ruleIdx: i,
         title: 'LOG rule has no rate limit',
         details: 'Every matching packet writes a log line — a port scan or packet flood becomes a disk-filling attack. Add `-m limit --limit 5/min` (nft: `limit rate 5/minute`) in front of the log action.'
+      });
+    }
+  }
+
+  // ── unlimited-icmp-echo ────────────────────────────────────────────
+  // Answering ping from anywhere with no rate limit hands out a free
+  // packet-reflection primitive: every echo-request costs the host an
+  // echo-reply, so a spoofed-source flood turns it into an amplifier and
+  // a direct one burns its CPU/bandwidth for free. The fix is the same
+  // one unlimited-log teaches: `-m limit --limit 10/sec` / nft `limit
+  // rate`. For IPv4 a blanket `-p icmp -j ACCEPT` counts (echo-request
+  // is included); an explicit non-echo --icmp-type does not answer ping
+  // and is skipped. For IPv6 only an EXPLICIT echo-request (type 128)
+  // match counts — blanket ICMPv6 accepts are required hygiene (Neighbor
+  // Discovery, PMTUD; icmpv6-blocked exists to demand them) and must not
+  // be punished here. Skipped for ufw, whose ICMP handling lives in
+  // before.rules and never shows in `ufw status`.
+  function acceptsIcmpEcho(rule) {
+    const text = `${rule.raw || ''} ${rule.match || ''}`;
+    if (isIcmpv6Rule(rule)) {
+      return /--icmpv6-type[\s=]+(echo-request|128)(\/|\s|$)/.test(text) ||
+             /(^|\s)icmpv6\s+type\s+(echo-request|128)(\s|$)/.test(text);
+    }
+    const proto = String((rule.tokens && rule.tokens.protocol) || '').toLowerCase();
+    // nft spellings never land in tokens.protocol: `ip protocol icmp`,
+    // `meta l4proto icmp`, `icmp type echo-request`. The (^|\s)…(\s|$)
+    // guards keep `icmpv6` / `ipv6-icmp` / `icmp6` from matching.
+    if (proto !== 'icmp' && !/(^|\s)icmp(\s|$)/.test(text)) return false;
+    const typed = text.match(/--icmp-type[\s=]+(\S+)/) ||
+                  text.match(/(^|\s)icmp\s+type\s+(\S+)/);
+    if (!typed) return true; // no type match = all types, echo included
+    const type = typed[typed.length - 1];
+    return /^(echo-request|8)(\/|$)/.test(type);
+  }
+
+  function detectUnlimitedIcmpEcho(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (!isAcceptAction(rule)) continue;
+      if (!isSourceAny(rule)) continue;
+      if (!acceptsIcmpEcho(rule)) continue;
+      if (isRateLimited(rule)) continue;
+      findings.push({
+        id: 'unlimited-icmp-echo',
+        severity: 'info',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: 'Answers ping from anywhere with no rate limit',
+        details: 'An unthrottled echo-request ACCEPT makes the host a free reflector: every ping costs it a reply, so a spoofed-source flood uses it as an amplifier. Add `-m limit --limit 10/sec` (nft: `limit rate 10/second`) to the rule — legitimate diagnostics never need more.'
       });
     }
   }

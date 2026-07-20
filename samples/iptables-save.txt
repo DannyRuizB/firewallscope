@@ -7,7 +7,7 @@
 :WEB - [0:0]
 -A INPUT -i lo -j ACCEPT
 -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
--A INPUT -p icmp -j ACCEPT
+-A INPUT -p icmp -m limit --limit 10/sec -j ACCEPT
 -A INPUT -p tcp -m tcp --dport 22 -m comment --comment "ssh" -j ACCEPT
 -A INPUT -p tcp -m tcp --dport 80 -j WEB
 -A INPUT -p tcp -m tcp --dport 443 -j WEB

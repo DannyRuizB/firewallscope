@@ -3,6 +3,10 @@
 > Visual analyzer for `iptables`, `ip6tables`, `nftables` and `ufw` rulesets — paste the output, see the structure.
 
 [![lint](https://github.com/DannyRuizB/firewallscope/actions/workflows/lint.yml/badge.svg)](https://github.com/DannyRuizB/firewallscope/actions/workflows/lint.yml)
+[![Live demo](https://img.shields.io/badge/demo-dannyruizb.github.io%2Ffirewallscope-3b82f6)](https://dannyruizb.github.io/firewallscope/)
+![No backend](https://img.shields.io/badge/backend-none%20·%20runs%20in%20your%20browser-f59e0b)
+![Formats](https://img.shields.io/badge/parsers-iptables%20·%20ip6tables%20·%20nftables%20·%20ufw-6366f1)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ### [Try the live demo →](https://dannyruizb.github.io/firewallscope/)
 

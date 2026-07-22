@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo'],
   'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
 };
 
@@ -61,6 +61,7 @@ const ALL_SMELLS = [
   'unlimited-icmp-echo',
   'unrestricted-egress',
   'mac-based-trust',
+  'admin-port-no-rate-limit',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -785,4 +786,69 @@ test('mac-based-trust does not double-count and coexists with the IP-level smell
   const ids = FS.lint(FS.parse(rs)).findings.map((f) => f.id);
   assert.equal(ids.filter((x) => x === 'mac-based-trust').length, 1);
   assert.ok(ids.includes('exposed-admin-port'), 'MAC match must not count as a source restriction');
+});
+
+test('admin-port-no-rate-limit flags an unthrottled SSH accept, spares a throttled one', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT',
+    '-A INPUT -p tcp --dport 22 -m recent --set -j ACCEPT',
+    '-A INPUT -p tcp --dport 22 -m hashlimit --hashlimit-name ssh --hashlimit-above 5/min -j ACCEPT',
+    '-A INPUT -p tcp --dport 22 -m connlimit --connlimit-above 10 -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'admin-port-no-rate-limit');
+  // Only the first (bare) accept is flagged; recent/hashlimit ones are throttled,
+  // and the connlimit rule is a DROP (not an accept) so it never qualifies.
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 0);
+  assert.equal(hits[0].severity, 'info');
+  assert.match(hits[0].title, /ssh/);
+});
+
+test('admin-port-no-rate-limit ignores non-admin service ports', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp --dport 80 -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('admin-port-no-rate-limit'), 'http/https are not admin ports');
+});
+
+test('admin-port-no-rate-limit reads the nft limit rate / ct count spellings', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority 0; policy drop;',
+    '		tcp dport 3389 accept',
+    '		tcp dport 3306 limit rate 10/minute accept',
+    '		tcp dport 5432 ct count over 20 drop',
+    '	}',
+    '}',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'admin-port-no-rate-limit');
+  // rdp/3389 bare accept fires; the throttled mysql accept and the ct-count
+  // postgres drop do not.
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 0);
+  assert.match(hits[0].title, /rdp/);
+});
+
+test('admin-port-no-rate-limit composes with exposed-admin-port (different axes)', () => {
+  // An any-source SSH with no throttle: exposed-admin-port (who) AND
+  // admin-port-no-rate-limit (how fast) both fire, once each.
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = FS.lint(FS.parse(rs)).findings.map((f) => f.id);
+  assert.equal(ids.filter((x) => x === 'admin-port-no-rate-limit').length, 1);
+  assert.ok(ids.includes('exposed-admin-port'));
+});
+
+test('admin-port-no-rate-limit is skipped for ufw', () => {
+  assert.ok(!lintIds('ufw-status.txt').has('admin-port-no-rate-limit'));
 });

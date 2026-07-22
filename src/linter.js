@@ -53,6 +53,7 @@
         if (isFilterTable) {
           detectOverbroadSource(chain, table, findings);
           detectMacBasedTrust(chain, table, findings, result.format);
+          detectAdminPortNoRateLimit(chain, table, findings, result.format);
         }
         detectUnlimitedLog(chain, table, findings, result.format);
         if (isFilterTable) {
@@ -1131,6 +1132,47 @@
         ruleIdx: i,
         title: 'Answers ping from anywhere with no rate limit',
         details: 'An unthrottled echo-request ACCEPT makes the host a free reflector: every ping costs it a reply, so a spoofed-source flood uses it as an amplifier. Add `-m limit --limit 10/sec` (nft: `limit rate 10/second`) to the rule — legitimate diagnostics never need more.'
+      });
+    }
+  }
+
+  // ── admin-port-no-rate-limit ───────────────────────────────────────
+  // An ACCEPT to an admin port (SSH, RDP, database consoles…) with no
+  // per-source rate limit lets brute-force login attempts arrive at full
+  // speed — a botnet can try thousands of passwords a second against sshd.
+  // A netfilter throttle caps new connections per source *before* they
+  // reach the service, and complements Fail2Ban (which reacts after the
+  // fact, from the log). Recognises the connection-limiting matches
+  // (`-m recent`, `-m hashlimit`, `-m connlimit`, plain `-m limit`) and the
+  // nft spellings (`limit rate`, `ct count`). Info severity: defense in
+  // depth, not an open door — and it composes with exposed-admin-port
+  // (that one is about *who* can reach the port; this one about *how fast*
+  // they can hammer it), so an unthrottled any-source SSH draws both.
+  function hasBruteForceLimit(rule) {
+    const raw = String(rule.raw || '');
+    return /-m\s+(limit|hashlimit|connlimit|recent)\b/.test(raw) ||
+           /\blimit\s+rate\b/.test(raw) ||
+           /\bct\s+count\b/.test(raw);
+  }
+
+  function detectAdminPortNoRateLimit(chain, table, findings, format) {
+    if (format === 'ufw') return; // ufw's own `limit` verb lives in the backend view
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (!isAcceptAction(rule)) continue;
+      const admin = matchAdminPort(rule);
+      if (!admin) continue;
+      if (hasBruteForceLimit(rule)) continue;
+      findings.push({
+        id: 'admin-port-no-rate-limit',
+        severity: 'info',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: `${admin.service} accepts new connections with no rate limit`,
+        details: `An ACCEPT for ${admin.service} (port ${admin.port}) has no per-source throttle, so brute-force attempts hit it at full speed. Add a netfilter limit — \`-m recent\` / \`-m hashlimit\` / \`-m connlimit\` (nft: \`limit rate\` / \`ct count\`) — to cap attempts per source before they reach the service, and pair it with Fail2Ban. Independent of who can reach the port: even a source-restricted admin port is worth throttling.`
       });
     }
   }

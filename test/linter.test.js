@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo'],
   'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
 };
 
@@ -60,6 +60,7 @@ const ALL_SMELLS = [
   'duplicate-rule',
   'unlimited-icmp-echo',
   'unrestricted-egress',
+  'mac-based-trust',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -741,4 +742,47 @@ test('unrestricted-egress fires on the default ufw posture (deny in, allow out)'
   const hits = FS.lint(FS.parse(sample('ufw-status.txt'))).findings.filter((f) => f.id === 'unrestricted-egress');
   assert.equal(hits.length, 1);
   assert.equal(hits[0].chain, 'OUTPUT');
+});
+
+test('mac-based-trust flags an ACCEPT keyed on a source MAC, spares a DROP', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp --dport 8080 -m mac --mac-source AA:BB:CC:DD:EE:FF -j ACCEPT',
+    '-A INPUT -m mac --mac-source 11:22:33:44:55:66 -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'mac-based-trust');
+  // The trusting ACCEPT fires; blocking a known-bad MAC is caution, not trust.
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 0);
+  assert.equal(hits[0].severity, 'warning');
+  assert.match(hits[0].title, /AA:BB:CC:DD:EE:FF/);
+});
+
+test('mac-based-trust reads the nft ether saddr spelling', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority 0; policy drop;',
+    '		ether saddr aa:bb:cc:dd:ee:ff tcp dport 8080 accept',
+    '		ether saddr 11:22:33:44:55:66 drop',
+    '	}',
+    '}',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'mac-based-trust');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 0);
+});
+
+test('mac-based-trust does not double-count and coexists with the IP-level smells', () => {
+  // An ssh accept "restricted" by MAC only: exposed-admin-port must STILL
+  // fire (a MAC match is not a source restriction) alongside this smell.
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp --dport 22 -m mac --mac-source AA:BB:CC:DD:EE:FF -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = FS.lint(FS.parse(rs)).findings.map((f) => f.id);
+  assert.equal(ids.filter((x) => x === 'mac-based-trust').length, 1);
+  assert.ok(ids.includes('exposed-admin-port'), 'MAC match must not count as a source restriction');
 });

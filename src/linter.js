@@ -52,6 +52,7 @@
         scanChainRules(chain, table, findings);
         if (isFilterTable) {
           detectOverbroadSource(chain, table, findings);
+          detectMacBasedTrust(chain, table, findings, result.format);
         }
         detectUnlimitedLog(chain, table, findings, result.format);
         if (isFilterTable) {
@@ -1130,6 +1131,38 @@
         ruleIdx: i,
         title: 'Answers ping from anywhere with no rate limit',
         details: 'An unthrottled echo-request ACCEPT makes the host a free reflector: every ping costs it a reply, so a spoofed-source flood uses it as an amplifier. Add `-m limit --limit 10/sec` (nft: `limit rate 10/second`) to the rule — legitimate diagnostics never need more.'
+      });
+    }
+  }
+
+  // ── mac-based-trust ────────────────────────────────────────────────
+  // A MAC address is identification, not authentication: it is broadcast
+  // to the whole local segment (ARP/NDP) and forged with one `ip link set
+  // address` — so an ACCEPT keyed on the sender's MAC hands every LAN
+  // neighbor a skeleton key. It also never survives routing (L2 only),
+  // which makes the rule look scoped while restricting nothing an attacker
+  // on the segment can't copy. Blocking by MAC stays unflagged — broad
+  // caution is fine, borrowed trust is the smell (the same philosophy as
+  // overbroad-source-trust and the DROP/REJECT exemption there).
+  function detectMacBasedTrust(chain, table, findings, format) {
+    if (format === 'ufw') return; // ufw's rule syntax has no MAC match
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (!isAcceptAction(rule)) continue;
+      const raw = String(rule.raw || '');
+      const mac = raw.match(/--mac-source\s+([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})/) ||
+                  raw.match(/\bether\s+saddr\s+([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})/);
+      if (!mac) continue;
+      findings.push({
+        id: 'mac-based-trust',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: `Trusts a spoofable MAC address (${mac[1]})`,
+        details: 'A MAC is identification, not authentication: every device on the segment sees it (ARP/NDP) and can wear it with one `ip link set address` command. Note the IP-level smells still judge this rule as unrestricted — a MAC match is not a source restriction. Scope the rule to an IP/subnet (or authenticate for real: keys, 802.1X); blocking a known-bad MAC is fine, trusting one is not.'
       });
     }
   }

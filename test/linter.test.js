@@ -17,9 +17,9 @@ const EXPECTED = {
   'iptables-leaky.txt': ['missing-input-drop', 'exposed-admin-port', 'permissive-accept', 'fallthrough-accept'],
   'iptables-shadowed.txt': ['shadowed-rule', 'rule-after-policy-drop'],
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo'],
-  'ufw-status.txt': ['loopback-not-allowed'],
+  'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
 };
 
@@ -59,6 +59,7 @@ const ALL_SMELLS = [
   'unlimited-log',
   'duplicate-rule',
   'unlimited-icmp-echo',
+  'unrestricted-egress',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -653,4 +654,91 @@ test('unlimited-icmp-echo punishes explicit ICMPv6 echo but never blanket ICMPv6
 test('unlimited-icmp-echo is skipped for ufw', () => {
   const ids = lintIds('ufw-status.txt');
   assert.ok(!ids.has('unlimited-icmp-echo'));
+});
+
+test('unrestricted-egress fires when INPUT is locked down and OUTPUT is wide open', () => {
+  const rs = [
+    '*filter',
+    ':INPUT DROP [0:0]',
+    ':OUTPUT ACCEPT [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'unrestricted-egress');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].severity, 'info');
+  assert.equal(hits[0].chain, 'OUTPUT');
+  assert.equal(hits[0].ruleIdx, null);
+});
+
+test('unrestricted-egress stays quiet when INPUT is open too (missing-input-drop territory)', () => {
+  const rs = [
+    '*filter',
+    ':INPUT ACCEPT [0:0]',
+    ':OUTPUT ACCEPT [0:0]',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('unrestricted-egress'));
+  assert.ok(ids.has('missing-input-drop'));
+});
+
+test('unrestricted-egress spares an OUTPUT with deny policy or a catch-all deny', () => {
+  const policyDeny = [
+    '*filter',
+    ':INPUT DROP [0:0]',
+    ':OUTPUT DROP [0:0]',
+    '-A OUTPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!new Set(FS.lint(FS.parse(policyDeny)).findings.map((f) => f.id)).has('unrestricted-egress'));
+
+  const catchAll = [
+    '*filter',
+    ':INPUT DROP [0:0]',
+    ':OUTPUT ACCEPT [0:0]',
+    '-A OUTPUT -p udp --dport 53 -j ACCEPT',
+    '-A OUTPUT -j DROP',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!new Set(FS.lint(FS.parse(catchAll)).findings.map((f) => f.id)).has('unrestricted-egress'));
+});
+
+test('unrestricted-egress accepts a catch-all-drop INPUT as "locked down"', () => {
+  // Deny posture via final catch-all rule instead of chain policy.
+  const rs = [
+    '*filter',
+    ':INPUT ACCEPT [0:0]',
+    ':OUTPUT ACCEPT [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    '-A INPUT -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'unrestricted-egress');
+  assert.equal(hits.length, 1);
+});
+
+test('unrestricted-egress reads the nft hooks and spares a deny-posture output', () => {
+  const open = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority 0; policy drop;',
+    '	}',
+    '	chain output {',
+    '		type filter hook output priority 0; policy accept;',
+    '	}',
+    '}',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(open)).findings.filter((f) => f.id === 'unrestricted-egress');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].chain, 'output');
+
+  const filtered = open.replace('hook output priority 0; policy accept;', 'hook output priority 0; policy drop;');
+  assert.ok(!new Set(FS.lint(FS.parse(filtered)).findings.map((f) => f.id)).has('unrestricted-egress'));
+});
+
+test('unrestricted-egress fires on the default ufw posture (deny in, allow out)', () => {
+  const hits = FS.lint(FS.parse(sample('ufw-status.txt'))).findings.filter((f) => f.id === 'unrestricted-egress');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].chain, 'OUTPUT');
 });

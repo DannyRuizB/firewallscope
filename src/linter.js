@@ -71,6 +71,9 @@
         }
       }
       detectUnusedChains(table, findings, result.format);
+      if (isFilterTable) {
+        detectUnrestrictedEgress(table, findings, result.format);
+      }
     }
 
     return summarize(findings);
@@ -162,6 +165,42 @@
       return chain.builtIn && chain.hook === 'forward';
     }
     return chain.name === 'FORWARD';
+  }
+
+  function isBuiltInOutputChain(chain, format) {
+    if (format === 'nftables') {
+      return chain.builtIn && chain.hook === 'output';
+    }
+    return chain.name === 'OUTPUT';
+  }
+
+  // A locked-down INPUT next to a wide-open OUTPUT is what post-compromise
+  // tooling counts on: reverse shells, exfiltration and C2 beacons all dial
+  // *out*, and ingress filtering never sees them. Flagged only when some
+  // INPUT-like chain in the same table has a deny posture — on a firewall
+  // open in both directions, missing-input-drop already says the important
+  // thing and this would be noise on top. Info severity: egress filtering is
+  // defense in depth, not an open door.
+  function detectUnrestrictedEgress(table, findings, format) {
+    const chains = table.chains || [];
+    const denyPosture = (c) =>
+      isDropPolicy(c.policy) || isRejectPolicy(c.policy) || hasFinalCatchAllDrop(c);
+    const lockedInput = chains.find((c) => isBuiltInInputChain(c, format) && denyPosture(c));
+    if (!lockedInput) return;
+    for (const chain of chains) {
+      if (!isBuiltInOutputChain(chain, format)) continue;
+      if (denyPosture(chain)) continue;
+      findings.push({
+        id: 'unrestricted-egress',
+        severity: 'info',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: null,
+        title: `${lockedInput.name} is locked down but egress is unrestricted`,
+        details: `${chain.name} has policy ${chain.policy || 'ACCEPT'} and no catch-all deny, so any process on this host can connect out anywhere. Ingress filtering does not stop what already runs inside — consider egress filtering: allow loopback, ESTABLISHED, DNS/NTP and the destinations the host actually needs, then default-deny the rest.`
+      });
+    }
   }
 
   // FORWARD with policy ACCEPT and no catch-all deny routes anything between

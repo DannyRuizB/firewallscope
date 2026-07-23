@@ -56,6 +56,7 @@
           detectAdminPortNoRateLimit(chain, table, findings, result.format);
         }
         detectUnlimitedLog(chain, table, findings, result.format);
+        detectLogTcpSequence(chain, table, findings, result.format);
         if (isFilterTable) {
           detectUnlimitedIcmpEcho(chain, table, findings, result.format);
         }
@@ -1079,6 +1080,46 @@
         ruleIdx: i,
         title: 'LOG rule has no rate limit',
         details: 'Every matching packet writes a log line — a port scan or packet flood becomes a disk-filling attack. Add `-m limit --limit 5/min` (nft: `limit rate 5/minute`) in front of the log action.'
+      });
+    }
+  }
+
+  // ── log-tcp-sequence ───────────────────────────────────────────────
+  // The LOG target has one flag with a documented security cost:
+  // `--log-tcp-sequence` writes each packet's TCP sequence numbers into
+  // syslog, and the iptables man page is blunt about it — "This is a
+  // security risk if the log is readable by users". Sequence numbers are
+  // the raw material for off-path injection / connection hijacking, and
+  // log lines routinely travel further than root (adm-group readable
+  // /var/log, log shippers, centralised collectors). nft records the
+  // same detail via `log flags tcp sequence` — and via the `log flags
+  // all` shorthand, which people reach for as "verbose". The LOG trio,
+  // completed: drop-without-log asks that a deny-posture chain log at
+  // all, unlimited-log asks that logging be bounded, this one asks that
+  // it not leak. Skipped for ufw — its CLI cannot express LOG flags.
+  function logsTcpSequence(rule) {
+    const raw = String(rule.raw || '');
+    if (/--log-tcp-sequence\b/.test(raw)) return true;
+    if (/\blog\s+flags\s+all\b/.test(raw)) return true;
+    return /\blog\s+flags\s+tcp\s+[a-z,]*\bsequence\b/.test(raw);
+  }
+
+  function detectLogTcpSequence(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (!isLogRule(rule)) continue;
+      if (!logsTcpSequence(rule)) continue;
+      findings.push({
+        id: 'log-tcp-sequence',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: 'LOG rule records TCP sequence numbers',
+        details: '`--log-tcp-sequence` (nft: `log flags tcp sequence`, included in `log flags all`) writes TCP sequence numbers to syslog — the iptables man page calls it "a security risk if the log is readable by users". Sequence numbers are the raw material for connection injection / hijacking, and logs routinely reach log shippers and readers beyond root. Drop the flag — source, destination and ports are logged either way.'
       });
     }
   }

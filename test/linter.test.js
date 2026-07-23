@@ -62,6 +62,7 @@ const ALL_SMELLS = [
   'unrestricted-egress',
   'mac-based-trust',
   'admin-port-no-rate-limit',
+  'log-tcp-sequence',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -851,4 +852,50 @@ test('admin-port-no-rate-limit composes with exposed-admin-port (different axes)
 
 test('admin-port-no-rate-limit is skipped for ufw', () => {
   assert.ok(!lintIds('ufw-status.txt').has('admin-port-no-rate-limit'));
+});
+
+test('log-tcp-sequence flags the sequence flag, spares plain LOG and --log-tcp-options', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -m limit --limit 5/min -j LOG --log-prefix "DROP: " --log-tcp-sequence',
+    '-A INPUT -m limit --limit 5/min -j LOG --log-prefix "DROP: "',
+    '-A INPUT -m limit --limit 5/min -j LOG --log-prefix "DROP: " --log-tcp-options',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'log-tcp-sequence');
+  // Only the sequence flag leaks hijacking material; header options do not.
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 0);
+  assert.equal(hits[0].severity, 'warning');
+});
+
+test('log-tcp-sequence is independent of unlimited-log (rate-limited but leaking)', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -m limit --limit 5/min -j LOG --log-tcp-sequence',
+    'COMMIT',
+  ].join('\n');
+  const ids = FS.lint(FS.parse(rs)).findings.map((f) => f.id);
+  assert.ok(ids.includes('log-tcp-sequence'), 'sequence leak fires');
+  assert.ok(!ids.includes('unlimited-log'), 'the limit match keeps unlimited-log quiet');
+});
+
+test('log-tcp-sequence reads the nft flags spellings, including `flags all`', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority 0; policy drop;',
+    '		limit rate 5/minute log flags tcp sequence,options prefix "SEQ: "',
+    '		limit rate 5/minute log flags all prefix "ALL: "',
+    '		limit rate 5/minute log prefix "PLAIN: "',
+    '	}',
+    '}',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'log-tcp-sequence');
+  assert.equal(hits.length, 2);
+  assert.equal(JSON.stringify(hits.map((h) => h.ruleIdx)), JSON.stringify([0, 1]));
+});
+
+test('log-tcp-sequence is skipped for ufw', () => {
+  assert.ok(!lintIds('ufw-status.txt').has('log-tcp-sequence'));
 });

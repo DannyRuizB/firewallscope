@@ -38,6 +38,7 @@
         if (isFilterTable && isBuiltInInputChain(chain, result.format)) {
           flagMissingInputDrop(chain, table, findings);
           flagLoopbackNotAllowed(chain, table, findings);
+          flagMissingLoopbackSpoofDrop(chain, table, findings, result.format);
           flagMissingEstablishedAccept(chain, table, findings, result.format);
           flagIcmpv6Blocked(chain, table, findings, result.format);
         }
@@ -456,6 +457,59 @@
     const raw = String(rule.raw || '');
     return /ctstate[\s=]+[A-Z,_]*(RELATED|ESTABLISHED)/i.test(raw) ||
            /ct\s+state\s+[a-z,_\s]*(established|related)/i.test(raw);
+  }
+
+  // ── missing-loopback-spoof-drop ────────────────────────────────────
+  // The other half of "loopback traffic is configured" (CIS 3.4.2):
+  // loopback-not-allowed demands the `-i lo ACCEPT`; this one demands its
+  // companion — DROP anything claiming a 127.0.0.0/8 (or ::1) source that
+  // arrives on a real interface. A spoofed loopback source rides a plain
+  // `--dport 80 ACCEPT` just like a legitimate packet, and services that
+  // trust "it came from localhost" believe it. The kernel normally drops
+  // these as martians, but `route_localnet=1` re-opens the door — and
+  // container tooling flips it (kube-proxy did, CVE-2020-8558), so the
+  // firewall rule is the belt to the kernel's braces. Only raised when the
+  // chain HAS the lo accept (the broken-loopback case is loopback-not-
+  // allowed's job) and has an accept a spoofed packet could ride; a drop
+  // placed AFTER those accepts is flagged too, pointing at the misplaced
+  // rule. Skipped for ufw, whose before.rules never show in `ufw status`.
+  function isLoopbackSpoofDrop(rule) {
+    const a = String(rule.action || '').toUpperCase();
+    if (a !== 'DROP' && a !== 'REJECT') return false;
+    const src = String((rule.tokens && rule.tokens.source) || '').replace(/"/g, '');
+    if (/^127\./.test(src)) return true; // 127.0.0.0/8 or narrower
+    return src === '::1' || src === '::1/128';
+  }
+
+  function flagMissingLoopbackSpoofDrop(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const hasDenyPosture =
+      isDropPolicy(chain.policy) ||
+      isRejectPolicy(chain.policy) ||
+      hasFinalCatchAllDrop(chain);
+    if (!hasDenyPosture) return;
+    const rules = chain.rules || [];
+    if (!rules.some(r => isAcceptAction(r) && isLoopbackRule(r))) return;
+    const firstRideableAccept = rules.findIndex(r =>
+      isAcceptAction(r) && !isLoopbackRule(r) && !isEstablishedRule(r));
+    if (firstRideableAccept === -1) return;
+    const dropIdx = rules.findIndex(isLoopbackSpoofDrop);
+    if (dropIdx !== -1 && dropIdx < firstRideableAccept) return;
+    const misplaced = dropIdx !== -1;
+    findings.push({
+      id: 'missing-loopback-spoof-drop',
+      severity: 'info',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: misplaced ? dropIdx : null,
+      title: misplaced
+        ? `${chain.name} drops spoofed loopback traffic only after its ACCEPT rules`
+        : `${chain.name} accepts loopback but never drops spoofed loopback sources`,
+      details: misplaced
+        ? 'The loopback-source drop sits below ACCEPT rules, so a packet claiming a 127.0.0.0/8 (or ::1) source rides any open port before the drop is consulted. Move it up, right after the `-i lo ACCEPT`.'
+        : 'Pair the `-i lo ACCEPT` with `-s 127.0.0.0/8 -j DROP` (ip6tables: `-s ::1 -j DROP`; nft: `ip saddr 127.0.0.0/8 drop`) right below it. The kernel normally drops these as martians, but `route_localnet=1` — flipped by container tooling (kube-proxy, CVE-2020-8558) — re-opens the door, and services that trust "it came from localhost" will believe a spoofed source.'
+    });
   }
 
   // Total number of ports a rule's dport expression opens (0 if it has no

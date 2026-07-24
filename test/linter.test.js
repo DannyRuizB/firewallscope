@@ -22,6 +22,7 @@ const EXPECTED = {
   'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
   'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
+  'iptables-dnat-dead.txt': ['dnat-forward-blocked', 'exposed-via-dnat'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -66,6 +67,7 @@ const ALL_SMELLS = [
   'log-tcp-sequence',
   'missing-loopback-spoof-drop',
   'ipv6-unfiltered',
+  'dnat-forward-blocked',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -1026,4 +1028,82 @@ test('ipv6-unfiltered needs a deny-postured v4 input to fire at all', () => {
 
 test('ipv6-unfiltered never fires for iptables pastes (other family invisible)', () => {
   assert.ok(!lintIds('iptables-save.txt').has('ipv6-unfiltered'));
+});
+
+// --- dnat-forward-blocked (v1.18.0) ----------------------------------------
+
+test('dnat-forward-blocked flags the DNAT whose FORWARD accept is missing', () => {
+  const { findings } = FS.lint(FS.parse(sample('iptables-dnat-dead.txt')));
+  const blocked = findings.filter((f) => f.id === 'dnat-forward-blocked');
+  // Only the :15432 -> 10.0.0.30:5432 publish lacks a FORWARD accept.
+  assert.equal(blocked.length, 1);
+  assert.match(blocked[0].title, /10\.0\.0\.30:5432/);
+});
+
+test('dnat-forward-blocked stays quiet when every target has a FORWARD accept', () => {
+  // The portforward sample cables all three DNAT targets in FORWARD.
+  assert.ok(!lintIds('iptables-portforward.txt').has('dnat-forward-blocked'));
+});
+
+test('dnat-forward-blocked does not fire when FORWARD is open (accept policy)', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]', ':FORWARD ACCEPT [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT',
+    'COMMIT',
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i eth0 -p tcp --dport 2222 -j DNAT --to-destination 10.0.0.20:22',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(rs)).findings.some((f) => f.id === 'dnat-forward-blocked'));
+});
+
+test('dnat-forward-blocked: an established-only FORWARD accept does NOT count as coverage', () => {
+  // Deny FORWARD with only a conntrack ESTABLISHED,RELATED rule — the NEW
+  // forwarded packet has nothing to match, so the forward is dead.
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]', ':FORWARD DROP [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT',
+    '-A FORWARD -j DROP',
+    'COMMIT',
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 10.0.0.50:80',
+    'COMMIT',
+  ].join('\n');
+  const blocked = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'dnat-forward-blocked');
+  assert.equal(blocked.length, 1);
+  assert.match(blocked[0].title, /10\.0\.0\.50:80/);
+});
+
+test('dnat-forward-blocked: a subnet FORWARD accept covers a host target', () => {
+  // FORWARD accepts the whole 10.0.0.0/24 on port 80 → the /32 target is covered.
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]', ':FORWARD DROP [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A FORWARD -d 10.0.0.0/24 -p tcp --dport 80 -j ACCEPT',
+    '-A FORWARD -j DROP',
+    'COMMIT',
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 10.0.0.50:80',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(rs)).findings.some((f) => f.id === 'dnat-forward-blocked'));
+});
+
+test('dnat-forward-blocked fires for nftables too', () => {
+  const nft = [
+    'table ip filter {',
+    '\tchain forward {',
+    '\t\ttype filter hook forward priority filter; policy drop;',
+    '\t\tct state established,related accept',
+    '\t}',
+    '}',
+    'table ip nat {',
+    '\tchain prerouting {',
+    '\t\ttype nat hook prerouting priority dstnat; policy accept;',
+    '\t\tiifname "eth0" tcp dport 8443 dnat to 10.0.0.60:443',
+    '\t}',
+    '}',
+  ].join('\n');
+  const blocked = FS.lint(FS.parse(nft)).findings.filter((f) => f.id === 'dnat-forward-blocked');
+  assert.equal(blocked.length, 1);
+  assert.match(blocked[0].title, /10\.0\.0\.60:443/);
 });

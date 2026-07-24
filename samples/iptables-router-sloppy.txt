@@ -15,6 +15,7 @@
 -A INPUT -i lo -j ACCEPT
 -A INPUT -p tcp -m tcp --dport 22 -s 10.0.0.0/8 -j ACCEPT
 -A INPUT -p tcp -m tcp --dport 8443 -m mac --mac-source AA:BB:CC:DD:EE:FF -j ACCEPT
+-A INPUT -s 169.254.0.0/16 -j ACCEPT
 -A INPUT -p icmp -j ACCEPT
 COMMIT
 *nat

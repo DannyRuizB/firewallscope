@@ -53,6 +53,7 @@
         scanChainRules(chain, table, findings);
         if (isFilterTable) {
           detectOverbroadSource(chain, table, findings);
+          detectBogonSourceAccept(chain, table, findings);
           detectMacBasedTrust(chain, table, findings, result.format);
           detectAdminPortNoRateLimit(chain, table, findings, result.format);
         }
@@ -533,6 +534,46 @@
         ruleIdx: i,
         title: `Accepts from ${src} — a /${parsed.bits} public range is "any" in costume`,
         details: `A source prefix this short${parsed.family === 'v4' && parsed.bits === 1 ? ' (half the internet)' : ''} evades every any-source check while restricting almost nothing. Scope it to the real network, or remove the source match so the any-source smells can judge the rule honestly. Rule: ${rule.raw || ''}`
+      });
+    }
+  }
+
+  // Source ranges that can never legitimately ORIGINATE inbound traffic:
+  // "this network" (0/8), link-local (169.254/16 — never routed off the
+  // wire), the TEST-NET / documentation blocks, reserved future-use space
+  // (240/4), and the v6 documentation prefix. A packet ARRIVING with one of
+  // these as its source is spoofed; an ACCEPT that trusts it is either
+  // botched anti-spoofing or a copy-paste that trusts the untrustable.
+  // Loopback (127/8, ::1) is deliberately NOT here — its own pair of smells
+  // (loopback-not-allowed / missing-loopback-spoof-drop) owns that story.
+  // CGNAT (100.64/10) and RFC1918 are legitimate behind many networks, so
+  // they stay out to avoid crying wolf.
+  const BOGON_NETS = [
+    '0.0.0.0/8', '169.254.0.0/16', '192.0.2.0/24', '198.51.100.0/24',
+    '203.0.113.0/24', '240.0.0.0/4', '2001:db8::/32',
+  ];
+
+  // A DROP/REJECT of a bogon source is correct anti-spoofing; only an ACCEPT
+  // that trusts it is the problem — same "wide caution ok, wide trust not"
+  // rule as overbroad-source-trust and mac-based-trust.
+  function detectBogonSourceAccept(chain, table, findings) {
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (!isAcceptAction(rule)) continue;
+      const src = rule.tokens && rule.tokens.source;
+      if (!src || isAnyCidr(src)) continue;
+      const bogon = BOGON_NETS.find((net) => cidrSubsetOrAny(src, net));
+      if (!bogon) continue;
+      findings.push({
+        id: 'bogon-source-accept',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: `Accepts from ${src} — a bogon/non-routable source (${bogon})`,
+        details: `Traffic arriving with a source in ${bogon} is spoofed: that range can't legitimately originate a packet reaching this host. Accepting it is either botched anti-spoofing or misplaced trust — drop these sources on external interfaces instead. Rule: ${rule.raw || ''}`
       });
     }
   }

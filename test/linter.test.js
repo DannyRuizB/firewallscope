@@ -16,7 +16,7 @@ function lintIds(name) {
 const EXPECTED = {
   'iptables-leaky.txt': ['missing-input-drop', 'exposed-admin-port', 'permissive-accept', 'fallthrough-accept'],
   'iptables-shadowed.txt': ['shadowed-rule', 'rule-after-policy-drop'],
-  'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo', 'missing-loopback-spoof-drop'],
+  'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo', 'missing-loopback-spoof-drop', 'log-without-prefix'],
   'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
   'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept'],
@@ -69,6 +69,7 @@ const ALL_SMELLS = [
   'ipv6-unfiltered',
   'dnat-forward-blocked',
   'bogon-source-accept',
+  'log-without-prefix',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -1164,4 +1165,56 @@ test('bogon-source-accept catches the v6 documentation prefix too', () => {
     'COMMIT',
   ].join('\n');
   assert.ok(FS.lint(FS.parse(rs)).findings.some((f) => f.id === 'bogon-source-accept'));
+});
+
+// --- log-without-prefix (v1.20.0) ------------------------------------------
+
+test('log-without-prefix flags an unlabelled LOG rule', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -j LOG',
+    '-A INPUT -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const found = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'log-without-prefix');
+  assert.equal(found.length, 1);
+});
+
+test('log-without-prefix stays quiet when the LOG carries a prefix', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -j LOG --log-prefix "DROP-INPUT: "',
+    '-A INPUT -j DROP',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(rs)).findings.some((f) => f.id === 'log-without-prefix'));
+});
+
+test('log-without-prefix understands nft `log prefix` and NFLOG --nflog-prefix', () => {
+  const nftPrefixed = [
+    'table inet filter {',
+    '\tchain input {',
+    '\t\ttype filter hook input priority filter; policy drop;',
+    '\t\tlog prefix "DROP: " drop',
+    '\t}',
+    '}',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(nftPrefixed)).findings.some((f) => f.id === 'log-without-prefix'));
+
+  const nftBare = [
+    'table inet filter {',
+    '\tchain input {',
+    '\t\ttype filter hook input priority filter; policy drop;',
+    '\t\tlog drop',
+    '\t}',
+    '}',
+  ].join('\n');
+  assert.ok(FS.lint(FS.parse(nftBare)).findings.some((f) => f.id === 'log-without-prefix'));
+
+  const nflog = ['*filter', ':INPUT DROP [0:0]', '-A INPUT -j NFLOG --nflog-prefix "x"', 'COMMIT'].join('\n');
+  assert.ok(!FS.lint(FS.parse(nflog)).findings.some((f) => f.id === 'log-without-prefix'));
+});
+
+test('log-without-prefix is skipped for ufw', () => {
+  assert.ok(!lintIds('ufw-status.txt').has('log-without-prefix'));
 });

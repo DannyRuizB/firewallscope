@@ -59,6 +59,7 @@
         }
         detectUnlimitedLog(chain, table, findings, result.format);
         detectLogTcpSequence(chain, table, findings, result.format);
+        detectLogWithoutPrefix(chain, table, findings, result.format);
         if (isFilterTable) {
           detectUnlimitedIcmpEcho(chain, table, findings, result.format);
         }
@@ -1329,6 +1330,44 @@
     if (/--log-tcp-sequence\b/.test(raw)) return true;
     if (/\blog\s+flags\s+all\b/.test(raw)) return true;
     return /\blog\s+flags\s+tcp\s+[a-z,]*\bsequence\b/.test(raw);
+  }
+
+  // ── log-without-prefix ─────────────────────────────────────────────
+  // A LOG rule with no `--log-prefix` (iptables), `--nflog-prefix` (NFLOG)
+  // or nft `log prefix "..."` writes anonymous lines into syslog: every
+  // dropped-packet log looks like every other, so you can't tell an INPUT
+  // drop from a FORWARD drop, grep for one chain, or route a jail's lines
+  // to their own file. The prefix is the label that makes the log useful
+  // after the fact — cheap to add, and the last piece of the LOG family
+  // (drop-without-log demands a log exists, unlimited-log that it's rate-
+  // limited, log-tcp-sequence that it doesn't leak sequence numbers, this
+  // that it's identifiable). Info severity: the log works, it's just
+  // harder to read. Skipped for ufw, whose backend prefixes its own logs.
+  function hasLogPrefix(rule) {
+    const raw = String(rule.raw || '');
+    // iptables --log-prefix / NFLOG --nflog-prefix, or nft `log ... prefix`.
+    return /--(?:log|nflog)-prefix[\s=]/.test(raw) ||
+           /(^|\s)log\b[^\n]*\bprefix\b/.test(raw);
+  }
+
+  function detectLogWithoutPrefix(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (!isLogRule(rule)) continue;
+      if (hasLogPrefix(rule)) continue;
+      findings.push({
+        id: 'log-without-prefix',
+        severity: 'info',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: 'LOG rule has no prefix',
+        details: 'This LOG rule writes anonymous lines to syslog — with no `--log-prefix` (nft: `log prefix "..."`) every dropped-packet entry looks alike, so you can\'t tell which chain or rule produced it, grep for one, or route it to its own file. Add a prefix, e.g. `--log-prefix "DROP-FORWARD: "` (nft: `log prefix "DROP-FORWARD: "`).'
+      });
+    }
   }
 
   function detectLogTcpSequence(chain, table, findings, format) {

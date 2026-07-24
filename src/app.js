@@ -11,7 +11,8 @@
     portforward: 'samples/iptables-portforward.txt',
     exposed:   'samples/iptables-exposed-services.txt',
     router:    'samples/iptables-router-sloppy.txt',
-    noicmpv6:  'samples/ip6tables-no-icmpv6.txt'
+    noicmpv6:  'samples/ip6tables-no-icmpv6.txt',
+    nftv4only: 'samples/nft-v4only.txt'
   };
 
   const FORMAT_LABELS = {

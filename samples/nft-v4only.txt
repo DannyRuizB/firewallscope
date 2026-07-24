@@ -1,0 +1,26 @@
+table ip filter {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iifname "lo" accept
+		ip saddr 127.0.0.0/8 drop
+		ct state invalid drop
+		ct state established,related accept
+		ip protocol icmp limit rate 10/second accept
+		ip saddr 10.0.0.0/24 tcp dport 22 limit rate 6/minute accept comment "ssh from mgmt"
+		tcp dport { 80, 443 } accept
+		limit rate 5/minute log prefix "DROP-INPUT: "
+		drop
+	}
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+	chain output {
+		type filter hook output priority filter; policy accept;
+	}
+}
+table ip nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 10.0.0.0/24 oifname "eth0" masquerade
+	}
+}

@@ -80,7 +80,53 @@
       }
     }
 
+    if (result.format === 'nftables') {
+      detectIpv6Unfiltered(result, findings);
+    }
+
     return summarize(findings);
+  }
+
+  // IPv6 is the forgotten front door: nftables families are independent
+  // pipelines, so a carefully deny-postured `table ip` filters ONLY IPv4 —
+  // every dual-stack service is still reachable over the address the LAN's
+  // router advertisements handed each host, and attackers scan v6 too.
+  // Fires only for nftables pastes: an iptables-save dump can't show the
+  // other family (ip6tables may well be fine), and ufw manages both stacks
+  // itself. Only when some family-ip input hook is deny-postured — that
+  // posture proves filtering was intended, so its absence for v6 is almost
+  // never a choice. If an ip6/inet input hook EXISTS but is wide open,
+  // missing-input-drop already says the important thing about that chain.
+  function detectIpv6Unfiltered(result, findings) {
+    const tables = result.tables || [];
+    const denyPosture = (c) =>
+      isDropPolicy(c.policy) || isRejectPolicy(c.policy) || hasFinalCatchAllDrop(c);
+    let lockedTable = null;
+    let lockedChain = null;
+    for (const table of tables) {
+      if ((table.family || 'ip') !== 'ip') continue;
+      const chain = (table.chains || []).find(
+        (c) => c.builtIn && c.hook === 'input' && denyPosture(c)
+      );
+      if (chain) { lockedTable = table; lockedChain = chain; break; }
+    }
+    if (!lockedTable) return;
+    const v6Covered = tables.some(
+      (t) =>
+        (t.family === 'ip6' || t.family === 'inet') &&
+        (t.chains || []).some((c) => c.builtIn && c.hook === 'input')
+    );
+    if (v6Covered) return;
+    findings.push({
+      id: 'ipv6-unfiltered',
+      severity: 'warning',
+      table: lockedTable.name,
+      tableFamily: lockedTable.family || null,
+      chain: lockedChain.name,
+      ruleIdx: null,
+      title: 'IPv4 input is filtered but IPv6 is not',
+      details: `Table ip ${lockedTable.name} deny-postures its input hook, but no ip6 or inet table hooks input at all. nftables families are independent pipelines: every dual-stack service is reachable over IPv6 unfiltered. Add an inet table (or mirror the rules in a family ip6 table).`
+    });
   }
 
   function flagMissingInputDrop(chain, table, findings) {

@@ -1,6 +1,6 @@
 {
   "name": "firewallscope",
-  "version": "1.18.0",
+  "version": "1.19.0",
   "description": "Visual analyzer for iptables, ip6tables, nftables and ufw rulesets — paste the output, see the structure.",
   "scripts": {
     "lint": "eslint 'src/**/*.js' 'test/**/*.js'",

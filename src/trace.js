@@ -433,14 +433,19 @@
     const raw = String(rule.raw || '');
     const action = String(rule.action || '').toUpperCase();
 
-    // iptables: -j DNAT --to-destination IP[:PORT]  or  --to IP[:PORT]
+    // iptables: -j DNAT --to-destination IP[:PORT]  or  --to IP[:PORT].
+    // The nft parser also labels dnat rules action='DNAT', so fall THROUGH to
+    // the nft patterns below when the iptables flags aren't present instead of
+    // returning null (that bug hid every nft DNAT from the trace + linter).
     if (action === 'DNAT') {
       const m = raw.match(/--to-destination\s+([^\s]+)/) || raw.match(/--to\s+([^\s]+)/);
-      if (!m) return null;
-      return parseDnatTarget(m[1]);
+      if (m) return parseDnatTarget(m[1]);
     }
-    // iptables: -j REDIRECT [--to-ports PORT] — rewrites dst to localhost on the same iface.
-    if (action === 'REDIRECT') {
+    // iptables: -j REDIRECT [--to-ports PORT] — rewrites dst to localhost on
+    // the same iface. nft spells it "redirect to :PORT"; only that spelling
+    // falls through to the nft pattern below, so iptables REDIRECT keeps its
+    // localhost default (with the original dport) as before.
+    if (action === 'REDIRECT' && !/\bredirect\s+to\b/.test(raw)) {
       const m = raw.match(/--to-ports?\s+(\d+)(?:[:-]\d+)?/);
       const port = m ? +m[1] : null;
       const out = { destination: '127.0.0.1' };

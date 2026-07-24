@@ -83,8 +83,94 @@
     if (result.format === 'nftables') {
       detectIpv6Unfiltered(result, findings);
     }
+    detectDnatForwardBlocked(result, findings);
 
     return summarize(findings);
+  }
+
+  // A DNAT in nat/PREROUTING rewrites the packet BEFORE the filter table
+  // sees it — but the rewritten packet still has to survive FORWARD. Publish
+  // :2222 -> 10.0.0.20:22 and forget the matching `FORWARD -d 10.0.0.20
+  // --dport 22 ACCEPT`, and a deny-postured FORWARD silently drops it: the
+  // port-forward looks configured, the service is dark, and the operator
+  // debugs the DNAT for an hour. The exact opposite failure of
+  // exposed-via-dnat (there the forward WORKS and exposes an admin port) —
+  // they compose: a sample can trip one, the other, or neither.
+  //
+  // Fires only when FORWARD is deny-postured (an open FORWARD forwards
+  // everything, nothing is blocked) and no ACCEPT rule covers the target.
+  // Conservative: a conntrack ESTABLISHED/RELATED rule doesn't count (the
+  // first forwarded packet is NEW), but any accept whose destination and
+  // port cover the target suppresses the finding — including ones with
+  // matches we don't model, so we never cry "blocked" over a rule we can't
+  // fully read. REDIRECT and DNAT-to-localhost are skipped: they don't
+  // forward anywhere.
+  function detectDnatForwardBlocked(result, findings) {
+    if (!window.FirewallScope || typeof window.FirewallScope.extractDnatRewrite !== 'function') return;
+    const extract = window.FirewallScope.extractDnatRewrite;
+    const tables = result.tables || [];
+    const format = result.format;
+
+    let fwd = null;
+    for (const table of tables) {
+      if (!isFilterTableName(table.name)) continue;
+      fwd = (table.chains || []).find((c) => isBuiltInForwardChain(c, format));
+      if (fwd) break;
+    }
+    if (!fwd) return; // no FORWARD chain visible → can't reason about it
+    const denyPosture =
+      isDropPolicy(fwd.policy) || isRejectPolicy(fwd.policy) || hasFinalCatchAllDrop(fwd);
+    if (!denyPosture) return;
+
+    for (const table of tables) {
+      for (const chain of table.chains || []) {
+        if (!isNatPreroutingChain(table, chain, format)) continue;
+        const rules = chain.rules || [];
+        for (let i = 0; i < rules.length; i++) {
+          const rule = rules[i];
+          if (String(rule.action || '').toUpperCase() !== 'DNAT') continue;
+          const rw = extract(rule);
+          if (!rw || !rw.destination || rw.dport == null) continue;
+          if (rw.destination === '127.0.0.1') continue; // local, not forwarded
+          if (forwardCoversTarget(fwd, rw.destination, rw.dport)) continue;
+          findings.push({
+            id: 'dnat-forward-blocked',
+            severity: 'warning',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: i,
+            title: `Port-forward to ${rw.destination}:${rw.dport} is dropped by FORWARD`,
+            details: `This DNAT rewrites to ${rw.destination}:${rw.dport}, but the deny-postured FORWARD chain has no ACCEPT rule for that destination and port — the rewritten packet is dropped and the forward never works. Add \`FORWARD -d ${rw.destination} -p tcp --dport ${rw.dport} -j ACCEPT\` (nft: \`ip daddr ${rw.destination} tcp dport ${rw.dport} accept\`).`
+          });
+        }
+      }
+    }
+  }
+
+  // A conntrack rule that only accepts existing flows can't be what lets a
+  // freshly-forwarded (NEW) connection through.
+  function isEstablishedOnlyRule(rule) {
+    const raw = String(rule.raw || '');
+    const m = raw.match(/(?:--ctstate|ct\s+state)\s+([A-Za-z,]+)/i);
+    if (!m) return false;
+    const states = m[1].toUpperCase();
+    return /ESTABLISHED|RELATED/.test(states) && !/\bNEW\b/.test(states);
+  }
+
+  // Does some ACCEPT rule in FORWARD let a NEW connection to destIp:dport
+  // through? Destination and port use the same subset arithmetic as
+  // shadowed-rule; an unconstrained field covers everything.
+  function forwardCoversTarget(fwd, destIp, dport) {
+    for (const rule of fwd.rules || []) {
+      if (!isAcceptAction(rule)) continue;
+      if (isEstablishedOnlyRule(rule)) continue;
+      const t = rule.tokens || {};
+      if (!cidrSubsetOrAny(destIp, t.destination)) continue;
+      if (!portSubsetOrAny(String(dport), t.dport)) continue;
+      return true;
+    }
+    return false;
   }
 
   // IPv6 is the forgotten front door: nftables families are independent

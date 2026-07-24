@@ -21,6 +21,7 @@ const EXPECTED = {
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
   'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
+  'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -64,6 +65,7 @@ const ALL_SMELLS = [
   'admin-port-no-rate-limit',
   'log-tcp-sequence',
   'missing-loopback-spoof-drop',
+  'ipv6-unfiltered',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -975,4 +977,53 @@ test('missing-loopback-spoof-drop reads the nft and IPv6 spellings', () => {
 
 test('missing-loopback-spoof-drop is skipped for ufw', () => {
   assert.ok(!lintIds('ufw-status.txt').has('missing-loopback-spoof-drop'));
+});
+
+// --- ipv6-unfiltered (v1.17.0) ---------------------------------------------
+
+test('ipv6-unfiltered fires on a locked family-ip table with no v6 coverage', () => {
+  const found = lintIds('nft-v4only.txt');
+  assert.ok(found.has('ipv6-unfiltered'));
+});
+
+test('ipv6-unfiltered stays quiet when an inet table hooks input', () => {
+  assert.ok(!lintIds('nft-ruleset.txt').has('ipv6-unfiltered'));
+});
+
+test('ipv6-unfiltered defers to missing-input-drop when a v6 input hook exists', () => {
+  const nft = [
+    'table ip filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy drop;',
+    '		iifname "lo" accept',
+    '		tcp dport 80 accept',
+    '	}',
+    '}',
+    'table ip6 filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy accept;',
+    '		tcp dport 80 accept',
+    '	}',
+    '}',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(nft));
+  assert.ok(!findings.some((f) => f.id === 'ipv6-unfiltered'));
+  // The open v6 chain is missing-input-drop's job, and it does speak.
+  assert.ok(findings.some((f) => f.id === 'missing-input-drop' && f.tableFamily === 'ip6'));
+});
+
+test('ipv6-unfiltered needs a deny-postured v4 input to fire at all', () => {
+  const nft = [
+    'table ip filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy accept;',
+    '		tcp dport 80 accept',
+    '	}',
+    '}',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(nft)).findings.some((f) => f.id === 'ipv6-unfiltered'));
+});
+
+test('ipv6-unfiltered never fires for iptables pastes (other family invisible)', () => {
+  assert.ok(!lintIds('iptables-save.txt').has('ipv6-unfiltered'));
 });

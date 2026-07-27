@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo', 'missing-loopback-spoof-drop', 'log-without-prefix'],
   'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
   'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
   'iptables-dnat-dead.txt': ['dnat-forward-blocked', 'exposed-via-dnat'],
@@ -70,6 +70,7 @@ const ALL_SMELLS = [
   'dnat-forward-blocked',
   'bogon-source-accept',
   'log-without-prefix',
+  'dnat-unscoped',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -1217,4 +1218,68 @@ test('log-without-prefix understands nft `log prefix` and NFLOG --nflog-prefix',
 
 test('log-without-prefix is skipped for ufw', () => {
   assert.ok(!lintIds('ufw-status.txt').has('log-without-prefix'));
+});
+
+// --- dnat-unscoped (v1.21.0) ------------------------------------------------
+
+test('dnat-unscoped fires on a DNAT with neither -d nor -i', () => {
+  const rs = [
+    '*nat', ':PREROUTING ACCEPT [0:0]',
+    '-A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 10.0.0.5:8080',
+    'COMMIT',
+  ].join('\n');
+  const found = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'dnat-unscoped');
+  assert.equal(found.length, 1);
+});
+
+test('dnat-unscoped stays quiet when the DNAT is scoped by -d or by -i', () => {
+  const byAddr = [
+    '*nat', ':PREROUTING ACCEPT [0:0]',
+    '-A PREROUTING -d 203.0.113.7/32 -p tcp --dport 8080 -j DNAT --to-destination 10.0.0.5:8080',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(byAddr)).findings.some((f) => f.id === 'dnat-unscoped'));
+
+  const byIface = [
+    '*nat', ':PREROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 10.0.0.5:8080',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(byIface)).findings.some((f) => f.id === 'dnat-unscoped'));
+});
+
+test('dnat-unscoped exempts REDIRECT (transparent proxies match any destination)', () => {
+  const rs = [
+    '*nat', ':PREROUTING ACCEPT [0:0]',
+    '-A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 3128',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(rs)).findings.some((f) => f.id === 'dnat-unscoped'));
+});
+
+test('dnat-unscoped understands nft: bare `dnat to` fires, iifname/daddr scoping does not', () => {
+  const bare = [
+    'table ip nat {',
+    '\tchain prerouting {',
+    '\t\ttype nat hook prerouting priority dstnat;',
+    '\t\ttcp dport 8080 dnat to 10.0.0.5:8080',
+    '\t}',
+    '}',
+  ].join('\n');
+  assert.ok(FS.lint(FS.parse(bare)).findings.some((f) => f.id === 'dnat-unscoped'));
+
+  const scoped = [
+    'table ip nat {',
+    '\tchain prerouting {',
+    '\t\ttype nat hook prerouting priority dstnat;',
+    '\t\tiifname "eth0" tcp dport 8080 dnat to 10.0.0.5:8080',
+    '\t\tip daddr 203.0.113.7 tcp dport 8443 dnat to 10.0.0.5:8443',
+    '\t}',
+    '}',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(scoped)).findings.some((f) => f.id === 'dnat-unscoped'));
+});
+
+test('dnat-unscoped does not fire on the portforward sample (all DNATs are -i scoped)', () => {
+  assert.ok(!lintIds('iptables-portforward.txt').has('dnat-unscoped'));
 });

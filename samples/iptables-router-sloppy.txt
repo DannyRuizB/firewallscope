@@ -6,6 +6,9 @@
 # anything the box forwards, not just the LAN it was meant for). The LAN_TRUST
 # chain was written but nobody ever wired it in — its ACCEPT never runs. The
 # MASQUERADE appears twice: the rc.local script appends it on every boot.
+# And the 8080 port-forward was added in a hurry with neither -d nor -i —
+# every host the router forwards for gets its port 8080 hijacked, LAN
+# clients included, not just traffic arriving on the public interface.
 *filter
 :INPUT DROP [0:0]
 :FORWARD ACCEPT [0:0]
@@ -23,6 +26,7 @@ COMMIT
 :INPUT ACCEPT [0:0]
 :OUTPUT ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]
+-A PREROUTING -p tcp -m tcp --dport 8080 -j DNAT --to-destination 192.168.1.50:8080
 -A POSTROUTING -o eth0 -j MASQUERADE
 -A POSTROUTING -o eth0 -j MASQUERADE
 COMMIT

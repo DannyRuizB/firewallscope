@@ -71,6 +71,7 @@
         }
         if (isNatPreroutingChain(table, chain, result.format)) {
           detectExposedViaDnat(table, chain, findings);
+          detectDnatUnscoped(table, chain, findings);
         }
         if (isNatPostroutingChain(table, chain, result.format)) {
           detectMasqueradeAnySource(table, chain, findings);
@@ -1596,6 +1597,36 @@
     }
     return String(table.name || '').toLowerCase() === 'nat'
         && String(chain.name || '').toUpperCase() === 'PREROUTING';
+  }
+
+  // ── dnat-unscoped ──────────────────────────────────────────────────
+  // A DNAT that names neither a destination address (`-d` / nft `ip daddr`)
+  // nor an input interface (`-i` / nft `iifname`) matches that port on
+  // EVERY packet entering the router — not just what arrives on the public
+  // side. A LAN client talking to *any* host on that port is silently
+  // hijacked into the forward too (and so is traffic between internal
+  // segments). A port-forward should say where it applies: the public
+  // address or the outside interface. REDIRECT is exempt on purpose — it
+  // rewrites to the local host, and transparent-proxy REDIRECTs
+  // legitimately match any destination.
+  function detectDnatUnscoped(table, chain, findings) {
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (String(rule.action || '').toUpperCase() !== 'DNAT') continue;
+      const t = rule.tokens || {};
+      if (t.destination || t.iface_in) continue;
+      findings.push({
+        id: 'dnat-unscoped',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: 'DNAT with no destination address or input interface hijacks the port everywhere',
+        details: `${rule.raw || ''} — with neither \`-d <public-ip>\` nor \`-i <wan-iface>\` (nft \`ip daddr\` / \`iifname\`) this rewrite applies to every packet entering any interface: LAN clients talking to any host on this port get forwarded too. Scope it to the public address or the outside interface.`
+      });
+    }
   }
 
   window.FirewallScope = window.FirewallScope || {};

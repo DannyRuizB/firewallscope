@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo', 'missing-loopback-spoof-drop', 'log-without-prefix'],
   'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
   'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
   'iptables-dnat-dead.txt': ['dnat-forward-blocked', 'exposed-via-dnat'],
@@ -71,6 +71,7 @@ const ALL_SMELLS = [
   'bogon-source-accept',
   'log-without-prefix',
   'dnat-unscoped',
+  'dnat-no-hairpin',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -1282,4 +1283,115 @@ test('dnat-unscoped understands nft: bare `dnat to` fires, iifname/daddr scoping
 
 test('dnat-unscoped does not fire on the portforward sample (all DNATs are -i scoped)', () => {
   assert.ok(!lintIds('iptables-portforward.txt').has('dnat-unscoped'));
+});
+
+// --- dnat-no-hairpin (v1.22.0) -----------------------------------------------
+
+test('dnat-no-hairpin fires (info) when the only masquerade is out-interface-scoped', () => {
+  const rs = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -d 203.0.113.7/32 -p tcp --dport 8080 -j DNAT --to-destination 192.168.1.50:8080',
+    '-A POSTROUTING -s 192.168.1.0/24 -o eth0 -j MASQUERADE',
+    'COMMIT',
+  ].join('\n');
+  const found = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'dnat-no-hairpin');
+  assert.equal(found.length, 1);
+  assert.equal(found[0].severity, 'info');
+  assert.match(found[0].title, /192\.168\.1\.50:8080/);
+});
+
+test('dnat-no-hairpin is suppressed by the hairpin leg (destination-scoped masquerade)', () => {
+  const rs = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -d 203.0.113.7/32 -p tcp --dport 8080 -j DNAT --to-destination 192.168.1.50:8080',
+    '-A POSTROUTING -s 192.168.1.0/24 -o eth0 -j MASQUERADE',
+    '-A POSTROUTING -s 192.168.1.0/24 -d 192.168.1.50/32 -p tcp --dport 8080 -j MASQUERADE',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(rs)).findings.some((f) => f.id === 'dnat-no-hairpin'));
+});
+
+test('dnat-no-hairpin is suppressed by a masquerade with no out-interface (covers the flow incidentally)', () => {
+  const rs = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -d 203.0.113.7/32 -p tcp --dport 8080 -j DNAT --to-destination 192.168.1.50:8080',
+    '-A POSTROUTING -s 192.168.1.0/24 -j MASQUERADE',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(rs)).findings.some((f) => f.id === 'dnat-no-hairpin'));
+});
+
+test('dnat-no-hairpin skips -i-scoped DNATs (LAN packets never match) and public targets', () => {
+  const ifaceScoped = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 192.168.1.50:8080',
+    '-A POSTROUTING -s 192.168.1.0/24 -o eth0 -j MASQUERADE',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(ifaceScoped)).findings.some((f) => f.id === 'dnat-no-hairpin'));
+
+  const publicTarget = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -d 203.0.113.7/32 -p tcp --dport 8080 -j DNAT --to-destination 198.51.100.9:8080',
+    '-A POSTROUTING -s 192.168.1.0/24 -o eth0 -j MASQUERADE',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(publicTarget)).findings.some((f) => f.id === 'dnat-no-hairpin'));
+});
+
+test('dnat-no-hairpin stays quiet when POSTROUTING never NATs (not provably a router)', () => {
+  const rs = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -d 203.0.113.7/32 -p tcp --dport 8080 -j DNAT --to-destination 192.168.1.50:8080',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(rs)).findings.some((f) => f.id === 'dnat-no-hairpin'));
+});
+
+test('dnat-no-hairpin understands nft: oifname-only masquerade fires, ip daddr hairpin leg does not', () => {
+  const broken = [
+    'table ip nat {',
+    '\tchain prerouting {',
+    '\t\ttype nat hook prerouting priority dstnat;',
+    '\t\tip daddr 203.0.113.7 tcp dport 8080 dnat to 192.168.1.50:8080',
+    '\t}',
+    '\tchain postrouting {',
+    '\t\ttype nat hook postrouting priority srcnat;',
+    '\t\tip saddr 192.168.1.0/24 oifname "eth0" masquerade',
+    '\t}',
+    '}',
+  ].join('\n');
+  assert.ok(FS.lint(FS.parse(broken)).findings.some((f) => f.id === 'dnat-no-hairpin'));
+
+  const fixed = [
+    'table ip nat {',
+    '\tchain prerouting {',
+    '\t\ttype nat hook prerouting priority dstnat;',
+    '\t\tip daddr 203.0.113.7 tcp dport 8080 dnat to 192.168.1.50:8080',
+    '\t}',
+    '\tchain postrouting {',
+    '\t\ttype nat hook postrouting priority srcnat;',
+    '\t\tip saddr 192.168.1.0/24 oifname "eth0" masquerade',
+    '\t\tip saddr 192.168.1.0/24 ip daddr 192.168.1.50 masquerade',
+    '\t}',
+    '}',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(fixed)).findings.some((f) => f.id === 'dnat-no-hairpin'));
+});
+
+test('dnat-no-hairpin composes with dnat-unscoped on the sloppy router\'s hurried 8080 forward', () => {
+  const { findings } = FS.lint(FS.parse(sample('iptables-router-sloppy.txt')));
+  const hairpin = findings.filter((f) => f.id === 'dnat-no-hairpin');
+  const unscoped = findings.filter((f) => f.id === 'dnat-unscoped');
+  assert.equal(hairpin.length, 1);
+  assert.equal(unscoped.length, 1);
+  // Same rule, two different complaints: what else the rewrite swallows
+  // (unscoped) and that LAN clients can't use the public address (hairpin).
+  assert.equal(hairpin[0].ruleIdx, unscoped[0].ruleIdx);
+  assert.equal(hairpin[0].chain, unscoped[0].chain);
+});
+
+test('dnat-no-hairpin does not fire on the portforward or dnat-dead samples (-i-scoped DNATs)', () => {
+  assert.ok(!lintIds('iptables-portforward.txt').has('dnat-no-hairpin'));
+  assert.ok(!lintIds('iptables-dnat-dead.txt').has('dnat-no-hairpin'));
 });

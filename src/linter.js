@@ -87,6 +87,7 @@
       detectIpv6Unfiltered(result, findings);
     }
     detectDnatForwardBlocked(result, findings);
+    detectDnatNoHairpin(result, findings);
 
     return summarize(findings);
   }
@@ -1626,6 +1627,96 @@
         title: 'DNAT with no destination address or input interface hijacks the port everywhere',
         details: `${rule.raw || ''} — with neither \`-d <public-ip>\` nor \`-i <wan-iface>\` (nft \`ip daddr\` / \`iifname\`) this rewrite applies to every packet entering any interface: LAN clients talking to any host on this port get forwarded too. Scope it to the public address or the outside interface.`
       });
+    }
+  }
+
+  // ── dnat-no-hairpin ────────────────────────────────────────────────
+  // The fourth side of the DNAT family: exposed-via-dnat asks who can
+  // reach the target, dnat-forward-blocked whether the forward works at
+  // all, dnat-unscoped what else the rewrite swallows — this one asks
+  // whether it works FROM THE INSIDE. A LAN client connecting to the
+  // router's public address rides the same DNAT to the internal server,
+  // but the server sees the client's own on-link source and replies
+  // DIRECTLY, bypassing the router — the client expected the reply from
+  // the public address and drops the half-open connection. The forward
+  // works from the internet and silently fails from the LAN: the classic
+  // "works from my phone on 4G, not from my desk" mystery.
+  //
+  // The fix is the hairpin (NAT-loopback) leg: a POSTROUTING MASQUERADE /
+  // SNAT scoped to the DNAT target as *destination*, so hairpinned flows
+  // leave wearing the router's address and the reply returns through it.
+  // Split-horizon DNS is the other legitimate fix — hence info severity.
+  //
+  // Never cries wolf:
+  // - only when POSTROUTING already SNATs / MASQUERADEs something (the
+  //   box is provably a NAT router, not a partial paste);
+  // - only DNATs to RFC1918 targets (a public target doesn't hairpin)
+  //   that a LAN packet can actually match — an `-i <wan>`-scoped DNAT
+  //   never sees LAN traffic, so no SNAT leg could help it (that setup
+  //   needs split DNS, a different conversation);
+  // - suppressed by any SNAT / MASQUERADE whose destination covers the
+  //   target (the hairpin leg, however else it is scoped), or by one
+  //   with neither destination nor out-interface (it masquerades the
+  //   hairpinned flow incidentally). An `-o <wan>`-only masquerade — the
+  //   classic outbound rule — does NOT cover it: hairpinned replies
+  //   leave through the LAN interface.
+  const RFC1918_NETS = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'];
+  function isRfc1918(ip) {
+    return RFC1918_NETS.some((net) => cidrSubsetOrAny(ip, net));
+  }
+
+  function detectDnatNoHairpin(result, findings) {
+    if (!window.FirewallScope || typeof window.FirewallScope.extractDnatRewrite !== 'function') return;
+    const extract = window.FirewallScope.extractDnatRewrite;
+    const format = result.format;
+    const tables = result.tables || [];
+
+    const snats = [];
+    for (const table of tables) {
+      for (const chain of table.chains || []) {
+        if (!isNatPostroutingChain(table, chain, format)) continue;
+        for (const rule of chain.rules || []) {
+          const action = String(rule.action || '').toUpperCase();
+          if (action === 'MASQUERADE' || action === 'SNAT') snats.push(rule);
+        }
+      }
+    }
+    if (snats.length === 0) return; // not provably a NAT router
+
+    const hairpinCovered = (targetIp) => snats.some((rule) => {
+      const t = rule.tokens || {};
+      if (t.destination && !isAnyCidr(t.destination)) {
+        return cidrSubsetOrAny(targetIp, t.destination);
+      }
+      return !t.iface_out;
+    });
+
+    for (const table of tables) {
+      for (const chain of table.chains || []) {
+        if (!isNatPreroutingChain(table, chain, format)) continue;
+        const rules = chain.rules || [];
+        for (let i = 0; i < rules.length; i++) {
+          const rule = rules[i];
+          if (String(rule.action || '').toUpperCase() !== 'DNAT') continue;
+          const t = rule.tokens || {};
+          if (t.iface_in) continue;
+          const rw = extract(rule);
+          if (!rw || !rw.destination) continue;
+          if (!isRfc1918(rw.destination)) continue;
+          if (hairpinCovered(rw.destination)) continue;
+          const target = rw.dport != null ? `${rw.destination}:${rw.dport}` : rw.destination;
+          findings.push({
+            id: 'dnat-no-hairpin',
+            severity: 'info',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: i,
+            title: `Port-forward to ${target} has no hairpin NAT — LAN clients can't use the public address`,
+            details: `A LAN client connecting to the public address rides this DNAT to ${rw.destination}, but the server replies directly to the client (they share the network), bypassing the router — the client expected the reply from the public address and drops the connection. Add the hairpin leg: \`-A POSTROUTING -s <lan-subnet> -d ${rw.destination}${rw.dport != null ? ` -p tcp --dport ${rw.dport}` : ''} -j MASQUERADE\` (nft: \`ip saddr <lan-subnet> ip daddr ${rw.destination} masquerade\`) — or point LAN clients at the internal address via split-horizon DNS.`
+          });
+        }
+      }
     }
   }
 

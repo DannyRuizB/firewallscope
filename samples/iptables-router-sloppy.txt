@@ -9,6 +9,9 @@
 # And the 8080 port-forward was added in a hurry with neither -d nor -i —
 # every host the router forwards for gets its port 8080 hijacked, LAN
 # clients included, not just traffic arriving on the public interface.
+# The second 8443 accept "throttles brute force" with plain -m limit: one
+# token bucket shared by every client, so an attacker draining it locks
+# the legitimate admin out of the web UI too.
 *filter
 :INPUT DROP [0:0]
 :FORWARD ACCEPT [0:0]
@@ -18,6 +21,7 @@
 -A INPUT -i lo -j ACCEPT
 -A INPUT -p tcp -m tcp --dport 22 -s 10.0.0.0/8 -j ACCEPT
 -A INPUT -p tcp -m tcp --dport 8443 -m mac --mac-source AA:BB:CC:DD:EE:FF -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 8443 -m limit --limit 10/min -j ACCEPT
 -A INPUT -s 169.254.0.0/16 -j ACCEPT
 -A INPUT -p icmp -j ACCEPT
 COMMIT

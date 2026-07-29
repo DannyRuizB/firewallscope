@@ -56,6 +56,7 @@
           detectBogonSourceAccept(chain, table, findings);
           detectMacBasedTrust(chain, table, findings, result.format);
           detectAdminPortNoRateLimit(chain, table, findings, result.format);
+          detectRateLimitNotPerSource(chain, table, findings, result.format);
         }
         detectUnlimitedLog(chain, table, findings, result.format);
         detectLogTcpSequence(chain, table, findings, result.format);
@@ -1482,6 +1483,76 @@
         ruleIdx: i,
         title: `${admin.service} accepts new connections with no rate limit`,
         details: `An ACCEPT for ${admin.service} (port ${admin.port}) has no per-source throttle, so brute-force attempts hit it at full speed. Add a netfilter limit — \`-m recent\` / \`-m hashlimit\` / \`-m connlimit\` (nft: \`limit rate\` / \`ct count\`) — to cap attempts per source before they reach the service, and pair it with Fail2Ban. Independent of who can reach the port: even a source-restricted admin port is worth throttling.`
+      });
+    }
+  }
+
+  // ── rate-limit-not-per-source ──────────────────────────────────────
+  // The follow-up question to admin-port-no-rate-limit: that smell asks
+  // whether a throttle EXISTS, this one asks whether it is keyed right.
+  // Plain `-m limit`, `-m hashlimit` without a srcip mode, and a bare nft
+  // `limit rate` all keep ONE token bucket that every client drains
+  // together — so an attacker holding the bucket empty with a trickle of
+  // SYNs makes the rule drop everyone else's connections too, and the
+  // "brute-force throttle" doubles as a remote off-switch for the service
+  // (the classic flaw of the tutorial SYN-flood recipe). Per-source
+  // limiters keep a bucket per client: `-m hashlimit --hashlimit-mode
+  // srcip`, `-m recent`, `-m connlimit` (nft: a meter / dynamic set keyed
+  // on `ip saddr`, or `ct count`). Scoped to TCP on purpose — a global
+  // cap is the right tool where TOTAL volume is the concern, and our own
+  // smells prescribe exactly that for ICMP echo (unlimited-icmp-echo) and
+  // it is a legitimate amplification ceiling for UDP services. Mutually
+  // exclusive with admin-port-no-rate-limit by construction: that one
+  // fires when no throttle exists, this one when the throttle is shared.
+  // Skipped for ufw: its `limit` verb compiles to a per-source `-m recent`
+  // pair in the backend, and `ufw status` cannot express raw matches.
+  function isTcpRule(rule) {
+    const proto = String((rule.tokens && rule.tokens.protocol) || '').toLowerCase();
+    if (proto) return proto === 'tcp';
+    const text = `${rule.raw || ''} ${rule.match || ''}`;
+    return /(^|\s)-p\s+tcp\b/.test(text) ||
+           /(^|\s)tcp\s+(dport|sport|flags)\b/.test(text) ||
+           /\bmeta\s+l4proto\s+tcp\b/.test(text) ||
+           /\bip6?\s+(protocol|nexthdr)\s+tcp\b/.test(text);
+  }
+
+  // Returns a human-readable name for the shared-bucket limiter on the
+  // rule, or null when the rule has no limiter / a per-source one.
+  function sharedBucketLimit(rule) {
+    const raw = String(rule.raw || '');
+    if (/-m\s+limit\b/.test(raw)) return '`-m limit`';
+    if (/-m\s+hashlimit\b/.test(raw)) {
+      const mode = raw.match(/--hashlimit-mode[\s=]+(\S+)/);
+      if (mode && mode[1].split(',').includes('srcip')) return null;
+      return mode ? `\`-m hashlimit --hashlimit-mode ${mode[1]}\``
+                  : '`-m hashlimit` with no `--hashlimit-mode`';
+    }
+    // nft: a bare `limit rate` is one bucket; inside braces it is a meter /
+    // dynamic-set element, keyed per entry (`{ ip saddr limit rate … }`).
+    if (/\blimit\s+rate\b/.test(raw) && !/\{[^}]*\blimit\s+rate\b[^}]*\}/.test(raw)) {
+      return '`limit rate`';
+    }
+    return null;
+  }
+
+  function detectRateLimitNotPerSource(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (!isAcceptAction(rule)) continue;
+      if (!isTcpRule(rule)) continue;
+      const how = sharedBucketLimit(rule);
+      if (!how) continue;
+      findings.push({
+        id: 'rate-limit-not-per-source',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: 'Throttle is one shared bucket for all sources',
+        details: `This ACCEPT is throttled with ${how}: a single token bucket that every client drains together. An attacker keeping it empty with a trickle of packets makes the rule drop everyone else's connections too — the brute-force throttle doubles as a remote off-switch for the service. Key the limit per client instead: \`-m hashlimit --hashlimit-mode srcip\`, \`-m recent --update --seconds 60 --hitcount 4\`, or \`-m connlimit\` (nft: a meter — \`meter ssh { ip saddr limit rate 3/minute }\` — or \`ct count\`). Global caps belong where total volume is the concern (ICMP echo, UDP amplification ceilings), not on a TCP service.`
       });
     }
   }

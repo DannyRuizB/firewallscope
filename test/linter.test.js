@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo', 'missing-loopback-spoof-drop', 'log-without-prefix'],
   'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin', 'rate-limit-not-per-source'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
   'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
   'iptables-dnat-dead.txt': ['dnat-forward-blocked', 'exposed-via-dnat'],
@@ -72,6 +72,7 @@ const ALL_SMELLS = [
   'log-without-prefix',
   'dnat-unscoped',
   'dnat-no-hairpin',
+  'rate-limit-not-per-source',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -861,6 +862,91 @@ test('admin-port-no-rate-limit composes with exposed-admin-port (different axes)
 
 test('admin-port-no-rate-limit is skipped for ufw', () => {
   assert.ok(!lintIds('ufw-status.txt').has('admin-port-no-rate-limit'));
+});
+
+test('rate-limit-not-per-source flags -m limit on a TCP accept, spares per-source throttles', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp --dport 22 -m limit --limit 3/min -j ACCEPT',
+    '-A INPUT -p tcp --dport 22 -m recent --update --seconds 60 --hitcount 4 -j ACCEPT',
+    '-A INPUT -p tcp --dport 22 -m connlimit --connlimit-above 10 -j ACCEPT',
+    '-A INPUT -p tcp --dport 22 -m hashlimit --hashlimit-name ssh --hashlimit-upto 5/min --hashlimit-mode srcip -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'rate-limit-not-per-source');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 0);
+  assert.equal(hits[0].severity, 'warning');
+});
+
+test('rate-limit-not-per-source flags hashlimit only when its mode lacks srcip', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --dport 443 -m hashlimit --hashlimit-name web --hashlimit-upto 50/sec -j ACCEPT',
+    '-A INPUT -p tcp --dport 443 -m hashlimit --hashlimit-name web2 --hashlimit-upto 50/sec --hashlimit-mode dstport -j ACCEPT',
+    '-A INPUT -p tcp --dport 443 -m hashlimit --hashlimit-name web3 --hashlimit-upto 50/sec --hashlimit-mode srcip,dstport -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'rate-limit-not-per-source');
+  // No mode at all and a srcip-less mode are both one shared bucket;
+  // srcip,dstport keys per client and stays quiet.
+  assert.equal(hits.length, 2);
+  // vm-realm arrays fail deepEqual on prototype — compare via JSON.
+  assert.equal(JSON.stringify(hits.map((h) => h.ruleIdx).sort()), '[0,1]');
+});
+
+test('rate-limit-not-per-source is mutually exclusive with admin-port-no-rate-limit', () => {
+  // One SSH accept with a shared throttle, one with none: each rule draws
+  // exactly one of the pair — the axes never double-report a rule.
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --dport 22 -m limit --limit 3/min -j ACCEPT',
+    '-A INPUT -p tcp --dport 2222 -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  const shared = findings.filter((f) => f.id === 'rate-limit-not-per-source');
+  const norate = findings.filter((f) => f.id === 'admin-port-no-rate-limit');
+  assert.equal(shared.length, 1);
+  assert.equal(shared[0].ruleIdx, 0);
+  assert.equal(norate.length, 1);
+  assert.equal(norate[0].ruleIdx, 2);
+});
+
+test('rate-limit-not-per-source leaves ICMP and UDP global caps alone', () => {
+  // Our own smells prescribe a global cap for ping (unlimited-icmp-echo),
+  // and a UDP ceiling is a legitimate amplification defence — only TCP
+  // service accepts are judged.
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p icmp --icmp-type echo-request -m limit --limit 10/sec -j ACCEPT',
+    '-A INPUT -p udp --dport 53 -m limit --limit 100/sec -j ACCEPT',
+    '-A INPUT -p tcp --dport 25 -m limit --limit 10/min -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('rate-limit-not-per-source'));
+});
+
+test('rate-limit-not-per-source reads nft: bare limit rate fires, a saddr meter does not', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority 0; policy drop;',
+    '		tcp dport 22 limit rate 3/minute accept',
+    '		tcp dport 2222 meter sshmeter { ip saddr limit rate 3/minute } accept',
+    '		tcp dport 8080 ct count over 20 accept',
+    '	}',
+    '}',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'rate-limit-not-per-source');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 0);
+});
+
+test('rate-limit-not-per-source is skipped for ufw (its limit verb is per-source -m recent)', () => {
+  assert.ok(!lintIds('ufw-status.txt').has('rate-limit-not-per-source'));
 });
 
 test('log-tcp-sequence flags the sequence flag, spares plain LOG and --log-tcp-options', () => {

@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo', 'missing-loopback-spoof-drop', 'log-without-prefix'],
   'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin', 'rate-limit-not-per-source'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin', 'rate-limit-not-per-source', 'rate-limit-drop-inverted'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
   'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
   'iptables-dnat-dead.txt': ['dnat-forward-blocked', 'exposed-via-dnat'],
@@ -73,6 +73,7 @@ const ALL_SMELLS = [
   'dnat-unscoped',
   'dnat-no-hairpin',
   'rate-limit-not-per-source',
+  'rate-limit-drop-inverted',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -947,6 +948,100 @@ test('rate-limit-not-per-source reads nft: bare limit rate fires, a saddr meter 
 
 test('rate-limit-not-per-source is skipped for ufw (its limit verb is per-source -m recent)', () => {
   assert.ok(!lintIds('ufw-status.txt').has('rate-limit-not-per-source'));
+});
+
+test('rate-limit-drop-inverted flags -m limit on a DROP, spares ACCEPT / LOG / the RETURN recipe', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]', ':SYNFLOOD - [0:0]',
+    '-A INPUT -p tcp -m tcp --dport 80 --tcp-flags FIN,SYN,RST,ACK SYN -m limit --limit 25/sec -j DROP',
+    '-A INPUT -p tcp --dport 22 -m limit --limit 3/min -j ACCEPT',
+    '-A INPUT -m limit --limit 5/min -j LOG --log-prefix "DROP: "',
+    '-A SYNFLOOD -m limit --limit 1/sec --limit-burst 3 -j RETURN',
+    '-A SYNFLOOD -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  const inverted = findings.filter((f) => f.id === 'rate-limit-drop-inverted');
+  // Only the direct limit+DROP is backwards; the ACCEPT form and the
+  // RETURN-then-DROP recipe are the correct spellings of the same intent.
+  assert.equal(inverted.length, 1);
+  assert.equal(inverted[0].chain, 'INPUT');
+  assert.equal(inverted[0].ruleIdx, 0);
+  assert.equal(inverted[0].severity, 'warning');
+});
+
+test('rate-limit-drop-inverted fires for any protocol and is mutually exclusive with not-per-source', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p icmp -m limit --limit 10/sec -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const ids = FS.lint(FS.parse(rs)).findings.map((f) => f.id);
+  // The inversion is wrong regardless of protocol (this drops calm pings,
+  // passes a ping flood); the shared-bucket smell stays TCP-scoped.
+  assert.ok(ids.includes('rate-limit-drop-inverted'));
+  assert.ok(!ids.includes('rate-limit-not-per-source'));
+});
+
+test('rate-limited REJECT is the reflector-avoidance recipe and stays unflagged', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --dport 113 -m limit --limit 5/sec -j REJECT --reject-with tcp-reset',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  // Capping how many polite rejections leave per second (excess falls to a
+  // silent drop) is deliberate cost control, not an inverted throttle.
+  assert.ok(!ids.has('rate-limit-drop-inverted'));
+  assert.ok(!ids.has('rate-limit-not-per-source'));
+});
+
+test('drop-the-excess judged by direction: hashlimit-above shared fires not-per-source, srcip is clean', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --dport 443 -m hashlimit --hashlimit-name a --hashlimit-upto 50/sec -j DROP',
+    '-A INPUT -p tcp --dport 443 -m hashlimit --hashlimit-name b --hashlimit-above 50/sec -j DROP',
+    '-A INPUT -p tcp --dport 443 -m hashlimit --hashlimit-name c --hashlimit-above 50/sec --hashlimit-mode srcip -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  const inverted = findings.filter((f) => f.id === 'rate-limit-drop-inverted');
+  const shared = findings.filter((f) => f.id === 'rate-limit-not-per-source');
+  // upto+DROP = bucket backwards; above without srcip = right direction,
+  // one global bucket; above+srcip = the correct per-source flood drop.
+  assert.equal(inverted.length, 1);
+  assert.equal(inverted[0].ruleIdx, 0);
+  assert.equal(shared.length, 1);
+  assert.equal(shared[0].ruleIdx, 1);
+});
+
+test('rate-limited drops read nft: direction and keying decide, braces do not save an inverted meter', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority 0; policy drop;',
+    '		tcp dport 22 limit rate 3/minute drop',
+    '		tcp dport 80 limit rate over 200/second drop',
+    '		tcp dport 443 meter flood { ip saddr limit rate over 25/second } drop',
+    '		udp dport 53 limit rate over 100/second drop',
+    '		tcp dport 8443 meter m2 { ip saddr limit rate 3/minute } drop',
+    '	}',
+    '}',
+  ].join('\n');
+  const { findings } = FS.lint(FS.parse(rs));
+  const inverted = findings.filter((f) => f.id === 'rate-limit-drop-inverted');
+  const shared = findings.filter((f) => f.id === 'rate-limit-not-per-source');
+  // No `over` = drops the calm traffic — even keyed per source (a meter
+  // just inverts per client). `over` bare = right direction, shared bucket
+  // (TCP only: the UDP ceiling is a legitimate amplification cap). The
+  // saddr meter with `over` is the correct spelling and stays clean.
+  assert.equal(JSON.stringify(inverted.map((f) => f.ruleIdx).sort()), '[0,4]');
+  assert.equal(shared.length, 1);
+  assert.equal(shared[0].ruleIdx, 1);
+});
+
+test('rate-limit-drop-inverted is skipped for ufw', () => {
+  assert.ok(!lintIds('ufw-status.txt').has('rate-limit-drop-inverted'));
 });
 
 test('log-tcp-sequence flags the sequence flag, spares plain LOG and --log-tcp-options', () => {

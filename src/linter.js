@@ -57,6 +57,7 @@
           detectMacBasedTrust(chain, table, findings, result.format);
           detectAdminPortNoRateLimit(chain, table, findings, result.format);
           detectRateLimitNotPerSource(chain, table, findings, result.format);
+          detectRateLimitDropInverted(chain, table, findings, result.format);
         }
         detectUnlimitedLog(chain, table, findings, result.format);
         detectLogTcpSequence(chain, table, findings, result.format);
@@ -1540,10 +1541,22 @@
     const rules = chain.rules || [];
     for (let i = 0; i < rules.length; i++) {
       const rule = rules[i];
-      if (!isAcceptAction(rule)) continue;
+      const action = String(rule.action || '').toUpperCase();
+      const isDrop = action === 'DROP' || action === 'REJECT';
+      if (!isDrop && !isAcceptAction(rule)) continue;
       if (!isTcpRule(rule)) continue;
+      // An under-limit matcher on a DROP is a different bug entirely — the
+      // bucket points the wrong way (rate-limit-drop-inverted's job) — and
+      // on a REJECT it is the legitimate reflector-avoidance pattern (cap
+      // the TOTAL cost of sending rejections; the excess falls through to
+      // a silent drop), where a global bucket is exactly right. Only a
+      // drop-the-excess rule is judged for bucket sharing here.
+      if (isDrop && underLimitMatch(rule)) continue;
       const how = sharedBucketLimit(rule);
       if (!how) continue;
+      const details = isDrop
+        ? `This ${action} discards the excess over ${how}: ONE bucket whose rate is summed across every client. An attacker supplying the volume keeps the aggregate above the limit, which pushes legitimate packets into the excess and drops them alongside the flood — the flood protection doubles as a remote off-switch for the service. Key the bucket per client instead: \`-m hashlimit --hashlimit-above … --hashlimit-mode srcip\` (nft: a meter — \`meter flood { ip saddr limit rate over 25/second } drop\`) or \`-m connlimit\`. A global excess-drop belongs where total volume is the concern (ICMP echo, UDP amplification ceilings), not on a TCP service.`
+        : `This ACCEPT is throttled with ${how}: a single token bucket that every client drains together. An attacker keeping it empty with a trickle of packets makes the rule drop everyone else's connections too — the brute-force throttle doubles as a remote off-switch for the service. Key the limit per client instead: \`-m hashlimit --hashlimit-mode srcip\`, \`-m recent --update --seconds 60 --hitcount 4\`, or \`-m connlimit\` (nft: a meter — \`meter ssh { ip saddr limit rate 3/minute }\` — or \`ct count\`). Global caps belong where total volume is the concern (ICMP echo, UDP amplification ceilings), not on a TCP service.`;
       findings.push({
         id: 'rate-limit-not-per-source',
         severity: 'warning',
@@ -1552,7 +1565,64 @@
         chain: chain.name,
         ruleIdx: i,
         title: 'Throttle is one shared bucket for all sources',
-        details: `This ACCEPT is throttled with ${how}: a single token bucket that every client drains together. An attacker keeping it empty with a trickle of packets makes the rule drop everyone else's connections too — the brute-force throttle doubles as a remote off-switch for the service. Key the limit per client instead: \`-m hashlimit --hashlimit-mode srcip\`, \`-m recent --update --seconds 60 --hitcount 4\`, or \`-m connlimit\` (nft: a meter — \`meter ssh { ip saddr limit rate 3/minute }\` — or \`ct count\`). Global caps belong where total volume is the concern (ICMP echo, UDP amplification ceilings), not on a TCP service.`
+        details
+      });
+    }
+  }
+
+  // ── rate-limit-drop-inverted ───────────────────────────────────────
+  // The DROP side of the rate-limit story, part one: the bucket points
+  // the wrong way. `-m limit` (always), `-m hashlimit` without
+  // `--hashlimit-above`, and nft `limit rate` without `over` all match
+  // traffic while it is UNDER the rate — the right direction for an
+  // ACCEPT ("let this much through"), exactly backwards on a DROP: the
+  // rule discards the first packets of every interval (calm, legitimate
+  // traffic) and once the bucket runs dry the flood sails past it to the
+  // rules below. The tutorial SYN-flood recipe with `-j DROP` on the
+  // limit line degrades the service on a quiet day and protects nothing
+  // under attack. Judged for every protocol — the inversion is wrong
+  // regardless — and per-source keying does not save it (a meter
+  // `{ ip saddr limit rate 3/minute } drop` just inverts per client), so
+  // this probe, unlike sharedBucketLimit, does not exempt braces.
+  // DROP only, on purpose: an under-limit REJECT is the classic
+  // reflector-avoidance recipe — send at most N polite rejections per
+  // second (each one costs a packet), let the excess fall through to a
+  // silent drop — the same global-cost cap our own smells prescribe for
+  // ICMP echo. A rejection cap is deliberate; a drop cap cannot be.
+  // Mutually exclusive with rate-limit-not-per-source by construction:
+  // under-limit direction lands here, drop-the-excess lands there.
+  // Skipped for ufw, whose `limit` verb compiles to a correct recipe.
+  function underLimitMatch(rule) {
+    const raw = String(rule.raw || '');
+    if (/-m\s+limit\b/.test(raw)) return '`-m limit`';
+    if (/-m\s+hashlimit\b/.test(raw) && !/--hashlimit-above\b/.test(raw)) {
+      return /--hashlimit-upto\b/.test(raw)
+        ? '`-m hashlimit --hashlimit-upto`'
+        : '`-m hashlimit` (whose default is `--hashlimit-upto`)';
+    }
+    if (/\blimit\s+rate\b/.test(raw) && !/\blimit\s+rate\s+over\b/.test(raw)) {
+      return '`limit rate` without `over`';
+    }
+    return null;
+  }
+
+  function detectRateLimitDropInverted(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (String(rule.action || '').toUpperCase() !== 'DROP') continue;
+      const how = underLimitMatch(rule);
+      if (!how) continue;
+      findings.push({
+        id: 'rate-limit-drop-inverted',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: 'Rate-limited DROP points the bucket the wrong way',
+        details: `This DROP is gated by ${how}, which matches traffic while it is UNDER the rate — so the rule discards the first packets of every interval (calm, legitimate traffic) and once the bucket runs dry the flood sails past it to the rules below. The service degrades on a quiet day and nothing is dropped under attack. Match the excess instead — nft \`limit rate over 25/second drop\` (per source: \`meter flood { ip saddr limit rate over 25/second } drop\`), iptables \`-m hashlimit --hashlimit-above 25/sec --hashlimit-mode srcip -j DROP\` — or keep the under-limit match on an ACCEPT followed by a catch-all DROP.`
       });
     }
   }

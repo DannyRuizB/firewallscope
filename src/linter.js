@@ -49,6 +49,7 @@
             (isBuiltInInputChain(chain, result.format) || isBuiltInForwardChain(chain, result.format))) {
           flagDropWithoutLog(chain, table, findings, result.format);
           flagMissingInvalidDrop(chain, table, findings, result.format);
+          flagIcmpPmtudBlocked(chain, table, findings, result.format);
         }
         scanChainRules(chain, table, findings);
         if (isFilterTable) {
@@ -492,6 +493,144 @@
     // `meta l4proto ipv6-icmp`, `icmpv6 type ...`
     const text = `${rule.raw || ''} ${rule.match || ''}`;
     return /icmpv6|ipv6-icmp|icmp6/i.test(text);
+  }
+
+  // ── icmp-pmtud-blocked ─────────────────────────────────────────────
+  // The IPv4 sibling of icmpv6-blocked, scoped to the one message IPv4
+  // genuinely cannot live without: ICMP type 3 (destination-unreachable,
+  // whose code 4 is fragmentation-needed). TCP sends every segment with
+  // DF set and relies on routers answering "too big" with that message;
+  // a firewall that swallows it turns any smaller-MTU path (VPN, PPPoE,
+  // tunnels) into a black hole — the handshake's small packets pass, the
+  // payload's full-size ones vanish, connections just hang. Two triggers:
+  // an explicit ICMP drop with no covering accept before it (the classic
+  // "block ping" rule that takes PMTUD down with it), and a deny-posture
+  // chain that never accepts ICMP at all. Quiet when ICMP is accepted
+  // broadly / type 3 explicitly, or when a RELATED-state accept lets
+  // conntrack pass the errors for tracked connections — ESTABLISHED
+  // alone is not enough, ICMP errors about a connection are RELATED.
+  // Skipped for ufw (before.rules accepts dest-unreach invisibly) and
+  // ip6tables (the twin's job); nftables only for ip / inet families.
+  function flagIcmpPmtudBlocked(chain, table, findings, format) {
+    if (format === 'ufw' || format === 'ip6tables') return;
+    if (format === 'nftables') {
+      const fam = String(table.family || '').toLowerCase();
+      if (fam !== 'ip' && fam !== 'inet') return;
+    }
+    const rules = chain.rules || [];
+    let flaggedRule = false;
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      const a = String(rule.action || '').toUpperCase();
+      if (a !== 'DROP' && a !== 'REJECT') continue;
+      if (!isIcmpv4Rule(rule) || !icmpSpecCoversPmtud(rule)) continue;
+      if (rules.slice(0, i).some(isPmtudAcceptRule)) continue;
+      flaggedRule = true;
+      findings.push({
+        id: 'icmp-pmtud-blocked',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: 'ICMP drop swallows fragmentation-needed — PMTUD black hole',
+        details: 'Blocking ping is fine; blocking all of ICMP is not. TCP relies on ICMP type 3 code 4 (fragmentation-needed) to learn the path MTU — swallow it and any smaller-MTU path (VPN, PPPoE, tunnels) black-holes: small packets pass, full-size ones vanish, connections hang. Scope the drop with `--icmp-type echo-request`, or put a `-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT` (nft: `ct state related accept`) before it.'
+      });
+    }
+    if (flaggedRule) return;
+    const hasDenyPosture =
+      isDropPolicy(chain.policy) ||
+      isRejectPolicy(chain.policy) ||
+      hasFinalCatchAllDrop(chain);
+    if (!hasDenyPosture) return;
+    // A deny-posture chain that accepts nothing (a non-forwarding host's
+    // empty FORWARD DROP, a loopback-only INPUT) passes no traffic whose
+    // PMTUD could break — correct config, not a black hole.
+    if (!chainHasRealAccept(chain, table, new Set())) return;
+    if (chainAcceptsPmtud(chain, table, new Set())) return;
+    findings.push({
+      id: 'icmp-pmtud-blocked',
+      severity: 'warning',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: null,
+      title: `${chain.name} default-denies but never accepts ICMP fragmentation-needed`,
+      details: 'A deny posture with no ICMP accept and no RELATED-state accept swallows ICMP type 3 (destination-unreachable, incl. fragmentation-needed) — the message Path MTU Discovery depends on. Add `-p icmp --icmp-type destination-unreachable -j ACCEPT` (nft: `icmp type destination-unreachable accept`) or a `--ctstate RELATED,ESTABLISHED` accept before the deny. ESTABLISHED alone is not enough: ICMP errors arrive as RELATED.'
+    });
+  }
+
+  // True if the chain — or any chain it jumps to, followed recursively within
+  // the same table — has an ACCEPT that lets fragmentation-needed through.
+  function chainAcceptsPmtud(chain, table, seen) {
+    if (seen.has(chain.name)) return false;
+    seen.add(chain.name);
+    for (const rule of chain.rules || []) {
+      if (isPmtudAcceptRule(rule)) return true;
+      if (rule.isJumpToChain && rule.action) {
+        const target = (table.chains || []).find(c => c.name === rule.action);
+        if (target && chainAcceptsPmtud(target, table, seen)) return true;
+      }
+    }
+    return false;
+  }
+
+  function isPmtudAcceptRule(rule) {
+    if (!isAcceptAction(rule)) return false;
+    if (isRelatedStateRule(rule)) return true;
+    return isIcmpv4Rule(rule) && icmpSpecCoversPmtud(rule);
+  }
+
+  // True if the chain accepts any non-loopback traffic at all (directly or
+  // via a jumped chain) — i.e. there is traffic whose PMTUD could break.
+  function chainHasRealAccept(chain, table, seen) {
+    if (seen.has(chain.name)) return false;
+    seen.add(chain.name);
+    for (const rule of chain.rules || []) {
+      if (isAcceptAction(rule) && !isLoopbackRule(rule)) return true;
+      if (rule.isJumpToChain && rule.action) {
+        const target = (table.chains || []).find(c => c.name === rule.action);
+        if (target && chainHasRealAccept(target, table, seen)) return true;
+      }
+    }
+    return false;
+  }
+
+  function isIcmpv4Rule(rule) {
+    const proto = String((rule.tokens && rule.tokens.protocol) || '').toLowerCase();
+    if (proto === 'icmp') return true;
+    if (proto) return false; // any other explicit protocol (incl. the v6 names) is not v4 ICMP
+    // nftables spellings: `ip protocol icmp`, `meta l4proto icmp`, `icmp type ...`
+    // — the lookahead keeps icmpv6 / icmp6 from matching.
+    const text = `${rule.raw || ''} ${rule.match || ''}`;
+    return /(?:ip\s+protocol|meta\s+l4proto)\s+icmp(?![a-z0-9-])/i.test(text) ||
+           /(^|\s)icmp\s+type\b/i.test(text);
+  }
+
+  // The rule's ICMP type restriction, or null when it matches all of ICMP.
+  function icmpTypeSpec(rule) {
+    const text = `${rule.raw || ''} ${rule.match || ''}`;
+    let m = text.match(/--icmp-type[\s=]+(\S+)/i);
+    if (m) return m[1].toLowerCase();
+    m = text.match(/(^|\s)icmp\s+type\s+(\{[^}]*\}|\S+)/i);
+    if (m) return m[2].toLowerCase();
+    return null;
+  }
+
+  // Does the rule's type restriction include type 3 / fragmentation-needed?
+  // No restriction = the whole protocol = yes.
+  function icmpSpecCoversPmtud(rule) {
+    const spec = icmpTypeSpec(rule);
+    if (spec === null) return true;
+    if (/\bany\b/.test(spec)) return true;
+    if (/destination-unreachable|dest-unreach|fragmentation-needed|frag-needed/.test(spec)) return true;
+    return /(^|[{,\s])3(\/4)?([},\s]|$)/.test(spec);
+  }
+
+  function isRelatedStateRule(rule) {
+    const raw = String(rule.raw || '');
+    return /--(?:ctstate|state)[\s=]+[A-Z,_]*RELATED/i.test(raw) ||
+           /ct\s+state\s+[a-z,_\s]*related/i.test(raw);
   }
 
   // Only the filter table (and its variants across formats) actually drops

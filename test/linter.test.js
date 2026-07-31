@@ -21,6 +21,7 @@ const EXPECTED = {
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
   'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin', 'rate-limit-not-per-source', 'rate-limit-drop-inverted'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
+  'iptables-no-pmtud.txt': ['icmp-pmtud-blocked'],
   'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
   'iptables-dnat-dead.txt': ['dnat-forward-blocked', 'exposed-via-dnat'],
 };
@@ -74,6 +75,7 @@ const ALL_SMELLS = [
   'dnat-no-hairpin',
   'rate-limit-not-per-source',
   'rate-limit-drop-inverted',
+  'icmp-pmtud-blocked',
 ];
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
@@ -434,6 +436,84 @@ test('icmpv6-blocked recognizes the nft `ip6 nexthdr icmpv6` spelling', () => {
     '}',
   ].join('\n');
   assert.ok(!new Set(FS.lint(FS.parse(v4only)).findings.map((f) => f.id)).has('icmpv6-blocked'));
+});
+
+test('icmp-pmtud-blocked: rule-level on the icmp DROP before conntrack, chain-level on FORWARD', () => {
+  const { findings } = FS.lint(FS.parse(sample('iptables-no-pmtud.txt')));
+  const hits = findings.filter((f) => f.id === 'icmp-pmtud-blocked');
+  const ruleHit = hits.find((f) => f.chain === 'INPUT');
+  assert.ok(ruleHit, 'expected a rule-level hit in INPUT');
+  assert.equal(typeof ruleHit.ruleIdx, 'number');
+  assert.equal(ruleHit.severity, 'warning');
+  const chainHit = hits.find((f) => f.chain === 'FORWARD');
+  assert.ok(chainHit, 'expected a chain-level hit in FORWARD');
+  assert.equal(chainHit.ruleIdx, null);
+});
+
+test('icmp-pmtud-blocked stays quiet when the RELATED accept comes before the icmp drop', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT',
+    '-A INPUT -p icmp -j DROP',
+    '-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('icmp-pmtud-blocked'));
+});
+
+test('icmp-pmtud-blocked: ESTABLISHED alone is not enough — ICMP errors arrive as RELATED', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -m conntrack --ctstate ESTABLISHED -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(ids.has('icmp-pmtud-blocked'));
+});
+
+test('icmp-pmtud-blocked spares an echo-request-only drop when type 3 is accepted', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p icmp --icmp-type echo-request -j DROP',
+    '-A INPUT -p icmp --icmp-type destination-unreachable -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('icmp-pmtud-blocked'));
+});
+
+test('icmp-pmtud-blocked: an empty deny-posture FORWARD (non-router) is not a black hole', () => {
+  // These flagship/other samples have FORWARD DROP with no accepts — correct
+  // config for a non-forwarding host, nothing whose PMTUD could break.
+  assert.ok(!lintIds('iptables-save.txt').has('icmp-pmtud-blocked'));
+  assert.ok(!lintIds('iptables-shadowed.txt').has('icmp-pmtud-blocked'));
+  assert.ok(!lintIds('nft-v4only.txt').has('icmp-pmtud-blocked'));
+});
+
+test('icmp-pmtud-blocked never fires on ufw or ip6tables rulesets', () => {
+  assert.ok(!lintIds('ufw-status.txt').has('icmp-pmtud-blocked'));
+  assert.ok(!lintIds('ip6tables-no-icmpv6.txt').has('icmp-pmtud-blocked'));
+  assert.ok(!lintIds('ip6tables-save.txt').has('icmp-pmtud-blocked'));
+});
+
+test('icmp-pmtud-blocked on nft: accepting input without icmp/related fires; `ip protocol icmp accept` silences', () => {
+  const bare = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy drop;',
+    '		iifname "lo" accept',
+    '		tcp dport 443 accept',
+    '	}',
+    '}',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(bare)).findings.map((f) => f.id));
+  assert.ok(ids.has('icmp-pmtud-blocked'));
+  // The flagship nft samples accept ICMP via `ip protocol icmp ... accept`.
+  assert.ok(!lintIds('nft-ruleset.txt').has('icmp-pmtud-blocked'));
+  assert.ok(!lintIds('nft-v4only.txt').has('icmp-pmtud-blocked'));
 });
 
 test('unused-chain is a warning with rules, info when empty, quiet when referenced', () => {

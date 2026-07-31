@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo', 'missing-loopback-spoof-drop', 'log-without-prefix'],
   'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin', 'rate-limit-not-per-source', 'rate-limit-drop-inverted'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin', 'rate-limit-not-per-source', 'rate-limit-drop-inverted', 'rate-limit-accept-inverted'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
   'iptables-no-pmtud.txt': ['icmp-pmtud-blocked'],
   'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
@@ -75,6 +75,7 @@ const ALL_SMELLS = [
   'dnat-no-hairpin',
   'rate-limit-not-per-source',
   'rate-limit-drop-inverted',
+  'rate-limit-accept-inverted',
   'icmp-pmtud-blocked',
 ];
 
@@ -1122,6 +1123,71 @@ test('rate-limited drops read nft: direction and keying decide, braces do not sa
 
 test('rate-limit-drop-inverted is skipped for ufw', () => {
   assert.ok(!lintIds('ufw-status.txt').has('rate-limit-drop-inverted'));
+});
+
+test('rate-limit-accept-inverted: an over-limit ACCEPT fires — per-source keying and protocol do not save it', () => {
+  // Per-source and non-TCP on purpose: the verdict is the bug, not the
+  // keying, so unlike not-per-source neither srcip nor ICMP exempts it.
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p icmp -m hashlimit --hashlimit-above 5/sec --hashlimit-mode srcip --hashlimit-name ping -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'rate-limit-accept-inverted');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].severity, 'warning');
+});
+
+test('rate-limit-accept-inverted recognizes the nft spellings, meter included', () => {
+  const bare = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy drop;',
+    '		tcp dport 25 limit rate over 10/second accept',
+    '	}',
+    '}',
+  ].join('\n');
+  assert.ok(new Set(FS.lint(FS.parse(bare)).findings.map((f) => f.id)).has('rate-limit-accept-inverted'));
+  // A per-client meter just inverts per client.
+  const meter = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority filter; policy drop;',
+    '		meter guard { ip saddr limit rate over 3/minute } accept',
+    '	}',
+    '}',
+  ].join('\n');
+  assert.ok(new Set(FS.lint(FS.parse(meter)).findings.map((f) => f.id)).has('rate-limit-accept-inverted'));
+});
+
+test('rate-limit-accept-inverted stays quiet on the three correct quadrants', () => {
+  const mk = (line) => new Set(FS.lint(FS.parse(['*filter', ':INPUT DROP [0:0]', line, 'COMMIT'].join('\n'))).findings.map((f) => f.id));
+  // Under-limit ACCEPT is the correct throttle direction (not-per-source's
+  // beat if the bucket is shared — but never this smell's).
+  assert.ok(!mk('-A INPUT -p tcp --dport 22 -m limit --limit 3/min -j ACCEPT').has('rate-limit-accept-inverted'));
+  // Over-limit DROP is the correct drop-the-excess recipe.
+  assert.ok(!mk('-A INPUT -p tcp --dport 80 -m hashlimit --hashlimit-above 25/sec --hashlimit-mode srcip --hashlimit-name f -j DROP').has('rate-limit-accept-inverted'));
+  // Under-limit DROP belongs to the DROP sibling.
+  assert.ok(!mk('-A INPUT -p tcp --dport 80 -m limit --limit 25/sec -j DROP').has('rate-limit-accept-inverted'));
+});
+
+test('the rate-limit smells stay mutually exclusive: an over-limit ACCEPT never lands in not-per-source', () => {
+  // Shared bucket + TCP — exactly what not-per-source judges — but the
+  // verdict is inverted, so accept-inverted claims it alone: prescribing
+  // srcip keying would "fix" a rule whose real problem is the ACCEPT.
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --dport 25 -m hashlimit --hashlimit-above 10/sec --hashlimit-name smtp -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(ids.has('rate-limit-accept-inverted'));
+  assert.ok(!ids.has('rate-limit-not-per-source'));
+  assert.ok(!ids.has('rate-limit-drop-inverted'));
+});
+
+test('rate-limit-accept-inverted is skipped for ufw', () => {
+  assert.ok(!lintIds('ufw-status.txt').has('rate-limit-accept-inverted'));
 });
 
 test('log-tcp-sequence flags the sequence flag, spares plain LOG and --log-tcp-options', () => {

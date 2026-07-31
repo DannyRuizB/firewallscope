@@ -59,6 +59,7 @@
           detectAdminPortNoRateLimit(chain, table, findings, result.format);
           detectRateLimitNotPerSource(chain, table, findings, result.format);
           detectRateLimitDropInverted(chain, table, findings, result.format);
+          detectRateLimitAcceptInverted(chain, table, findings, result.format);
         }
         detectUnlimitedLog(chain, table, findings, result.format);
         detectLogTcpSequence(chain, table, findings, result.format);
@@ -1691,6 +1692,12 @@
       // a silent drop), where a global bucket is exactly right. Only a
       // drop-the-excess rule is judged for bucket sharing here.
       if (isDrop && underLimitMatch(rule)) continue;
+      // Same courtesy in the other direction: an over-limit matcher on an
+      // ACCEPT admits only the excess — inverted regardless of how the
+      // bucket is keyed (rate-limit-accept-inverted's job). Judging it for
+      // bucket sharing would prescribe `--hashlimit-mode srcip` as the fix
+      // for a rule whose real problem is the verdict.
+      if (!isDrop && overLimitMatch(rule)) continue;
       const how = sharedBucketLimit(rule);
       if (!how) continue;
       const details = isDrop
@@ -1745,6 +1752,18 @@
     return null;
   }
 
+  // The opposite direction: matchers that fire on the traffic ABOVE the
+  // rate. `-m limit` has no over form, so only hashlimit-above and nft's
+  // `limit rate over` land here.
+  function overLimitMatch(rule) {
+    const raw = String(rule.raw || '');
+    if (/-m\s+hashlimit\b/.test(raw) && /--hashlimit-above\b/.test(raw)) {
+      return '`-m hashlimit --hashlimit-above`';
+    }
+    if (/\blimit\s+rate\s+over\b/.test(raw)) return '`limit rate over`';
+    return null;
+  }
+
   function detectRateLimitDropInverted(chain, table, findings, format) {
     if (format === 'ufw') return;
     const rules = chain.rules || [];
@@ -1762,6 +1781,46 @@
         ruleIdx: i,
         title: 'Rate-limited DROP points the bucket the wrong way',
         details: `This DROP is gated by ${how}, which matches traffic while it is UNDER the rate — so the rule discards the first packets of every interval (calm, legitimate traffic) and once the bucket runs dry the flood sails past it to the rules below. The service degrades on a quiet day and nothing is dropped under attack. Match the excess instead — nft \`limit rate over 25/second drop\` (per source: \`meter flood { ip saddr limit rate over 25/second } drop\`), iptables \`-m hashlimit --hashlimit-above 25/sec --hashlimit-mode srcip -j DROP\` — or keep the under-limit match on an ACCEPT followed by a catch-all DROP.`
+      });
+    }
+  }
+
+  // ── rate-limit-accept-inverted ─────────────────────────────────────
+  // The fourth quadrant of the rate-limit matrix, and the only one that
+  // was still unjudged. Under-limit ACCEPT = a correct throttle (judged
+  // only for bucket sharing); under-limit DROP = rate-limit-drop-inverted;
+  // over-limit DROP = the correct drop-the-excess recipe (judged for
+  // sharing); over-limit ACCEPT = THIS: the rule admits only the traffic
+  // ABOVE the rate. Calm, legitimate traffic never matches and falls
+  // through to whatever sits below — usually the default deny — so the
+  // service is dead on a quiet day and springs to life only under flood.
+  // Typically born of a half-fix: someone flips the tutorial recipe's
+  // matcher to `over` / `--hashlimit-above` but forgets to flip the
+  // verdict (or swaps verdicts while refactoring). Per-source keying does
+  // not save it — a meter `{ ip saddr limit rate over 3/minute } accept`
+  // just inverts per client — and the protocol doesn't matter (admitting
+  // only excess ICMP is equally backwards), so like its DROP sibling this
+  // judges every protocol and never exempts braces. Mutually exclusive
+  // with rate-limit-not-per-source by construction: an over-limit ACCEPT
+  // lands here and only here (the verdict is the bug, not the keying).
+  // Skipped for ufw, whose `limit` verb compiles to a correct recipe.
+  function detectRateLimitAcceptInverted(chain, table, findings, format) {
+    if (format === 'ufw') return;
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (!isAcceptAction(rule)) continue;
+      const how = overLimitMatch(rule);
+      if (!how) continue;
+      findings.push({
+        id: 'rate-limit-accept-inverted',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: 'Rate-limited ACCEPT admits only the excess',
+        details: `This ACCEPT is gated by ${how}, which matches traffic only while it is ABOVE the rate — calm, legitimate traffic never matches and falls through to the rules below (usually the default deny), so the service is dead on a quiet day and answers only under flood. Flip the direction, not the keying: accept under the limit (\`-m hashlimit --hashlimit-upto … --hashlimit-mode srcip -j ACCEPT\`, nft \`limit rate 10/second accept\`) — or keep the over-limit match but make it a DROP that sheds the excess above a plain ACCEPT.`
       });
     }
   }

@@ -14,7 +14,8 @@
     noicmpv6:  'samples/ip6tables-no-icmpv6.txt',
     nopmtud:   'samples/iptables-no-pmtud.txt',
     nftv4only: 'samples/nft-v4only.txt',
-    dnatdead:  'samples/iptables-dnat-dead.txt'
+    dnatdead:  'samples/iptables-dnat-dead.txt',
+    ufwdecorative: 'samples/ufw-default-allow.txt'
   };
 
   const FORMAT_LABELS = {

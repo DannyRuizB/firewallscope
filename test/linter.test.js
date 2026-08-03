@@ -24,6 +24,7 @@ const EXPECTED = {
   'iptables-no-pmtud.txt': ['icmp-pmtud-blocked'],
   'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
   'iptables-dnat-dead.txt': ['dnat-forward-blocked', 'exposed-via-dnat'],
+  'ufw-default-allow.txt': ['allow-under-default-allow', 'missing-input-drop'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -77,7 +78,77 @@ const ALL_SMELLS = [
   'rate-limit-drop-inverted',
   'rate-limit-accept-inverted',
   'icmp-pmtud-blocked',
+  'allow-under-default-allow',
 ];
+
+// --- allow-under-default-allow -------------------------------------------
+
+const UFW_HEADER = [
+  'Status: active',
+  'Logging: on (low)',
+];
+const UFW_TABLE = [
+  '',
+  'To                         Action      From',
+  '--                         ------      ----',
+];
+
+function ufwLint(defaults, rows) {
+  const text = [...UFW_HEADER, `Default: ${defaults}`, 'New profiles: skip', ...UFW_TABLE, ...rows].join('\n');
+  return FS.lint(FS.parse(text)).findings;
+}
+
+test('allow-under-default-allow counts the no-op allows and composes with missing-input-drop', () => {
+  const findings = ufwLint('allow (incoming), allow (outgoing), disabled (routed)', [
+    '22/tcp                     ALLOW IN    Anywhere',
+    '443/tcp                    ALLOW IN    Anywhere',
+  ]);
+  const hits = findings.filter((f) => f.id === 'allow-under-default-allow');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].chain, 'INPUT');
+  assert.equal(hits[0].ruleIdx, 0);
+  assert.ok(hits[0].title.startsWith('2 allow'));
+  // Two axes, two findings: the open policy (error) AND the decorative list.
+  assert.ok(findings.some((f) => f.id === 'missing-input-drop' && f.chain === 'INPUT'));
+});
+
+test('allow-under-default-allow never fires under a default-deny policy', () => {
+  const findings = ufwLint('deny (incoming), allow (outgoing), disabled (routed)', [
+    '22/tcp                     ALLOW IN    Anywhere',
+  ]);
+  assert.ok(!findings.some((f) => f.id === 'allow-under-default-allow'));
+});
+
+test('an allow above a deny still does real work and is spared; allows below it are not', () => {
+  const findings = ufwLint('allow (incoming), allow (outgoing), disabled (routed)', [
+    '22/tcp                     ALLOW IN    10.0.0.0/8',
+    'Anywhere                   DENY IN     10.0.0.0/8',
+    '80/tcp                     ALLOW IN    Anywhere',
+    '443/tcp                    ALLOW IN    Anywhere',
+  ]);
+  const hits = findings.filter((f) => f.id === 'allow-under-default-allow');
+  assert.equal(hits.length, 1);
+  // Only the two allows BELOW the deny are no-ops; the finding anchors there.
+  assert.ok(hits[0].title.startsWith('2 allow'));
+  assert.equal(hits[0].ruleIdx, 2);
+});
+
+test('LIMIT rules keep their throttle and never count as no-op allows', () => {
+  const findings = ufwLint('allow (incoming), allow (outgoing), disabled (routed)', [
+    '8080/tcp                   LIMIT IN    Anywhere',
+  ]);
+  assert.ok(!findings.some((f) => f.id === 'allow-under-default-allow'));
+});
+
+test('the decorative-ufw sample trips the smell exactly once with three no-ops', () => {
+  const { findings } = FS.lint(FS.parse(sample('ufw-default-allow.txt')));
+  const hits = findings.filter((f) => f.id === 'allow-under-default-allow');
+  assert.equal(hits.length, 1);
+  assert.ok(hits[0].title.startsWith('3 allow'));
+  // The LIMIT row and the working DENY are not part of the count, and the
+  // finding anchors on the first allow after the deny.
+  assert.equal(hits[0].ruleIdx, 1);
+});
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {
   const { findings } = FS.lint(FS.parse(sample('iptables-portforward.txt')));

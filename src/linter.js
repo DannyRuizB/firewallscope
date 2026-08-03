@@ -60,6 +60,7 @@
           detectRateLimitNotPerSource(chain, table, findings, result.format);
           detectRateLimitDropInverted(chain, table, findings, result.format);
           detectRateLimitAcceptInverted(chain, table, findings, result.format);
+          detectAllowUnderDefaultAllow(chain, table, findings, result.format);
         }
         detectUnlimitedLog(chain, table, findings, result.format);
         detectLogTcpSequence(chain, table, findings, result.format);
@@ -235,6 +236,44 @@
       ruleIdx: null,
       title: `Chain ${chain.name} has no default-deny`,
       details: `Policy is ${chain.policy || 'ACCEPT'} and there is no catch-all DROP / REJECT rule at the end. Unmatched packets are accepted.`
+    });
+  }
+
+  // ufw's whole UX is `ufw allow <port>` — but under `Default: allow` every
+  // packet is accepted before the rule list matters, so those allows are
+  // DECORATIVE: the output reads like a whitelist while restricting nothing.
+  // missing-input-drop already reports the open door (error, the policy
+  // axis); this reports the lie in the list (warning, the rules axis) — the
+  // same silent-no-op family as dockerscope's ports-with-host-network.
+  // Two exemptions keep it honest: an ALLOW with a DENY/REJECT *below* it
+  // still does real work (it can punch a hole through that deny — different
+  // problem, not a no-op), and LIMIT rules keep their throttle either way.
+  // ufw-only on purpose: raw iptables/nft pastes can be partial rulesets,
+  // and the whitelist illusion is ufw's own UX.
+  function detectAllowUnderDefaultAllow(chain, table, findings, format) {
+    if (format !== 'ufw') return;
+    if ((chain.policy || '').toUpperCase() !== 'ACCEPT') return;
+    if (!chain.rules || chain.rules.length === 0) return;
+    let lastDenyIdx = -1;
+    for (let i = 0; i < chain.rules.length; i++) {
+      const a = (chain.rules[i].action || '').toUpperCase();
+      if (a === 'DROP' || a === 'REJECT') lastDenyIdx = i;
+    }
+    const noOps = [];
+    for (let i = lastDenyIdx + 1; i < chain.rules.length; i++) {
+      if ((chain.rules[i].action || '').toUpperCase() === 'ACCEPT') noOps.push(i);
+    }
+    if (noOps.length === 0) return;
+    const plural = noOps.length === 1 ? 'rule is a no-op' : 'rules are no-ops';
+    findings.push({
+      id: 'allow-under-default-allow',
+      severity: 'warning',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: noOps[0],
+      title: `${noOps.length} allow ${plural} under ${chain.name}'s default-allow policy`,
+      details: 'The default already accepts everything, so these allow rules restrict nothing — the list reads like a whitelist but is decorative. Set the default to deny (`ufw default deny incoming`) to make the allows real, or delete them. Allows sitting above a deny rule are not flagged: those still punch holes through it.'
     });
   }
 

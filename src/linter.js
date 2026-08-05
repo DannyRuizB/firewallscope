@@ -85,6 +85,7 @@
       detectUnusedChains(table, findings, result.format);
       if (isFilterTable) {
         detectUnrestrictedEgress(table, findings, result.format);
+        detectSourcePortTrust(table, findings, result.format);
       }
     }
 
@@ -1893,6 +1894,69 @@
         title: `Trusts a spoofable MAC address (${mac[1]})`,
         details: 'A MAC is identification, not authentication: every device on the segment sees it (ARP/NDP) and can wear it with one `ip link set address` command. Note the IP-level smells still judge this rule as unrestricted — a MAC match is not a source restriction. Scope the rule to an IP/subnet (or authenticate for real: keys, 802.1X); blocking a known-bad MAC is fine, trusting one is not.'
       });
+    }
+  }
+
+  // ── source-port-trust ──────────────────────────────────────────────
+  // The source port is the cheapest field in the packet to forge: it is
+  // whatever socket the sender binds, so "from port 53" costs an attacker
+  // one option (nmap ships -g/--source-port precisely to walk through
+  // rules like this). An inbound ACCEPT keyed on --sport with no
+  // destination port is the pre-conntrack idiom for admitting replies
+  // (DNS answers, active-FTP data) — and it opens every local port to
+  // anyone who remembers to set their source port. Judged only on chains
+  // reachable from INPUT / FORWARD (BFS over jumps, same as unused-chain):
+  // on the OUTPUT side the sport is the host's OWN port and matching it is
+  // how stateless egress rules are legitimately written. A rule that also
+  // pins the destination port is spared (the service scopes it — the sport
+  // is then decoration, not the gate), and so is an ESTABLISHED/RELATED
+  // rule (conntrack is the gate). Blocking by sport stays unflagged: the
+  // usual wide-caution-ok, borrowed-trust-not rule shared with
+  // mac-based-trust and bogon-source-accept. Skipped for ufw (its status
+  // output has no source-port match).
+  function detectSourcePortTrust(table, findings, format) {
+    if (format === 'ufw') return;
+    const chains = table.chains || [];
+    const byName = new Map(chains.map(c => [c.name, c]));
+    const inbound = new Set();
+    const queue = [];
+    for (const chain of chains) {
+      if (isBuiltInInputChain(chain, format) || isBuiltInForwardChain(chain, format)) {
+        inbound.add(chain.name);
+        queue.push(chain);
+      }
+    }
+    while (queue.length) {
+      const chain = queue.shift();
+      for (const rule of chain.rules || []) {
+        if (!rule.isJumpToChain || !rule.action) continue;
+        const target = byName.get(rule.action);
+        if (target && !inbound.has(target.name)) {
+          inbound.add(target.name);
+          queue.push(target);
+        }
+      }
+    }
+    for (const chain of chains) {
+      if (!inbound.has(chain.name)) continue;
+      const rules = chain.rules || [];
+      for (let i = 0; i < rules.length; i++) {
+        const rule = rules[i];
+        if (!isAcceptAction(rule)) continue;
+        const t = rule.tokens || {};
+        if (!t.sport || t.dport) continue;
+        if (isEstablishedOnlyRule(rule)) continue;
+        findings.push({
+          id: 'source-port-trust',
+          severity: 'warning',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: i,
+          title: `Trusts a spoofable source port (sport ${t.sport})`,
+          details: `The source port is whatever socket the sender binds — any client can claim port ${t.sport} (nmap's -g/--source-port exists precisely to walk through rules like this), and with no destination port pinned this accept opens every local port to whoever does. It is the pre-conntrack idiom for admitting replies; the modern spelling is \`-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\` (nft: \`ct state established,related accept\`). If a stateless match is truly required, pin the destination port and the source address too — a source port is a hint, never an identity.`
+        });
+      }
     }
   }
 

@@ -19,7 +19,7 @@ const EXPECTED = {
   'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo', 'missing-loopback-spoof-drop', 'log-without-prefix'],
   'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
-  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin', 'rate-limit-not-per-source', 'rate-limit-drop-inverted', 'rate-limit-accept-inverted'],
+  'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin', 'rate-limit-not-per-source', 'rate-limit-drop-inverted', 'rate-limit-accept-inverted', 'source-port-trust'],
   'ip6tables-no-icmpv6.txt': ['icmpv6-blocked', 'unlimited-log'],
   'iptables-no-pmtud.txt': ['icmp-pmtud-blocked'],
   'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
@@ -79,6 +79,7 @@ const ALL_SMELLS = [
   'rate-limit-accept-inverted',
   'icmp-pmtud-blocked',
   'allow-under-default-allow',
+  'source-port-trust',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -950,6 +951,67 @@ test('mac-based-trust does not double-count and coexists with the IP-level smell
   const ids = FS.lint(FS.parse(rs)).findings.map((f) => f.id);
   assert.equal(ids.filter((x) => x === 'mac-based-trust').length, 1);
   assert.ok(ids.includes('exposed-admin-port'), 'MAC match must not count as a source restriction');
+});
+
+test('source-port-trust flags an inbound ACCEPT keyed on sport, spares a DROP', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p udp -m udp --sport 53 -j ACCEPT',
+    '-A INPUT -p udp -m udp --sport 67 -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'source-port-trust');
+  // The trusting ACCEPT fires; blocking by sport is caution, not trust.
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 0);
+  assert.equal(hits[0].severity, 'warning');
+  assert.match(hits[0].title, /53/);
+});
+
+test('source-port-trust spares a dport-pinned rule and an ESTABLISHED-gated one', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    // dport pinned: the service scopes the accept, sport is decoration.
+    '-A INPUT -p udp -m udp --sport 123 --dport 123 -j ACCEPT',
+    // conntrack is the gate, not the sport.
+    '-A INPUT -p udp -m udp --sport 53 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = FS.lint(FS.parse(rs)).findings.map((f) => f.id);
+  assert.ok(!ids.includes('source-port-trust'));
+});
+
+test('source-port-trust judges only the inbound side: OUTPUT is exempt, a chain jumped from INPUT is not', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]', ':OUTPUT DROP [0:0]', ':REPLIES - [0:0]',
+    // Stateless egress: matching the host's OWN sport is legitimate.
+    '-A OUTPUT -p tcp -m tcp --sport 22 -j ACCEPT',
+    // Same match reached from INPUT via a user chain: that is the smell.
+    '-A INPUT -j REPLIES',
+    '-A REPLIES -p udp -m udp --sport 53 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'source-port-trust');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].chain, 'REPLIES');
+});
+
+test('source-port-trust reads the nft sport spelling', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority 0; policy drop;',
+    '		udp sport 53 accept',
+    '	}',
+    '	chain output {',
+    '		type filter hook output priority 0; policy drop;',
+    '		tcp sport 22 accept',
+    '	}',
+    '}',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'source-port-trust');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].chain, 'input');
 });
 
 test('admin-port-no-rate-limit flags an unthrottled SSH accept, spares a throttled one', () => {

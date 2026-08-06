@@ -25,6 +25,7 @@ const EXPECTED = {
   'nft-v4only.txt': ['ipv6-unfiltered', 'unrestricted-egress'],
   'iptables-dnat-dead.txt': ['dnat-forward-blocked', 'exposed-via-dnat'],
   'ufw-default-allow.txt': ['allow-under-default-allow', 'missing-input-drop'],
+  'iptables-reflector.txt': ['udp-amplifier-exposed', 'exposed-admin-port'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -80,6 +81,7 @@ const ALL_SMELLS = [
   'icmp-pmtud-blocked',
   'allow-under-default-allow',
   'source-port-trust',
+  'udp-amplifier-exposed',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -1854,4 +1856,127 @@ test('dnat-no-hairpin composes with dnat-unscoped on the sloppy router\'s hurrie
 test('dnat-no-hairpin does not fire on the portforward or dnat-dead samples (-i-scoped DNATs)', () => {
   assert.ok(!lintIds('iptables-portforward.txt').has('dnat-no-hairpin'));
   assert.ok(!lintIds('iptables-dnat-dead.txt').has('dnat-no-hairpin'));
+});
+
+// --- udp-amplifier-exposed ------------------------------------------------
+
+test('udp-amplifier-exposed flags open UDP reflectors and names the multiplier', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p udp -m udp --dport 123 -j ACCEPT',
+    '-A INPUT -p udp -m udp --dport 11211 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'udp-amplifier-exposed');
+  assert.equal(hits.length, 2);
+  assert.equal(hits[0].severity, 'warning');
+  assert.match(hits[0].title, /ntp \(port 123, 556x amplification\)/);
+  assert.match(hits[1].title, /memcached .*51,000x/);
+});
+
+test('udp-amplifier-exposed spares a restricted source, a rate limit and an ESTABLISHED gate', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    // A resolver for your own subnet is the normal, correct setup.
+    '-A INPUT -p udp -m udp --dport 53 -s 192.168.1.0/24 -j ACCEPT',
+    // A TOTAL ceiling is the right control for amplification: it caps what
+    // this host can emit. Unlike the TCP brute-force case, global is fine.
+    '-A INPUT -p udp -m udp --dport 123 -m limit --limit 10/sec -j ACCEPT',
+    // Replies to the host's own queries, not a service anyone can reach.
+    '-A INPUT -p udp -m udp --dport 1900 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+    // Blocking a reflector port is the fix, never the smell.
+    '-A INPUT -p udp -m udp --dport 19 -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const ids = FS.lint(FS.parse(rs)).findings.map((f) => f.id);
+  assert.ok(!ids.includes('udp-amplifier-exposed'));
+});
+
+test('udp-amplifier-exposed is UDP-only: the same port over TCP never reflects', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    // TCP needs a handshake, so the source address cannot be forged —
+    // no reflection, whatever the port.
+    '-A INPUT -p tcp -m tcp --dport 53 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = FS.lint(FS.parse(rs)).findings.map((f) => f.id);
+  assert.ok(!ids.includes('udp-amplifier-exposed'));
+});
+
+test('udp-amplifier-exposed judges only the inbound side: OUTPUT is the host\'s own client socket', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]', ':OUTPUT ACCEPT [0:0]', ':SERVICES - [0:0]',
+    // The host querying someone else's NTP server: legitimate egress.
+    '-A OUTPUT -p udp -m udp --dport 123 -j ACCEPT',
+    // Same match reached from INPUT through a user chain: that is a reflector.
+    '-A INPUT -j SERVICES',
+    '-A SERVICES -p udp -m udp --dport 123 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'udp-amplifier-exposed');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].chain, 'SERVICES');
+});
+
+test('udp-amplifier-exposed reads the nft spelling and nft sets', () => {
+  const rs = [
+    'table inet filter {',
+    '	chain input {',
+    '		type filter hook input priority 0; policy drop;',
+    '		udp dport { 53, 123 } accept',
+    '	}',
+    '}',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'udp-amplifier-exposed');
+  // One finding per rule, reported on the first amplifier port it matches.
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].chain, 'input');
+  assert.match(hits[0].title, /dns/);
+});
+
+test('udp-amplifier-exposed treats a protocol-less ufw allow as UDP too (ufw allow 53 opens both)', () => {
+  const rs = UFW_HEADER.concat([
+    'Default: deny (incoming), allow (outgoing), disabled (routed)',
+    '',
+    'To                         Action      From',
+    '--                         ------      ----',
+    // Explicit /udp, and the bare spelling that opens BOTH transports.
+    '1900/udp                   ALLOW IN    Anywhere',
+    '53                         ALLOW IN    Anywhere',
+    // Explicit /tcp cannot reflect, and a LAN-scoped one is legitimate.
+    '11211/tcp                  ALLOW IN    Anywhere',
+    '123/udp                    ALLOW IN    192.168.1.0/24',
+  ]).join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'udp-amplifier-exposed');
+  assert.equal(hits.length, 2);
+  assert.match(hits[0].title, /ssdp/);
+  assert.match(hits[1].title, /dns/);
+});
+
+test('udp-amplifier-exposed composes with exposed-admin-port on open memcached UDP', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p udp -m udp --dport 11211 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = FS.lint(FS.parse(rs)).findings.map((f) => f.id);
+  // Two different costs on one rule: someone reading your cache
+  // (exposed-admin-port) and your host attacking a stranger (this smell).
+  assert.ok(ids.includes('exposed-admin-port'));
+  assert.ok(ids.includes('udp-amplifier-exposed'));
+});
+
+test('the reflector sample fires on the widened resolver, memcached and SSDP — but not the capped NTP', () => {
+  const hits = FS.lint(FS.parse(sample('iptables-reflector.txt')))
+    .findings.filter((f) => f.id === 'udp-amplifier-exposed');
+  assert.equal(hits.length, 3);
+  const services = hits.map((f) => f.title.match(/reflector: (\S+)/)[1]);
+  // JSON, not deepEqual: findings come from the linter's own realm, where
+  // deepEqual sees "same structure, not reference-equal" (the recurring
+  // cross-realm gotcha in this suite).
+  assert.equal(JSON.stringify(services), JSON.stringify(['dns', 'memcached', 'ssdp']));
+  // The LAN-scoped copy of the same port 53 rule sits right above the
+  // flagged one: the finding must point at the source-less rule.
+  assert.ok(hits[0].ruleIdx > 0);
 });

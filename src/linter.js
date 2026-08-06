@@ -86,6 +86,7 @@
       if (isFilterTable) {
         detectUnrestrictedEgress(table, findings, result.format);
         detectSourcePortTrust(table, findings, result.format);
+        detectUdpAmplifierExposed(table, findings, result.format);
       }
     }
 
@@ -1955,6 +1956,124 @@
           ruleIdx: i,
           title: `Trusts a spoofable source port (sport ${t.sport})`,
           details: `The source port is whatever socket the sender binds — any client can claim port ${t.sport} (nmap's -g/--source-port exists precisely to walk through rules like this), and with no destination port pinned this accept opens every local port to whoever does. It is the pre-conntrack idiom for admitting replies; the modern spelling is \`-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\` (nft: \`ct state established,related accept\`). If a stateless match is truly required, pin the destination port and the source address too — a source port is a hint, never an identity.`
+        });
+      }
+    }
+  }
+
+  // ── udp-amplifier-exposed ──────────────────────────────────────────
+  // Every other smell here asks "who gets INTO this host?". This one asks
+  // the opposite: who does this host ATTACK? UDP needs no handshake, so a
+  // reflector answers a forged source address — the attacker sends a small
+  // query claiming the victim's IP and the host mails the victim a much
+  // bigger answer. That is how a home NAS becomes a DDoS weapon: the 1.35
+  // Tbps GitHub flood (2018) came off open memcached, and the 400 Gbps
+  // Spamhaus/OVH floods off open NTP and DNS. The cost is not "someone
+  // reads your cache" (exposed-admin-port's axis, which composes here for
+  // memcached) — it is your uplink saturated and your provider's abuse
+  // desk on the phone about traffic you never sent.
+  //
+  // Ports carry their documented amplification factor (US-CERT TA14-017A
+  // and the memcached / WS-Discovery advisories) so the finding states the
+  // real multiplier. Deliberately limited to factors around 25x and above:
+  // SNMP (6.3x), NetBIOS (3.8x) and mDNS (10x) are left out — they reflect
+  // too, but a smell that fires on every LAN service earns nothing.
+  //
+  // Exemptions that keep it honest:
+  //  - a restricted source (any -s that is not "any") is spared: a resolver
+  //    or NTP server for your own subnet is the normal, correct setup;
+  //  - ESTABLISHED/RELATED-gated accepts are spared (those are replies to
+  //    the host's own queries, not a service);
+  //  - ANY rate limit is spared, per-source or global — unlike the TCP
+  //    brute-force case, a TOTAL ceiling is exactly the right control for
+  //    amplification (it caps what the host can emit), which is what
+  //    rate-limit-not-per-source already says by scoping itself to TCP;
+  //  - OUTPUT-side rules are never judged (BFS from INPUT/FORWARD, the
+  //    unused-chain machinery): there the port is the host's own client
+  //    socket, not a service anyone can reach;
+  //  - DROP/REJECT rules obviously never fire.
+  // ufw IS covered (its status prints the protocol), with one wrinkle worth
+  // knowing: `ufw allow 53` with no protocol opens TCP *and* UDP, so a
+  // protocol-less ufw allow counts as UDP here — that spelling is exactly
+  // how an accidental open resolver usually gets created.
+  const AMPLIFIER_PORTS = {
+    19:    { service: 'chargen',       factor: '358x' },
+    53:    { service: 'dns',           factor: 'up to 54x' },
+    111:   { service: 'rpcbind',       factor: 'up to 28x' },
+    123:   { service: 'ntp',           factor: '556x' },
+    389:   { service: 'cldap',         factor: 'up to 70x' },
+    1900:  { service: 'ssdp',          factor: '30x' },
+    3702:  { service: 'ws-discovery',  factor: 'up to 500x' },
+    11211: { service: 'memcached',    factor: 'up to 51,000x' }
+  };
+
+  function isUdpRule(rule, format) {
+    const proto = String((rule.tokens && rule.tokens.protocol) || '').toLowerCase();
+    if (proto) return proto === 'udp';
+    // A ufw allow with no protocol opens both transports — UDP included.
+    if (format === 'ufw') return true;
+    const text = `${rule.raw || ''} ${rule.match || ''}`;
+    return /(^|\s)-p\s+udp\b/.test(text) ||
+           /(^|\s)udp\s+(dport|sport)\b/.test(text) ||
+           /\bmeta\s+l4proto\s+udp\b/.test(text) ||
+           /\bip6?\s+(protocol|nexthdr)\s+udp\b/.test(text);
+  }
+
+  function matchAmplifierPort(rule) {
+    const d = rule.tokens && rule.tokens.dport;
+    if (!d) return null;
+    for (const portStr of Object.keys(AMPLIFIER_PORTS)) {
+      const port = +portStr;
+      if (portInDport(port, String(d))) {
+        return Object.assign({ port }, AMPLIFIER_PORTS[portStr]);
+      }
+    }
+    return null;
+  }
+
+  function detectUdpAmplifierExposed(table, findings, format) {
+    const chains = table.chains || [];
+    const byName = new Map(chains.map(c => [c.name, c]));
+    const inbound = new Set();
+    const queue = [];
+    for (const chain of chains) {
+      if (isBuiltInInputChain(chain, format) || isBuiltInForwardChain(chain, format)) {
+        inbound.add(chain.name);
+        queue.push(chain);
+      }
+    }
+    while (queue.length) {
+      const chain = queue.shift();
+      for (const rule of chain.rules || []) {
+        if (!rule.isJumpToChain || !rule.action) continue;
+        const target = byName.get(rule.action);
+        if (target && !inbound.has(target.name)) {
+          inbound.add(target.name);
+          queue.push(target);
+        }
+      }
+    }
+    for (const chain of chains) {
+      if (!inbound.has(chain.name)) continue;
+      const rules = chain.rules || [];
+      for (let i = 0; i < rules.length; i++) {
+        const rule = rules[i];
+        if (!isAcceptAction(rule)) continue;
+        if (!isSourceAny(rule)) continue;
+        if (!isUdpRule(rule, format)) continue;
+        if (isEstablishedRule(rule)) continue;
+        if (isRateLimited(rule)) continue;
+        const hit = matchAmplifierPort(rule);
+        if (!hit) continue;
+        findings.push({
+          id: 'udp-amplifier-exposed',
+          severity: 'warning',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: i,
+          title: `Open UDP reflector: ${hit.service} (port ${hit.port}, ${hit.factor} amplification) accepted from any source`,
+          details: `UDP takes no handshake, so this service answers forged source addresses: an attacker sends a small ${hit.service} query claiming the victim's IP and the host mails the victim a reply ${hit.factor} the size. The damage lands on someone else — your uplink saturated, your provider's abuse desk calling about traffic you never sent (open memcached carried the 1.35 Tbps GitHub flood; open NTP and DNS carried the 400 Gbps Spamhaus/OVH ones). Restrict the source to the subnet that actually needs it (\`-s 192.168.1.0/24\`), or cap what the host can emit with a rate limit (\`-m limit --limit 10/sec\`; nft: \`limit rate 10/second\`) — either one clears this finding. If the service is not meant to be public at all, close the port: for memcached, bind it to localhost and disable UDP (\`-U 0\`).`
         });
       }
     }

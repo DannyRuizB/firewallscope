@@ -26,6 +26,7 @@ const EXPECTED = {
   'iptables-dnat-dead.txt': ['dnat-forward-blocked', 'exposed-via-dnat'],
   'ufw-default-allow.txt': ['allow-under-default-allow', 'missing-input-drop'],
   'iptables-reflector.txt': ['udp-amplifier-exposed', 'exposed-admin-port'],
+  'ufw-default-deny-noop.txt': ['deny-under-default-deny'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -82,6 +83,7 @@ const ALL_SMELLS = [
   'allow-under-default-allow',
   'source-port-trust',
   'udp-amplifier-exposed',
+  'deny-under-default-deny',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -151,6 +153,105 @@ test('the decorative-ufw sample trips the smell exactly once with three no-ops',
   // The LIMIT row and the working DENY are not part of the count, and the
   // finding anchors on the first allow after the deny.
   assert.equal(hits[0].ruleIdx, 1);
+});
+
+test('a v6 deny below the list cannot save a v4 no-op allow (families judged apart)', () => {
+  // ufw prints the whole v6 block after the v4 rules: with the flat-list
+  // logic the trailing v6 deny made every v4 allow look functional.
+  const findings = ufwLint('allow (incoming), allow (outgoing), disabled (routed)', [
+    '80/tcp                     ALLOW IN    Anywhere',
+    '23/tcp (v6)                DENY IN     Anywhere (v6)',
+  ]);
+  const hits = findings.filter((f) => f.id === 'allow-under-default-allow');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 0);
+});
+
+// --- deny-under-default-deny ----------------------------------------------
+
+test('deny-under-default-deny counts the dead denies and anchors on the first', () => {
+  const findings = ufwLint('deny (incoming), allow (outgoing), disabled (routed)', [
+    '80/tcp                     ALLOW IN    Anywhere',
+    '23/tcp                     DENY IN     Anywhere',
+    '445/tcp                    DENY IN     Anywhere',
+  ]);
+  const hits = findings.filter((f) => f.id === 'deny-under-default-deny');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].chain, 'INPUT');
+  assert.equal(hits[0].ruleIdx, 1);
+  assert.ok(hits[0].title.startsWith('2 deny'));
+});
+
+test('a deny above an allow carves an exception and is spared', () => {
+  const findings = ufwLint('deny (incoming), allow (outgoing), disabled (routed)', [
+    '80/tcp                     DENY IN     203.0.113.9',
+    '80/tcp                     ALLOW IN    Anywhere',
+  ]);
+  assert.ok(!findings.some((f) => f.id === 'deny-under-default-deny'));
+});
+
+test('a deny above a LIMIT is spared too - limit admits traffic a deny can carve', () => {
+  const findings = ufwLint('deny (incoming), allow (outgoing), disabled (routed)', [
+    '22/tcp                     DENY IN     203.0.113.9',
+    '22/tcp                     LIMIT IN    Anywhere',
+  ]);
+  assert.ok(!findings.some((f) => f.id === 'deny-under-default-deny'));
+});
+
+test('REJECT under a deny policy changes the refusal mode and is spared', () => {
+  const findings = ufwLint('deny (incoming), allow (outgoing), disabled (routed)', [
+    '113/tcp                    REJECT IN   Anywhere',
+  ]);
+  assert.ok(!findings.some((f) => f.id === 'deny-under-default-deny'));
+});
+
+test('under a reject policy the roles swap: reject rules are the no-ops, denies work', () => {
+  const findings = ufwLint('reject (incoming), allow (outgoing), disabled (routed)', [
+    '113/tcp                    REJECT IN   Anywhere',
+    '23/tcp                     DENY IN     Anywhere',
+  ]);
+  const hits = findings.filter((f) => f.id === 'deny-under-default-deny');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 0);
+  assert.ok(hits[0].title.startsWith('1 reject'));
+});
+
+test('a (log) deny changes what you see and is spared', () => {
+  const findings = ufwLint('deny (incoming), allow (outgoing), disabled (routed)', [
+    '137/udp                    DENY IN     Anywhere                   (log)',
+  ]);
+  assert.ok(!findings.some((f) => f.id === 'deny-under-default-deny'));
+});
+
+test('never fires under a default-allow policy (that is the other smell)', () => {
+  const findings = ufwLint('allow (incoming), allow (outgoing), disabled (routed)', [
+    '23/tcp                     DENY IN     Anywhere',
+    '80/tcp                     ALLOW IN    Anywhere',
+  ]);
+  assert.ok(!findings.some((f) => f.id === 'deny-under-default-deny'));
+});
+
+test('a v6 allow below the list cannot save a v4 dead deny (families judged apart)', () => {
+  // The measured case: a deny added after `allow 80` sits above the v6
+  // block, and judging the flat list called it functional when it was dead.
+  const findings = ufwLint('deny (incoming), allow (outgoing), disabled (routed)', [
+    '80/tcp                     ALLOW IN    Anywhere',
+    '80/tcp                     DENY IN     203.0.113.9',
+    '80/tcp (v6)                ALLOW IN    Anywhere (v6)',
+  ]);
+  const hits = findings.filter((f) => f.id === 'deny-under-default-deny');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].ruleIdx, 1);
+});
+
+test('the dead-deny sample trips the smell exactly once, on the late v4 deny only', () => {
+  const { findings } = FS.lint(FS.parse(sample('ufw-default-deny-noop.txt')));
+  const hits = findings.filter((f) => f.id === 'deny-under-default-deny');
+  assert.equal(hits.length, 1);
+  assert.ok(hits[0].title.startsWith('1 deny'));
+  // The denies above the LIMIT are spared, the (log) deny is spared, the
+  // REJECT is spared, and the v6 block has nothing after its LIMIT.
+  assert.equal(hits[0].ruleIdx, 5);
 });
 
 test('exposed-via-dnat flags only the admin-port forward, not the web redirect', () => {

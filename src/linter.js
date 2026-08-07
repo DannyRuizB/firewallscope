@@ -61,6 +61,7 @@
           detectRateLimitDropInverted(chain, table, findings, result.format);
           detectRateLimitAcceptInverted(chain, table, findings, result.format);
           detectAllowUnderDefaultAllow(chain, table, findings, result.format);
+          detectDenyUnderDefaultDeny(chain, table, findings, result.format);
         }
         detectUnlimitedLog(chain, table, findings, result.format);
         detectLogTcpSequence(chain, table, findings, result.format);
@@ -252,20 +253,38 @@
   // problem, not a no-op), and LIMIT rules keep their throttle either way.
   // ufw-only on purpose: raw iptables/nft pastes can be partial rulesets,
   // and the whitelist illusion is ufw's own UX.
+  // ufw lists the IPv4 rules first and the whole IPv6 block ("(v6)") after
+  // them, in ONE list — but the two stacks are separate universes: a v6 rule
+  // sitting "below" a v4 rule can neither save it nor shadow it. Every
+  // position-based judgement over a ufw chain must partition first (measured:
+  // a v4 deny added after `allow 80` sat ABOVE the v6 allows, and judging the
+  // flat list called it functional when it was dead).
+  function ufwFamilyPartitions(chain) {
+    const v4 = [];
+    const v6 = [];
+    for (let i = 0; i < chain.rules.length; i++) {
+      (/\(v6\)/.test(chain.rules[i].raw || '') ? v6 : v4).push(i);
+    }
+    return [v4, v6];
+  }
+
   function detectAllowUnderDefaultAllow(chain, table, findings, format) {
     if (format !== 'ufw') return;
     if ((chain.policy || '').toUpperCase() !== 'ACCEPT') return;
     if (!chain.rules || chain.rules.length === 0) return;
-    let lastDenyIdx = -1;
-    for (let i = 0; i < chain.rules.length; i++) {
-      const a = (chain.rules[i].action || '').toUpperCase();
-      if (a === 'DROP' || a === 'REJECT') lastDenyIdx = i;
-    }
     const noOps = [];
-    for (let i = lastDenyIdx + 1; i < chain.rules.length; i++) {
-      if ((chain.rules[i].action || '').toUpperCase() === 'ACCEPT') noOps.push(i);
+    for (const idxs of ufwFamilyPartitions(chain)) {
+      let lastDeny = -1;
+      for (let k = 0; k < idxs.length; k++) {
+        const a = (chain.rules[idxs[k]].action || '').toUpperCase();
+        if (a === 'DROP' || a === 'REJECT') lastDeny = k;
+      }
+      for (let k = lastDeny + 1; k < idxs.length; k++) {
+        if ((chain.rules[idxs[k]].action || '').toUpperCase() === 'ACCEPT') noOps.push(idxs[k]);
+      }
     }
     if (noOps.length === 0) return;
+    noOps.sort((a, b) => a - b);
     const plural = noOps.length === 1 ? 'rule is a no-op' : 'rules are no-ops';
     findings.push({
       id: 'allow-under-default-allow',
@@ -275,7 +294,51 @@
       chain: chain.name,
       ruleIdx: noOps[0],
       title: `${noOps.length} allow ${plural} under ${chain.name}'s default-allow policy`,
-      details: 'The default already accepts everything, so these allow rules restrict nothing — the list reads like a whitelist but is decorative. Set the default to deny (`ufw default deny incoming`) to make the allows real, or delete them. Allows sitting above a deny rule are not flagged: those still punch holes through it.'
+      details: 'The default already accepts everything, so these allow rules restrict nothing — the list reads like a whitelist but is decorative. Set the default to deny (`ufw default deny incoming`) to make the allows real, or delete them. Allows sitting above a deny rule are not flagged: those still punch holes through it. IPv4 and IPv6 are judged as the separate stacks they are.'
+    });
+  }
+
+  // The mirror image: under `Default: deny (incoming)` a DENY rule with no
+  // allow below it refuses what the policy already refuses — decorative, and
+  // it reads like extra hardening. Three things keep their job and are spared:
+  // a deny ABOVE an allow/limit (it carves an exception out of it — ufw is
+  // first-match), a REJECT under a deny policy (the policy drops silently,
+  // the rule answers with a reset: a different, observable refusal — and
+  // vice versa under `default reject`), and a `(log)` rule (it changes what
+  // you SEE even when it cannot change the verdict).
+  function detectDenyUnderDefaultDeny(chain, table, findings, format) {
+    if (format !== 'ufw') return;
+    const policy = (chain.policy || '').toUpperCase();
+    if (policy !== 'DROP' && policy !== 'REJECT') return;
+    if (!chain.rules || chain.rules.length === 0) return;
+    const noOps = [];
+    for (const idxs of ufwFamilyPartitions(chain)) {
+      let lastAllow = -1;
+      for (let k = 0; k < idxs.length; k++) {
+        const a = (chain.rules[idxs[k]].action || '').toUpperCase();
+        if (a === 'ACCEPT' || a === 'LIMIT') lastAllow = k;
+      }
+      for (let k = lastAllow + 1; k < idxs.length; k++) {
+        const rule = chain.rules[idxs[k]];
+        const a = (rule.action || '').toUpperCase();
+        if (a !== policy) continue;               // the other refusal mode is real work
+        if (/\(log\)/i.test(rule.raw || '')) continue; // observability is real work
+        noOps.push(idxs[k]);
+      }
+    }
+    if (noOps.length === 0) return;
+    noOps.sort((a, b) => a - b);
+    const plural = noOps.length === 1 ? 'rule is a no-op' : 'rules are no-ops';
+    const mode = policy === 'REJECT' ? 'reject' : 'deny';
+    findings.push({
+      id: 'deny-under-default-deny',
+      severity: 'info',
+      table: table.name,
+      tableFamily: table.family || null,
+      chain: chain.name,
+      ruleIdx: noOps[0],
+      title: `${noOps.length} ${mode} ${plural} under ${chain.name}'s default-${mode} policy`,
+      details: `The default already refuses everything these rules refuse, and no allow below them needs the exception — they read like extra hardening while doing nothing. Denies above an allow are spared (they carve exceptions out of it), a REJECT under a deny policy is spared (a reset instead of a silent drop is a different refusal), and \`(log)\` rules are spared (they change what you see). IPv4 and IPv6 are judged as the separate stacks they are.`
     });
   }
 

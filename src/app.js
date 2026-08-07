@@ -16,7 +16,8 @@
     nftv4only: 'samples/nft-v4only.txt',
     dnatdead:  'samples/iptables-dnat-dead.txt',
     ufwdecorative: 'samples/ufw-default-allow.txt',
-    reflector: 'samples/iptables-reflector.txt'
+    reflector: 'samples/iptables-reflector.txt',
+    ufwdeadden:  'samples/ufw-default-deny-noop.txt'
   };
 
   const FORMAT_LABELS = {

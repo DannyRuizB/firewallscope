@@ -78,6 +78,7 @@
         if (isNatPreroutingChain(table, chain, result.format)) {
           detectExposedViaDnat(table, chain, findings);
           detectDnatUnscoped(table, chain, findings);
+          detectDnatToLoopback(table, chain, findings);
         }
         if (isNatPostroutingChain(table, chain, result.format)) {
           detectMasqueradeAnySource(table, chain, findings);
@@ -115,8 +116,9 @@
   // first forwarded packet is NEW), but any accept whose destination and
   // port cover the target suppresses the finding — including ones with
   // matches we don't model, so we never cry "blocked" over a rule we can't
-  // fully read. REDIRECT and DNAT-to-localhost are skipped: they don't
-  // forward anywhere.
+  // fully read. REDIRECT and DNAT-to-loopback (any 127/8 address, not just
+  // 127.0.0.1 — 127.0.0.53 is systemd-resolved) are skipped: they don't
+  // forward anywhere, the rewritten packet is delivered locally.
   function detectDnatForwardBlocked(result, findings) {
     if (!window.FirewallScope || typeof window.FirewallScope.extractDnatRewrite !== 'function') return;
     const extract = window.FirewallScope.extractDnatRewrite;
@@ -143,7 +145,7 @@
           if (String(rule.action || '').toUpperCase() !== 'DNAT') continue;
           const rw = extract(rule);
           if (!rw || !rw.destination || rw.dport == null) continue;
-          if (rw.destination === '127.0.0.1') continue; // local, not forwarded
+          if (cidrSubsetOrAny(rw.destination, '127.0.0.0/8')) continue; // local, not forwarded
           if (forwardCoversTarget(fwd, rw.destination, rw.dport)) continue;
           findings.push({
             id: 'dnat-forward-blocked',
@@ -2250,6 +2252,67 @@
         ruleIdx: i,
         title: 'DNAT with no destination address or input interface hijacks the port everywhere',
         details: `${rule.raw || ''} — with neither \`-d <public-ip>\` nor \`-i <wan-iface>\` (nft \`ip daddr\` / \`iifname\`) this rewrite applies to every packet entering any interface: LAN clients talking to any host on this port get forwarded too. Scope it to the public address or the outside interface.`
+      });
+    }
+  }
+
+  // ── dnat-to-loopback ───────────────────────────────────────────────
+  // The fifth side of the DNAT family: exposed-via-dnat asks who can reach
+  // the target, dnat-forward-blocked whether the forward works, dnat-unscoped
+  // what else it swallows, dnat-no-hairpin whether it works from the inside —
+  // this one asks where the rewrite SENDS the packet. A PREROUTING DNAT to
+  // 127.0.0.1 (or any 127/8 address — 127.0.0.53 is systemd-resolved) is the
+  // classic "publish the localhost-only admin panel" recipe, and it is broken
+  // both ways:
+  // - by default it does nothing: the kernel refuses to route a packet from
+  //   the wire to a loopback address (a martian destination), so the forward
+  //   is silently dark;
+  // - the fix every forum thread offers — `sysctl route_localnet=1` — works
+  //   by removing the kernel's own guarantee that 127/8 is unreachable from
+  //   outside. Every service bound to 127.0.0.1 is then one spoofed packet
+  //   away from any on-link sender: exactly the hole kube-proxy opened
+  //   (CVE-2020-8558) and the hole missing-loopback-spoof-drop exists to
+  //   close from the firewall side.
+  // The honest fixes never touch loopback routing: bind the service on an
+  // address the filter table can scope (that is what the firewall is FOR),
+  // front it with a reverse proxy — or, when the service listens on the
+  // router's own address, REDIRECT. REDIRECT itself is exempt on purpose:
+  // its "127.0.0.1" in the trace model is shorthand, the kernel rewrites to
+  // the incoming interface's address and no loopback routing is involved.
+  // An `-i lo`-scoped DNAT is exempt too — traffic already on loopback
+  // stays there. nat/OUTPUT rewrites are never judged (the dispatch is
+  // PREROUTING-only): DNAT-ing the host's OWN traffic to 127.0.0.1 is how
+  // transparent local proxies are legitimately written.
+  function detectDnatToLoopback(table, chain, findings) {
+    if (!window.FirewallScope || typeof window.FirewallScope.extractDnatRewrite !== 'function') return;
+    const extract = window.FirewallScope.extractDnatRewrite;
+    const rules = chain.rules || [];
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (String(rule.action || '').toUpperCase() !== 'DNAT') continue;
+      const t = rule.tokens || {};
+      if (t.iface_in === 'lo') continue;
+      const rw = extract(rule);
+      const v4Loopback = !!(rw && rw.destination && cidrSubsetOrAny(rw.destination, '127.0.0.0/8'));
+      // parseDnatTarget only models dotted-quad targets, so the v6 loopback
+      // (`--to-destination [::1]:8080`, nft `dnat to [::1]:8080`) is read
+      // from the raw rewrite target directly.
+      const v6Loopback = !v4Loopback
+        && /(?:--to(?:-destination)?|\bto)\s+\[?::1\]?(?::\d+)?(?:\s|$)/.test(String(rule.raw || ''));
+      if (!v4Loopback && !v6Loopback) continue;
+      const target = v4Loopback
+        ? (rw.dport != null ? `${rw.destination}:${rw.dport}` : rw.destination)
+        : '::1';
+      const port = rw && rw.dport != null ? rw.dport : '<port>';
+      findings.push({
+        id: 'dnat-to-loopback',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: i,
+        title: `DNAT rewrites inbound traffic to loopback (${target}) — dark by default, dangerous when "fixed"`,
+        details: `${rule.raw || ''} — the kernel refuses to route packets from the wire to a loopback address, so this forward silently delivers nothing; and the usual fix (\`sysctl route_localnet=1\`) removes that refusal wholesale, leaving every 127.0.0.1-bound service one spoofed packet away from any on-link sender (CVE-2020-8558). Bind the service on an address the filter table can scope, front it with a proxy — or, if it listens on the router's own address, use REDIRECT (\`-j REDIRECT --to-ports ${port}\` / nft \`redirect to :${port}\`).`
       });
     }
   }

@@ -16,7 +16,7 @@ function lintIds(name) {
 const EXPECTED = {
   'iptables-leaky.txt': ['missing-input-drop', 'exposed-admin-port', 'permissive-accept', 'fallthrough-accept'],
   'iptables-shadowed.txt': ['shadowed-rule', 'rule-after-policy-drop'],
-  'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo', 'missing-loopback-spoof-drop', 'log-without-prefix'],
+  'iptables-portforward.txt': ['exposed-via-dnat', 'unlimited-log', 'unlimited-icmp-echo', 'missing-loopback-spoof-drop', 'log-without-prefix', 'dnat-to-loopback'],
   'ufw-status.txt': ['loopback-not-allowed', 'unrestricted-egress'],
   'iptables-exposed-services.txt': ['exposed-admin-port', 'wide-open-port-range', 'overbroad-source-trust'],
   'iptables-router-sloppy.txt': ['forward-no-default-deny', 'missing-established-accept', 'masquerade-any-source', 'drop-without-log', 'missing-invalid-drop', 'unused-chain', 'duplicate-rule', 'unlimited-icmp-echo', 'unrestricted-egress', 'mac-based-trust', 'admin-port-no-rate-limit', 'bogon-source-accept', 'dnat-unscoped', 'dnat-no-hairpin', 'rate-limit-not-per-source', 'rate-limit-drop-inverted', 'rate-limit-accept-inverted', 'source-port-trust'],
@@ -84,6 +84,7 @@ const ALL_SMELLS = [
   'source-port-trust',
   'udp-amplifier-exposed',
   'deny-under-default-deny',
+  'dnat-to-loopback',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -1608,7 +1609,9 @@ test('dnat-forward-blocked flags the DNAT whose FORWARD accept is missing', () =
 });
 
 test('dnat-forward-blocked stays quiet when every target has a FORWARD accept', () => {
-  // The portforward sample cables all three DNAT targets in FORWARD.
+  // The portforward sample cables all three forwarded DNAT targets in
+  // FORWARD; the fourth DNAT rewrites to loopback, which is delivered
+  // locally and never traverses FORWARD (dnat-to-loopback's business).
   assert.ok(!lintIds('iptables-portforward.txt').has('dnat-forward-blocked'));
 });
 
@@ -2080,4 +2083,104 @@ test('the reflector sample fires on the widened resolver, memcached and SSDP —
   // The LAN-scoped copy of the same port 53 rule sits right above the
   // flagged one: the finding must point at the source-less rule.
   assert.ok(hits[0].ruleIdx > 0);
+});
+
+// --- dnat-to-loopback (v1.31.0) ---------------------------------------------
+
+test('dnat-to-loopback flags the PREROUTING DNAT to 127.0.0.1, names the target and the trap', () => {
+  const rs = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i eth0 -p tcp --dport 8081 -j DNAT --to-destination 127.0.0.1:8081',
+    'COMMIT',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'dnat-to-loopback');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].severity, 'warning');
+  assert.match(hits[0].title, /127\.0\.0\.1:8081/);
+  // Both halves of the argument travel in the details: dark by default,
+  // and the forum fix is the CVE.
+  assert.match(hits[0].details, /route_localnet/);
+  assert.match(hits[0].details, /CVE-2020-8558/);
+  assert.match(hits[0].details, /REDIRECT --to-ports 8081/);
+});
+
+test('dnat-to-loopback covers all of 127/8, not just 127.0.0.1 (127.0.0.53 is systemd-resolved)', () => {
+  const rs = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i eth0 -p udp --dport 53 -j DNAT --to-destination 127.0.0.53:53',
+    'COMMIT',
+  ].join('\n');
+  const findings = FS.lint(FS.parse(rs)).findings;
+  assert.ok(findings.some((f) => f.id === 'dnat-to-loopback'));
+  // ...and the sibling smell agrees the packet never traverses FORWARD:
+  // a loopback rewrite with no FORWARD accept is NOT a blocked forward.
+  assert.ok(!findings.some((f) => f.id === 'dnat-forward-blocked'));
+});
+
+test('dnat-to-loopback reads the v6 loopback from ip6tables and from nft', () => {
+  const v6 = [
+    '*nat', ':PREROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination [::1]:8080',
+    'COMMIT',
+  ].join('\n');
+  const v6hits = FS.lint(FS.parse(v6, 'ip6tables-save')).findings.filter((f) => f.id === 'dnat-to-loopback');
+  assert.equal(v6hits.length, 1);
+  assert.match(v6hits[0].title, /::1/);
+
+  const nft = [
+    'table ip6 nat {',
+    '\tchain prerouting {',
+    '\t\ttype nat hook prerouting priority dstnat;',
+    '\t\ttcp dport 8080 dnat to [::1]:8080',
+    '\t}',
+    '}',
+  ].join('\n');
+  assert.ok(FS.lint(FS.parse(nft)).findings.some((f) => f.id === 'dnat-to-loopback'));
+});
+
+test('dnat-to-loopback understands the nft v4 form', () => {
+  const nft = [
+    'table ip nat {',
+    '\tchain prerouting {',
+    '\t\ttype nat hook prerouting priority dstnat;',
+    '\t\tiifname "eth0" tcp dport 8081 dnat to 127.0.0.1:8081',
+    '\t}',
+    '}',
+  ].join('\n');
+  const hits = FS.lint(FS.parse(nft)).findings.filter((f) => f.id === 'dnat-to-loopback');
+  assert.equal(hits.length, 1);
+});
+
+test('dnat-to-loopback spares REDIRECT: same "127.0.0.1" in the trace model, no loopback routing involved', () => {
+  const rs = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i eth0 -p tcp --dport 8081 -j REDIRECT --to-ports 8081',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(rs)).findings.some((f) => f.id === 'dnat-to-loopback'));
+});
+
+test('dnat-to-loopback spares -i lo DNATs and nat/OUTPUT rewrites (transparent local proxies)', () => {
+  const onLoopback = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i lo -p tcp --dport 53 -j DNAT --to-destination 127.0.0.1:5353',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(onLoopback)).findings.some((f) => f.id === 'dnat-to-loopback'));
+
+  const natOutput = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A OUTPUT -p tcp --dport 80 -j DNAT --to-destination 127.0.0.1:8080',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(natOutput)).findings.some((f) => f.id === 'dnat-to-loopback'));
+});
+
+test('dnat-to-loopback stays quiet on ordinary forwards', () => {
+  const rs = [
+    '*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 192.168.1.50:8080',
+    'COMMIT',
+  ].join('\n');
+  assert.ok(!FS.lint(FS.parse(rs)).findings.some((f) => f.id === 'dnat-to-loopback'));
 });

@@ -97,8 +97,92 @@
     }
     detectDnatForwardBlocked(result, findings);
     detectDnatNoHairpin(result, findings);
+    detectDockerUserUnfiltered(result, findings);
 
     return summarize(findings);
+  }
+
+  // ── docker-user-unfiltered ─────────────────────────────────────────
+  // The most famous iptables surprise of the container era: a published
+  // Docker port never traverses INPUT. The packet is DNATed in the nat
+  // DOCKER chain (jumped from PREROUTING) and delivered through FORWARD —
+  // so every carefully-curated INPUT rule in the paste is blind to it, ufw
+  // included (its user rules live in INPUT too). Appending to FORWARD is no
+  // better: Docker re-inserts its own jumps at the TOP of FORWARD on every
+  // restart, so admin rules sink below the accepts. The ONE chain Docker
+  // creates for the operator, consults first, and guarantees never to
+  // touch is DOCKER-USER — and its factory content is a single RETURN,
+  // i.e. no filtering at all. Docker managing the firewall + published
+  // ports + a factory DOCKER-USER = every published port reachable from
+  // anywhere the host routes, whatever the rest of the ruleset says.
+  //
+  // Note the rest of the DNAT family cannot speak here: those detectors
+  // are dispatched on nat/PREROUTING itself, and Docker's DNATs live in
+  // the user chain DOCKER. This smell is the mechanism-level counterpart —
+  // and the ruleset-side view of dockerscope's `port-public` (a compose
+  // file publishing 5432 to 0.0.0.0 lands as exactly this DNAT).
+  //
+  // Three conditions, all visible in the paste, keep it honest:
+  //  - the filter table shows Docker's wiring (a DOCKER-USER chain jumped
+  //    from the built-in FORWARD) — without the jump nothing consults it;
+  //  - DOCKER-USER is factory content: empty, or nothing but RETURN. One
+  //    real rule means the operator knows the mechanism — judging their
+  //    rules' quality is other smells' job;
+  //  - at least one port is actually published: a DNAT rule in a chain
+  //    named DOCKER. No DNAT (internal-only networks, no -p flags) means
+  //    nothing is exposed and the empty chain is simply Docker's default.
+  // ufw pastes are exempt by construction (ufw status never shows Docker's
+  // chains — which is itself part of the trap this smell describes).
+  function detectDockerUserUnfiltered(result, findings) {
+    const format = result.format;
+    if (format === 'ufw') return;
+    const tables = result.tables || [];
+
+    let filterTable = null;
+    let dockerUser = null;
+    for (const table of tables) {
+      if (!isFilterTableName(table.name)) continue;
+      const du = (table.chains || []).find((c) => String(c.name) === 'DOCKER-USER');
+      if (!du) continue;
+      const fwd = (table.chains || []).find((c) => isBuiltInForwardChain(c, format));
+      if (!fwd) continue;
+      const wired = (fwd.rules || []).some((r) => r.isJumpToChain && r.action === 'DOCKER-USER');
+      if (!wired) continue;
+      filterTable = table;
+      dockerUser = du;
+      break;
+    }
+    if (!dockerUser) return;
+
+    const noop = (dockerUser.rules || []).every(
+      (r) => String(r.action || '').toUpperCase() === 'RETURN'
+    );
+    if (!noop) return;
+
+    const published = [];
+    for (const table of tables) {
+      for (const chain of table.chains || []) {
+        if (String(chain.name) !== 'DOCKER') continue;
+        for (const rule of chain.rules || []) {
+          if (String(rule.action || '').toUpperCase() !== 'DNAT') continue;
+          const t = rule.tokens || {};
+          published.push(t.dport != null ? String(t.dport) : '?');
+        }
+      }
+    }
+    if (published.length === 0) return;
+
+    const plural = published.length === 1 ? 'port' : 'ports';
+    findings.push({
+      id: 'docker-user-unfiltered',
+      severity: 'warning',
+      table: filterTable.name,
+      tableFamily: filterTable.family || null,
+      chain: dockerUser.name,
+      ruleIdx: null,
+      title: `Docker publishes ${plural} ${published.join(', ')} and DOCKER-USER filters nothing`,
+      details: `A published container port never traverses INPUT: the packet is DNATed in the nat DOCKER chain and delivered through FORWARD, so every INPUT rule in this ruleset is blind to it (ufw's user rules included). Appending to FORWARD is no better — Docker re-inserts its own jumps at the top on every restart. The one chain Docker consults first and guarantees to leave alone is DOCKER-USER, and here it only RETURNs: the published ${plural} are reachable from anywhere the host routes. Put the restriction there, e.g. \`iptables -I DOCKER-USER -i <wan-iface> ! -s 10.0.0.0/8 -j DROP\` — and mind that the packet is already rewritten by then, so match the original published port with \`-m conntrack --ctdir ORIGINAL --ctorigdstport <port>\`, not \`--dport\`.`
+    });
   }
 
   // A DNAT in nat/PREROUTING rewrites the packet BEFORE the filter table

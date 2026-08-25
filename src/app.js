@@ -17,7 +17,8 @@
     dnatdead:  'samples/iptables-dnat-dead.txt',
     ufwdecorative: 'samples/ufw-default-allow.txt',
     reflector: 'samples/iptables-reflector.txt',
-    ufwdeadden:  'samples/ufw-default-deny-noop.txt'
+    ufwdeadden:  'samples/ufw-default-deny-noop.txt',
+    dockeropen: 'samples/iptables-docker-open.txt'
   };
 
   const FORMAT_LABELS = {

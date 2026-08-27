@@ -28,6 +28,7 @@ const EXPECTED = {
   'iptables-reflector.txt': ['udp-amplifier-exposed', 'exposed-admin-port'],
   'ufw-default-deny-noop.txt': ['deny-under-default-deny'],
   'iptables-docker-open.txt': ['docker-user-unfiltered', 'exposed-admin-port', 'missing-invalid-drop', 'unrestricted-egress'],
+  'iptables-notrack-dns.txt': ['notrack-defeats-state-match'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -87,6 +88,7 @@ const ALL_SMELLS = [
   'deny-under-default-deny',
   'dnat-to-loopback',
   'docker-user-unfiltered',
+  'notrack-defeats-state-match',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -2317,4 +2319,114 @@ test('the docker sample stars the new smell and keeps the noise pinned down', ()
       .filter((f) => f.id === quiet && f.chain === 'INPUT');
     assert.equal(hits.length, 0, `'${quiet}' should not fire on the hardened INPUT`);
   }
+});
+
+// --- notrack-defeats-state-match -------------------------------------------
+
+const NOTRACK_RAW = [
+  '*raw', ':PREROUTING ACCEPT [0:0]', ':OUTPUT ACCEPT [0:0]',
+  '-A PREROUTING -p udp --dport 53 -j CT --notrack',
+  'COMMIT',
+];
+
+function notrackRs(inputRules, policy = 'DROP') {
+  return NOTRACK_RAW.concat([
+    '*filter', `:INPUT ${policy} [0:0]`, ':FORWARD DROP [0:0]', ':OUTPUT ACCEPT [0:0]',
+  ], inputRules, ['COMMIT']).join('\n');
+}
+
+test('notrack-defeats-state-match fires when the only covering accept is state-qualified', () => {
+  const rs = notrackRs([
+    '-A INPUT -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT',
+  ]);
+  const findings = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'notrack-defeats-state-match');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].chain, 'PREROUTING');
+  assert.match(findings[0].title, /udp\/53/);
+});
+
+test('the legacy -j NOTRACK target fires too', () => {
+  const rs = [
+    '*raw', ':PREROUTING ACCEPT [0:0]',
+    '-A PREROUTING -p udp --dport 123 -j NOTRACK',
+    'COMMIT',
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+    '-A INPUT -p udp --dport 123 -m state --state NEW -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(ids.has('notrack-defeats-state-match'));
+});
+
+test('a stateless covering accept dissolves the trap', () => {
+  const rs = notrackRs([
+    '-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+    '-A INPUT -p udp --dport 53 -j ACCEPT',
+  ]);
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('notrack-defeats-state-match'));
+});
+
+test('an accept that matches UNTRACKED explicitly dissolves the trap', () => {
+  const rs = notrackRs([
+    '-A INPUT -p udp --dport 53 -m conntrack --ctstate UNTRACKED -j ACCEPT',
+  ]);
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('notrack-defeats-state-match'));
+});
+
+test('an open INPUT means the untracked packet gets in - no finding', () => {
+  const rs = notrackRs([
+    '-A INPUT -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT',
+  ], 'ACCEPT');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('notrack-defeats-state-match'));
+});
+
+test('no covering accept at all is not this smell\'s story', () => {
+  const rs = notrackRs([
+    '-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j ACCEPT',
+  ]);
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('notrack-defeats-state-match'));
+});
+
+test('an accept for another port does not cover the notracked one', () => {
+  const rs = notrackRs([
+    '-A INPUT -p udp --dport 514 -m conntrack --ctstate NEW -j ACCEPT',
+    '-A INPUT -p udp --dport 53 -j ACCEPT',
+  ]);
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('notrack-defeats-state-match'));
+});
+
+test('nft notrack in a prerouting hook fires against a ct state accept', () => {
+  const rs = [
+    'table ip raw {',
+    '  chain prerouting {',
+    '    type filter hook prerouting priority raw; policy accept;',
+    '    udp dport 53 notrack',
+    '  }',
+    '}',
+    'table ip filter {',
+    '  chain input {',
+    '    type filter hook input priority filter; policy drop;',
+    '    ct state established,related accept',
+    '    udp dport 53 ct state new accept',
+    '  }',
+    '}',
+  ].join('\n');
+  const findings = FS.lint(FS.parse(rs)).findings.filter((f) => f.id === 'notrack-defeats-state-match');
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].title, /udp\/53/);
+});
+
+test('the notrack sample tells the DNS story: udp/53 dead, tcp/53 alive', () => {
+  const findings = FS.lint(FS.parse(sample('iptables-notrack-dns.txt'))).findings
+    .filter((f) => f.id === 'notrack-defeats-state-match');
+  // one finding: the PREROUTING notrack (raw OUTPUT is the reply path, not inbound)
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].table, 'raw');
+  assert.match(findings[0].title, /udp\/53/);
 });

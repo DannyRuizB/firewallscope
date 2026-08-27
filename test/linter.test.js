@@ -29,6 +29,7 @@ const EXPECTED = {
   'ufw-default-deny-noop.txt': ['deny-under-default-deny'],
   'iptables-docker-open.txt': ['docker-user-unfiltered', 'exposed-admin-port', 'missing-invalid-drop', 'unrestricted-egress'],
   'iptables-notrack-dns.txt': ['notrack-defeats-state-match'],
+  'iptables-ftp-helper.txt': ['conntrack-helper-enabled'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -89,6 +90,7 @@ const ALL_SMELLS = [
   'dnat-to-loopback',
   'docker-user-unfiltered',
   'notrack-defeats-state-match',
+  'conntrack-helper-enabled',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -2429,4 +2431,52 @@ test('the notrack sample tells the DNS story: udp/53 dead, tcp/53 alive', () => 
   assert.equal(findings.length, 1);
   assert.equal(findings[0].table, 'raw');
   assert.match(findings[0].title, /udp\/53/);
+});
+
+// --- conntrack-helper-enabled ----------------------------------------------
+
+test('conntrack-helper-enabled fires on the CT target, the -m helper match, and nft ct helper set', () => {
+  const ipt = [
+    '*raw', ':PREROUTING ACCEPT [0:0]',
+    '-A PREROUTING -p tcp --dport 21 -j CT --helper ftp',
+    'COMMIT',
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m helper --helper sip -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(ipt)).findings.filter((x) => x.id === 'conntrack-helper-enabled');
+  assert.equal(f.length, 2);
+  assert.ok(f.some((x) => /ftp/.test(x.title) && x.table === 'raw'));
+  assert.ok(f.some((x) => /sip/.test(x.title) && x.chain === 'INPUT'));
+
+  const nft = [
+    'table ip filter {',
+    '  chain input {',
+    '    type filter hook input priority filter; policy drop;',
+    '    tcp dport 21 ct helper set "ftp"',
+    '  }',
+    '}',
+  ].join('\n');
+  const g = FS.lint(FS.parse(nft)).findings.filter((x) => x.id === 'conntrack-helper-enabled');
+  assert.equal(g.length, 1);
+  assert.match(g[0].title, /ftp/);
+});
+
+test('conntrack-helper-enabled stays quiet on a ruleset with no helper', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+    '-A INPUT -p tcp --dport 21 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((f) => f.id));
+  assert.ok(!ids.has('conntrack-helper-enabled'));
+});
+
+test('the ftp-helper sample names the helper and stays otherwise clean of noise', () => {
+  const findings = FS.lint(FS.parse(sample('iptables-ftp-helper.txt'))).findings
+    .filter((f) => f.id === 'conntrack-helper-enabled');
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].title, /ftp/);
+  assert.equal(findings[0].table, 'raw');
 });

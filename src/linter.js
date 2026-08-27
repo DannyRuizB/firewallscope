@@ -98,8 +98,145 @@
     detectDnatForwardBlocked(result, findings);
     detectDnatNoHairpin(result, findings);
     detectDockerUserUnfiltered(result, findings);
+    detectNotrackDefeatsStateMatch(result, findings);
 
     return summarize(findings);
+  }
+
+  // ── notrack-defeats-state-match ─────────────────────────────────────
+  // The performance tweak that quietly turns off the firewall's memory for
+  // one flow. A raw-table NOTRACK (iptables `-j NOTRACK` / `-j CT
+  // --notrack`, nft `notrack`) is the standard tuning for high-pps
+  // services — busy DNS and NTP boxes skip conntrack to survive — but an
+  // untracked packet has conntrack state UNTRACKED: it is neither NEW nor
+  // ESTABLISHED, so EVERY --ctstate / --state / `ct state` match in the
+  // filter path is blind to it. The classic combination: raw/PREROUTING
+  // NOTRACK udp/53 for performance, INPUT deny-postured with the textbook
+  // `-p udp --dport 53 --ctstate NEW -j ACCEPT` — and the tuned port is
+  // dead, because the accept that looks like it covers the traffic can
+  // never match it. The only ctstate that matches is UNTRACKED itself.
+  //
+  // Fires per NOTRACK rule, and only when the pieces make the trap real:
+  //  - the NOTRACK sits in an inbound raw hook (raw/PREROUTING, or an nft
+  //    prerouting-hook chain containing `notrack`);
+  //  - a family-matching filter INPUT chain is deny-postured — with an
+  //    open INPUT the untracked packet gets in regardless;
+  //  - at least one ACCEPT covering that traffic is state-qualified, and
+  //    NO covering accept is stateless or matches UNTRACKED. A stateless
+  //    accept works for untracked packets, so it dissolves the trap; no
+  //    covering accept at all means the operator never meant to serve the
+  //    port, and that is not this smell's story.
+  function detectNotrackDefeatsStateMatch(result, findings) {
+    if (result.format === 'ufw') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        if (!isInboundNotrackChain(table, chain, result.format)) continue;
+        chain.rules.forEach((rule, idx) => {
+          if (!isNotrackRule(rule, result.format)) return;
+          const input = findDenyPosturedInput(result, table);
+          if (!input) return;
+          const blind = coveringStateAccepts(input, rule);
+          if (!blind) return;
+          const traffic = notrackTrafficDesc(rule);
+          const plural = blind.length === 1 ? 'accept' : 'accepts';
+          findings.push({
+            id: 'notrack-defeats-state-match',
+            severity: 'warning',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx,
+            title: `NOTRACK on ${traffic} makes ${blind.length} state-qualified ${plural} blind to it`,
+            details: `An untracked packet has conntrack state UNTRACKED — neither NEW nor ESTABLISHED — so the state-qualified ${plural} covering this traffic (\`${blind[0].raw.trim()}\`) can never match it, and the deny-postured INPUT drops the flow: the port looks served and is dead. The NOTRACK itself is usually right (conntrack costs real CPU per packet on high-rate services like DNS or NTP) — it is the accept that must stop asking conntrack about a flow conntrack never saw: match the untracked state explicitly (\`-m conntrack --ctstate UNTRACKED\`, nft \`ct state untracked\`) or accept the port statelessly (\`-p udp --dport 53 -j ACCEPT\` with no state match). And mind the reply direction: with conntrack out of the loop, a state-filtered OUTPUT needs the same treatment for the responses.`
+          });
+        });
+      }
+    }
+  }
+
+  function isInboundNotrackChain(table, chain, format) {
+    if (format === 'nftables') return chain.hook === 'prerouting';
+    return /^raw$/i.test(table.name) && /^PREROUTING$/i.test(chain.name);
+  }
+
+  function isNotrackRule(rule, format) {
+    if (format === 'nftables') return /\bnotrack\b/i.test(rule.raw || '');
+    if (rule.action === 'NOTRACK') return true;
+    return rule.action === 'CT' && /--notrack\b/.test(rule.actionDetail || '');
+  }
+
+  function findDenyPosturedInput(result, rawTable) {
+    for (const table of result.tables) {
+      if (!isFilterTableName(table.name)) continue;
+      if (!familiesOverlap(rawTable.family, table.family)) continue;
+      for (const chain of table.chains) {
+        if (!isBuiltInInputChain(chain, result.format)) continue;
+        if (isDropPolicy(chain.policy) || isRejectPolicy(chain.policy) ||
+            hasFinalCatchAllDrop(chain)) {
+          return chain;
+        }
+      }
+    }
+    return null;
+  }
+
+  // nft's inet family sees both v4 and v6, so it overlaps everything;
+  // iptables/ip6tables tables carry no family — the format splits them.
+  function familiesOverlap(a, b) {
+    if (!a || !b) return true;
+    if (a === b) return true;
+    return a === 'inet' || b === 'inet';
+  }
+
+  // The accepts in INPUT that cover the notracked traffic, when ALL of
+  // them are state-qualified (the trap). A single covering accept that is
+  // stateless or matches UNTRACKED returns null — it serves the flow.
+  // Loopback accepts are excluded up front: `-i lo -j ACCEPT` is stateless
+  // and portless, but it serves exactly nothing that arrives on a wire —
+  // every real ruleset has one, and it must not dissolve the trap (the
+  // sample caught precisely this before the exclusion existed).
+  function coveringStateAccepts(chain, notrack) {
+    const nProto = normalizeProto((notrack.tokens && notrack.tokens.protocol) || '');
+    const nDport = (notrack.tokens && notrack.tokens.dport) || null;
+    const blind = [];
+    for (const rule of chain.rules) {
+      if (!isAcceptAction(rule)) continue;
+      if (isLoopbackRule(rule)) continue;
+      const rProto = normalizeProto((rule.tokens && rule.tokens.protocol) || '');
+      if (nProto && rProto && nProto !== rProto) continue;
+      const rDport = (rule.tokens && rule.tokens.dport) || null;
+      if (nDport && rDport && !dportCoversNotrack(rDport, nDport)) continue;
+      const st = ruleStateSpec(rule);
+      if (!st) return null;
+      if (/untracked/i.test(st)) return null;
+      blind.push(rule);
+    }
+    return blind.length ? blind : null;
+  }
+
+  function ruleStateSpec(rule) {
+    const m = rule.match || '';
+    const ct = m.match(/--ctstate\s+(\S+)/) || m.match(/--state\s+(\S+)/) ||
+               m.match(/\bct\s+state\s+(\{[^}]*\}|[\w,]+)/i);
+    return ct ? ct[1] : null;
+  }
+
+  // Conservative coverage: a numeric notracked port is checked against the
+  // accept's dport expression; anything we can't model counts as NOT
+  // covered, so an unreadable match never produces a false alarm.
+  function dportCoversNotrack(acceptDport, notrackDport) {
+    const n = String(notrackDport).trim();
+    if (String(acceptDport).trim() === n) return true;
+    if (/^\d+$/.test(n)) return portInDport(+n, String(acceptDport));
+    return false;
+  }
+
+  function notrackTrafficDesc(rule) {
+    const p = normalizeProto((rule.tokens && rule.tokens.protocol) || '');
+    const d = (rule.tokens && rule.tokens.dport) || null;
+    if (p && d) return `${p}/${d}`;
+    if (p) return `all ${p}`;
+    return 'all inbound traffic';
   }
 
   // ── docker-user-unfiltered ─────────────────────────────────────────

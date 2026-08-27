@@ -18,7 +18,8 @@
     ufwdecorative: 'samples/ufw-default-allow.txt',
     reflector: 'samples/iptables-reflector.txt',
     ufwdeadden:  'samples/ufw-default-deny-noop.txt',
-    dockeropen: 'samples/iptables-docker-open.txt'
+    dockeropen: 'samples/iptables-docker-open.txt',
+    notrackdns: 'samples/iptables-notrack-dns.txt'
   };
 
   const FORMAT_LABELS = {

@@ -99,8 +99,64 @@
     detectDnatNoHairpin(result, findings);
     detectDockerUserUnfiltered(result, findings);
     detectNotrackDefeatsStateMatch(result, findings);
+    detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
+  }
+
+  // ── conntrack-helper-enabled ────────────────────────────────────────
+  // An application-layer conntrack helper (ALG) widens the firewall on its
+  // own, at runtime, from data it reads inside the connection. The FTP
+  // helper is the textbook case: it parses the cleartext `PORT`/`PASV`
+  // exchange and opens a RELATED pinhole to whatever address:port it saw —
+  // so a deny-postured ruleset that accepts RELATED (almost all do) can be
+  // steered into opening arbitrary high ports by anyone who can talk to the
+  // FTP control channel. The same class covers the SIP, H.323, IRC and TFTP
+  // helpers. The mechanism is enabled three ways, all detected here:
+  //   iptables raw/CT:  `-j CT --helper ftp`  (assign a helper to a flow)
+  //   iptables filter:  `-m helper --helper ftp`  (match on a helped flow)
+  //   nft:              `ct helper set "ftp"`
+  // Warn, not error: a legacy FTP server sometimes genuinely needs its
+  // helper — but it must be scoped to that one server and that one port,
+  // and modern deployments should prefer explicit rules or FTPS/SFTP. The
+  // finding names the helper so an operator can see whether it's the one
+  // service they meant or a blanket enable.
+  function detectConntrackHelperEnabled(result, findings) {
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          const helper = conntrackHelperName(rule, result.format);
+          if (!helper) return;
+          findings.push({
+            id: 'conntrack-helper-enabled',
+            severity: 'warning',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx,
+            title: `enables the ${helper} conntrack helper (dynamic pinholes from connection data)`,
+            details: `The ${helper} application-layer helper widens the firewall at runtime from data it reads inside the connection — the FTP helper's class is famous for it: it parses the cleartext control channel and opens a RELATED pinhole to the address and port it sees there, so any ruleset that accepts RELATED (almost all do) can be steered into opening arbitrary ports by whoever can reach the control channel. Enable a helper only for the one legacy server that needs it, scoped to its address and port; prefer FTPS/SFTP (or protocol-native rules) where you can. If nothing here needs an ALG, drop the \`${result.format === 'nftables' ? 'ct helper set' : rule.action === 'CT' ? '-j CT --helper' : '-m helper'}\` rule entirely.`
+          });
+        });
+      }
+    }
+  }
+
+  // The helper name if this rule enables/matches a conntrack helper, else
+  // null. iptables: the CT target's `--helper X`, or an `-m helper --helper
+  // X` match. nft: `ct helper set "X"`. Quotes are stripped; a custom name
+  // (ftp-2121) is kept as written so the operator sees their own label.
+  function conntrackHelperName(rule, format) {
+    if (format === 'nftables') {
+      const m = (rule.raw || '').match(/\bct\s+helper\s+set\s+"?([\w.-]+)"?/i);
+      return m ? m[1] : null;
+    }
+    if (rule.action === 'CT') {
+      const m = (rule.actionDetail || '').match(/--helper\s+(\S+)/);
+      if (m) return m[1].replace(/^"|"$/g, '');
+    }
+    const mm = (rule.match || '').match(/-m\s+helper\s+--helper\s+(\S+)/);
+    return mm ? mm[1].replace(/^"|"$/g, '') : null;
   }
 
   // ── notrack-defeats-state-match ─────────────────────────────────────

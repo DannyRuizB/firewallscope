@@ -21,7 +21,8 @@
     dockeropen: 'samples/iptables-docker-open.txt',
     notrackdns: 'samples/iptables-notrack-dns.txt',
     notrackoneway: 'samples/iptables-notrack-oneway.txt',
-    ftphelper: 'samples/iptables-ftp-helper.txt'
+    ftphelper: 'samples/iptables-ftp-helper.txt',
+    acceptalldead: 'samples/iptables-accept-all-dead.txt'
   };
 
   const FORMAT_LABELS = {

@@ -72,6 +72,7 @@
         detectDuplicateRules(chain, table, findings, result.format);
         detectShadowedRules(chain, table, findings, result.format);
         detectRuleAfterPolicyDrop(chain, table, findings);
+        detectUnreachableAfterAcceptAll(chain, table, findings);
         if (isFilterTable) {
           detectFallthroughAccept(result, chain, table, result.format, findings);
         }
@@ -1782,12 +1783,54 @@
   function isCatchAllDeny(rule) {
     const a = String(rule.action || '').toUpperCase();
     if (a !== 'DROP' && a !== 'REJECT') return false;
+    return isUnconditional(rule);
+  }
+
+  // An ACCEPT with no match of any kind terminates the packet's walk through
+  // the table just as surely as a DROP does — so everything below it in the
+  // same chain is dead code. A rule has "no match" when none of the five
+  // modeled dimensions, no interface, no ct-state and no unmodeled match is
+  // present (the same test isCatchAllDeny uses).
+  function isUnconditional(rule) {
     const t = rule.tokens || {};
     if (t.source || t.destination || t.dport || t.sport || t.protocol) return false;
     if (t.iif || t.oif || t.in_interface || t.out_interface) return false;
     if (ctState(rule)) return false;
     if (hasUnmodeledMatch(rule)) return false;
     return true;
+  }
+
+  // ── unreachable-after-accept-all ─────────────────────────────────────
+  // The mirror of rule-after-policy-drop: an unconditional `-j ACCEPT`
+  // (nft `accept` with no match) mid-chain accepts every packet and ends
+  // its table walk, so every rule below it in the same chain never runs.
+  // The classic footgun is a broad `-A INPUT -j ACCEPT` pasted above the
+  // real rules "to test", with the rate-limited ssh accept, the INVALID
+  // drop or the LOG sitting dead underneath it. Composes with
+  // permissive-accept on the catch-all itself (that flags "opens the box",
+  // this flags "and kills everything below"); RETURN is NOT terminal (it
+  // just leaves the chain, the packet keeps being judged) so it never
+  // triggers this. Applies to built-in and user chains alike — an
+  // unconditional accept ends the walk in both.
+  function detectUnreachableAfterAcceptAll(chain, table, findings) {
+    const rules = chain.rules || [];
+    let acceptIdx = -1;
+    for (let i = 0; i < rules.length; i++) {
+      if (isAcceptAction(rules[i]) && isUnconditional(rules[i])) { acceptIdx = i; break; }
+    }
+    if (acceptIdx === -1 || acceptIdx >= rules.length - 1) return;
+    for (let j = acceptIdx + 1; j < rules.length; j++) {
+      findings.push({
+        id: 'unreachable-after-accept-all',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: j,
+        title: `Dead rule — unreachable after catch-all ACCEPT at rule #${acceptIdx + 1}`,
+        details: rules[j].raw || ''
+      });
+    }
   }
 
   // INPUT chains with a deny posture (policy DROP/REJECT, or a final

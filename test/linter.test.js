@@ -31,6 +31,7 @@ const EXPECTED = {
   'iptables-notrack-dns.txt': ['notrack-defeats-state-match'],
   'iptables-ftp-helper.txt': ['conntrack-helper-enabled'],
   'iptables-notrack-oneway.txt': ['notrack-one-way'],
+  'iptables-accept-all-dead.txt': ['unreachable-after-accept-all', 'permissive-accept'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -93,6 +94,7 @@ const ALL_SMELLS = [
   'notrack-defeats-state-match',
   'notrack-one-way',
   'conntrack-helper-enabled',
+  'unreachable-after-accept-all',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -2586,4 +2588,71 @@ test('the notrack-dns sample stays clean of notrack-one-way (its pair is complet
   assert.match(mine[0].title, /udp\/123/);
   assert.ok(!f.some((x) => x.id === 'notrack-defeats-state-match'), 'the stateless accept serves the flow');
   assert.ok(!f.some((x) => x.id === 'udp-amplifier-exposed'), 'the rate limit exempts the NTP accept');
+});
+
+// --- unreachable-after-accept-all --------------------------------------------
+
+test('unreachable-after-accept-all flags every rule below an unconditional ACCEPT', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    '-A INPUT -j ACCEPT',
+    '-A INPUT -p tcp --dport 22 -j ACCEPT',
+    '-A INPUT -m conntrack --ctstate INVALID -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'unreachable-after-accept-all');
+  assert.equal(f.length, 2);
+  assert.ok(f.every((x) => /catch-all ACCEPT at rule #2/.test(x.title)));
+  assert.ok(f.some((x) => /--dport 22/.test(x.details)));
+});
+
+test('unreachable-after-accept-all stays quiet when the ACCEPT has any match', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    '-A INPUT -p tcp --dport 443 -j ACCEPT',
+    '-A INPUT -p tcp --dport 22 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((x) => x.id));
+  assert.ok(!ids.has('unreachable-after-accept-all'), 'a scoped ACCEPT terminates only its own packets');
+});
+
+test('unreachable-after-accept-all: RETURN is not terminal, so it does not trigger', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    ':myset - [0:0]',
+    '-A INPUT -j myset',
+    '-A myset -j RETURN',
+    '-A myset -p tcp --dport 22 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((x) => x.id));
+  assert.ok(!ids.has('unreachable-after-accept-all'), 'RETURN leaves the chain, it does not accept-and-stop');
+});
+
+test('unreachable-after-accept-all reads the nft unconditional accept too', () => {
+  const nft = [
+    'table ip filter {',
+    '  chain input {',
+    '    type filter hook input priority filter; policy drop;',
+    '    iifname "lo" accept',
+    '    accept',
+    '    tcp dport 22 accept',
+    '  }',
+    '}',
+  ].join('\n');
+  const f = FS.lint(FS.parse(nft)).findings.filter((x) => x.id === 'unreachable-after-accept-all');
+  assert.equal(f.length, 1);
+  assert.match(f[0].details, /tcp dport 22/);
+});
+
+test('the accept-all-dead sample flags the dead rules AND composes with permissive-accept', () => {
+  const findings = FS.lint(FS.parse(sample('iptables-accept-all-dead.txt'))).findings;
+  const dead = findings.filter((x) => x.id === 'unreachable-after-accept-all');
+  // 5 rules sit below the catch-all ACCEPT (rule #3): the recent --set, the
+  // recent --update drop, the ssh accept, the INVALID drop and the LOG.
+  assert.equal(dead.length, 5);
+  assert.ok(findings.some((x) => x.id === 'permissive-accept'), 'the catch-all ACCEPT opens the box too');
 });

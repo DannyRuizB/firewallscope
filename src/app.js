@@ -20,6 +20,7 @@
     ufwdeadden:  'samples/ufw-default-deny-noop.txt',
     dockeropen: 'samples/iptables-docker-open.txt',
     notrackdns: 'samples/iptables-notrack-dns.txt',
+    notrackoneway: 'samples/iptables-notrack-oneway.txt',
     ftphelper: 'samples/iptables-ftp-helper.txt'
   };
 

@@ -99,6 +99,7 @@
     detectDnatNoHairpin(result, findings);
     detectDockerUserUnfiltered(result, findings);
     detectNotrackDefeatsStateMatch(result, findings);
+    detectNotrackOneWay(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -293,6 +294,96 @@
     if (p && d) return `${p}/${d}`;
     if (p) return `all ${p}`;
     return 'all inbound traffic';
+  }
+
+  // ── notrack-one-way ─────────────────────────────────────────────────
+  // A conntrack exemption is a PAIR, because a flow has two directions and
+  // NOTRACK only ever matches packets crossing the hook it sits in. The
+  // canonical high-pps recipe is raw/PREROUTING `udp dport 53 notrack`
+  // PLUS raw/OUTPUT `udp sport 53 notrack`: skip tracking for the queries
+  // coming in AND for the replies going out. Write only one half and the
+  // other direction is still tracked — every reply is a locally-generated
+  // packet conntrack has never seen, so it opens a FRESH entry with the
+  // reply as the "original" direction: the conntrack table still fills at
+  // line rate (exactly what the NOTRACK was deployed to prevent), and any
+  // state-qualified rule on that path judges the replies as NEW forever
+  // (an ESTABLISHED accept never matches them).
+  //
+  // Conservative on purpose: only port-qualified NOTRACK rules are judged
+  // (a protocol we can read plus a dport or sport) — a bare `notrack` or an
+  // unmodelable match stays silent. The mirror is matched by protocol with
+  // dport<->sport swapped; a broader mirror (same protocol, no ports) also
+  // satisfies it. ufw is exempt by construction (no raw-table syntax).
+  function detectNotrackOneWay(result, findings) {
+    if (result.format === 'ufw') return;
+    const sides = collectNotrackRules(result);
+    for (const entry of sides.inbound) {
+      judgeNotrackMirror(entry, sides.outbound, 'inbound', findings);
+    }
+    for (const entry of sides.outbound) {
+      judgeNotrackMirror(entry, sides.inbound, 'outbound', findings);
+    }
+  }
+
+  function collectNotrackRules(result) {
+    const inbound = [];
+    const outbound = [];
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        const dirIn = isInboundNotrackChain(table, chain, result.format);
+        const dirOut = isOutboundNotrackChain(table, chain, result.format);
+        if (!dirIn && !dirOut) continue;
+        chain.rules.forEach((rule, idx) => {
+          if (!isNotrackRule(rule, result.format)) return;
+          const entry = { table, chain, rule, idx };
+          (dirIn ? inbound : outbound).push(entry);
+        });
+      }
+    }
+    return { inbound, outbound };
+  }
+
+  function isOutboundNotrackChain(table, chain, format) {
+    if (format === 'nftables') return chain.hook === 'output';
+    return /^raw$/i.test(table.name) && /^OUTPUT$/i.test(chain.name);
+  }
+
+  function judgeNotrackMirror(entry, opposite, direction, findings) {
+    const t = entry.rule.tokens || {};
+    const proto = normalizeProto(t.protocol || '');
+    const dport = t.dport ? String(t.dport).trim() : null;
+    const sport = t.sport ? String(t.sport).trim() : null;
+    // Only judge what we can fully read: protocol plus at least one port.
+    if (!proto || (!dport && !sport)) return;
+    const mirrored = opposite.some((cand) => {
+      const c = cand.rule.tokens || {};
+      const cProto = normalizeProto(c.protocol || '');
+      if (!cProto) return true; // a bare notrack covers everything
+      if (cProto !== proto) return false;
+      const cDport = c.dport ? String(c.dport).trim() : null;
+      const cSport = c.sport ? String(c.sport).trim() : null;
+      if (!cDport && !cSport) return true; // proto-wide mirror covers it
+      if (dport && cSport !== dport) return false;
+      if (sport && cDport !== sport) return false;
+      return true;
+    });
+    if (mirrored) return;
+    const traffic = dport ? `${proto}/${dport}` : `${proto} sport ${sport}`;
+    const here = direction === 'inbound' ? 'inbound' : 'outbound';
+    const missing = direction === 'inbound' ? 'outbound (raw/OUTPUT)' : 'inbound (raw/PREROUTING)';
+    const mirrorSpec = direction === 'inbound'
+      ? `${proto} sport ${dport || sport}`
+      : `${proto} dport ${sport || dport}`;
+    findings.push({
+      id: 'notrack-one-way',
+      severity: 'warning',
+      table: entry.table.name,
+      tableFamily: entry.table.family || null,
+      chain: entry.chain.name,
+      ruleIdx: entry.idx,
+      title: `NOTRACK on ${traffic} covers only the ${here} direction — the ${direction === 'inbound' ? 'replies' : 'responses coming back'} are still tracked`,
+      details: `NOTRACK only matches packets crossing the hook it sits in, and a flow has two directions. With just this ${here} half, every packet of the other direction opens a FRESH conntrack entry (conntrack never saw the flow, so the ${direction === 'inbound' ? 'reply' : 'response'} becomes the "original" direction of a new one): the conntrack table still fills at line rate — exactly what this exemption was deployed to prevent — and any state-qualified rule on that path judges those packets as NEW forever, never ESTABLISHED. Add the missing ${missing} half: a \`${mirrorSpec}\` NOTRACK, the second line of the canonical recipe.`
+    });
   }
 
   // ── docker-user-unfiltered ─────────────────────────────────────────

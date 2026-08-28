@@ -30,6 +30,7 @@ const EXPECTED = {
   'iptables-docker-open.txt': ['docker-user-unfiltered', 'exposed-admin-port', 'missing-invalid-drop', 'unrestricted-egress'],
   'iptables-notrack-dns.txt': ['notrack-defeats-state-match'],
   'iptables-ftp-helper.txt': ['conntrack-helper-enabled'],
+  'iptables-notrack-oneway.txt': ['notrack-one-way'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -90,6 +91,7 @@ const ALL_SMELLS = [
   'dnat-to-loopback',
   'docker-user-unfiltered',
   'notrack-defeats-state-match',
+  'notrack-one-way',
   'conntrack-helper-enabled',
 ];
 
@@ -2479,4 +2481,109 @@ test('the ftp-helper sample names the helper and stays otherwise clean of noise'
   assert.equal(findings.length, 1);
   assert.match(findings[0].title, /ftp/);
   assert.equal(findings[0].table, 'raw');
+});
+
+// --- notrack-one-way ---------------------------------------------------------
+
+test('notrack-one-way fires on an inbound-only NOTRACK and names the missing outbound half', () => {
+  const rs = [
+    '*raw', ':PREROUTING ACCEPT [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A PREROUTING -p udp --dport 123 -j CT --notrack',
+    'COMMIT',
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p udp --dport 123 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'notrack-one-way');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].chain, 'PREROUTING');
+  assert.match(f[0].title, /udp\/123/);
+  assert.match(f[0].details, /raw\/OUTPUT/);
+  assert.match(f[0].details, /udp sport 123/);
+});
+
+test('notrack-one-way goes quiet when the outbound twin exists (the canonical pair)', () => {
+  const rs = [
+    '*raw', ':PREROUTING ACCEPT [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A PREROUTING -p udp --dport 123 -j CT --notrack',
+    '-A OUTPUT -p udp --sport 123 -j CT --notrack',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((x) => x.id));
+  assert.ok(!ids.has('notrack-one-way'), 'the pair is complete');
+});
+
+test('notrack-one-way judges the outbound direction too (OUTPUT half without PREROUTING)', () => {
+  const rs = [
+    '*raw', ':PREROUTING ACCEPT [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A OUTPUT -p udp --sport 123 -j CT --notrack',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'notrack-one-way');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].chain, 'OUTPUT');
+  assert.match(f[0].details, /raw\/PREROUTING/);
+  assert.match(f[0].details, /udp dport 123/);
+});
+
+test('notrack-one-way reads both nft spellings and respects the nft pair', () => {
+  const oneWay = [
+    'table ip raw {',
+    '  chain prerouting {',
+    '    type filter hook prerouting priority raw; policy accept;',
+    '    udp dport 53 notrack',
+    '  }',
+    '}',
+  ].join('\n');
+  const f = FS.lint(FS.parse(oneWay)).findings.filter((x) => x.id === 'notrack-one-way');
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /udp\/53/);
+
+  const pair = [
+    'table ip raw {',
+    '  chain prerouting {',
+    '    type filter hook prerouting priority raw; policy accept;',
+    '    udp dport 53 notrack',
+    '  }',
+    '  chain output {',
+    '    type filter hook output priority raw; policy accept;',
+    '    udp sport 53 notrack',
+    '  }',
+    '}',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(pair)).findings.map((x) => x.id));
+  assert.ok(!ids.has('notrack-one-way'), 'the nft pair is complete');
+});
+
+test('notrack-one-way stays conservative: a bare or port-less NOTRACK is not judged', () => {
+  const rs = [
+    '*raw', ':PREROUTING ACCEPT [0:0]',
+    '-A PREROUTING -j NOTRACK',
+    '-A PREROUTING -p udp -j CT --notrack',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((x) => x.id));
+  assert.ok(!ids.has('notrack-one-way'), 'nothing port-qualified to judge');
+});
+
+test('notrack-one-way accepts a proto-wide mirror as covering (broader than needed is fine)', () => {
+  const rs = [
+    '*raw', ':PREROUTING ACCEPT [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A PREROUTING -p udp --dport 53 -j CT --notrack',
+    '-A OUTPUT -p udp -j CT --notrack',
+    'COMMIT',
+  ].join('\n');
+  const ids = new Set(FS.lint(FS.parse(rs)).findings.map((x) => x.id));
+  assert.ok(!ids.has('notrack-one-way'), 'the proto-wide OUTPUT notrack covers the replies');
+});
+
+test('the notrack-dns sample stays clean of notrack-one-way (its pair is complete) and the new sample fires exactly it', () => {
+  const dns = new Set(FS.lint(FS.parse(sample('iptables-notrack-dns.txt'))).findings.map((x) => x.id));
+  assert.ok(!dns.has('notrack-one-way'), 'the DNS sample models the full recipe');
+  const f = FS.lint(FS.parse(sample('iptables-notrack-oneway.txt'))).findings;
+  const mine = f.filter((x) => x.id === 'notrack-one-way');
+  assert.equal(mine.length, 1);
+  assert.match(mine[0].title, /udp\/123/);
+  assert.ok(!f.some((x) => x.id === 'notrack-defeats-state-match'), 'the stateless accept serves the flow');
+  assert.ok(!f.some((x) => x.id === 'udp-amplifier-exposed'), 'the rate limit exempts the NTP accept');
 });

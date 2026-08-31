@@ -102,6 +102,7 @@
     detectNotrackDefeatsStateMatch(result, findings);
     detectNotrackOneWay(result, findings);
     detectRecentOneWay(result, findings);
+    detectPortMatchWithoutProtocol(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -459,6 +460,58 @@
             details: `\`--${r.op}\` reads kernel list \`${name}\`, but no rule in this paste ever writes to it (\`--set\` on the same \`--name\`). A check against a list that stays empty is a constant: ${r.negated ? 'this NEGATED check is constant-TRUE — the match is decoration and the rule fires for every packet, whatever the intent was' : 'constant-false — this rule never matches, and the verdict it carries (the brute-force DROP, the port-knock ACCEPT) is silently inert; every attempt sails past it'}. Add the writer half on the same traffic: \`-m conntrack --ctstate NEW -m recent --set --name ${name}\` (a rule with no \`-j\` is valid — it only does the bookkeeping).`
           });
         }
+      }
+    }
+  }
+
+  // ── port-match-without-protocol ─────────────────────────────────────
+  // `--dport` / `--sport` (and multiport `--dports` / `--sports`) are
+  // options of the tcp/udp match extensions — they don't exist until a
+  // protocol pulls that extension in. Write a port match with NO `-p` and
+  // the rule doesn't just misbehave, it FAILS TO PARSE, and because
+  // iptables-restore is atomic the WHOLE ruleset is refused: on boot the
+  // firewall never comes up (open or shut depending on the kernel's default
+  // policy — neither is what the file describes). Measured with
+  // `iptables-restore --test` (no root needed, v1.8.11):
+  //   -A INPUT --dport 22 -j ACCEPT      -> unknown option "--dport"
+  //   -A INPUT -m tcp --dport 22 ...      -> TCP match requires '-p tcp'
+  //   -A INPUT -m multiport --dports ...  -> multiport needs `-p tcp', ...
+  //   -A INPUT --sport 53 -j ACCEPT       -> unknown option "--sport"
+  // and each aborts the load at that line. Conservative on purpose: it fires
+  // ONLY when a port match is present and there is NO `-p` at all — the
+  // unambiguous, measured case. A protocol that is present but wrong for
+  // ports (`-p icmp --dport`) also fails, but judging every protocol name
+  // risks a false positive that cries "won't load" over a rule that will,
+  // so a present `-p` stays silent. An iptables-save DUMP always writes
+  // `-p tcp -m tcp --dport`, so this only ever catches HAND-WRITTEN rules —
+  // exactly its audience. iptables/ip6tables only: nft and ufw have their
+  // own grammar where ports and protocol are expressed together.
+  function detectPortMatchWithoutProtocol(result, findings) {
+    if (result.format !== 'iptables' && result.format !== 'ip6tables') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          const t = rule.tokens || {};
+          if (t.protocol) return; // a protocol is present — stay silent (conservative)
+          const raw = String(rule.raw || '');
+          const portOpt =
+            (t.dport && '--dport') ||
+            (t.sport && '--sport') ||
+            (/--dports\s/.test(raw) && '--dports') ||
+            (/--sports\s/.test(raw) && '--sports') ||
+            null;
+          if (!portOpt) return;
+          findings.push({
+            id: 'port-match-without-protocol',
+            severity: 'error',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx,
+            title: `\`${portOpt}\` with no \`-p tcp\`/\`-p udp\` — this rule will not load, and takes the whole ruleset down with it`,
+            details: `\`${portOpt}\` is an option of the tcp/udp match extension, which only exists once a protocol pulls it in — with no \`-p\`, iptables refuses the rule (\`unknown option "${portOpt}"\`, or \`TCP match requires '-p tcp'\` under an explicit \`-m tcp\`; measured). And iptables-restore is ATOMIC: this one bad line makes the ENTIRE ruleset fail to load, so on boot the firewall never comes up — the box is left on the kernel's default policy, not the one in this file. Add the protocol the port belongs to: \`-p tcp ${portOpt} <port>\` (or \`-p udp\`). Only hand-written rules hit this; \`iptables-save\` always emits the \`-p tcp\` itself.`
+          });
+        });
       }
     }
   }

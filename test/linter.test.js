@@ -33,6 +33,7 @@ const EXPECTED = {
   'iptables-notrack-oneway.txt': ['notrack-one-way'],
   'iptables-accept-all-dead.txt': ['unreachable-after-accept-all', 'permissive-accept'],
   'iptables-recent-oneway.txt': ['recent-one-way'],
+  'iptables-dport-no-proto.txt': ['port-match-without-protocol'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -97,6 +98,7 @@ const ALL_SMELLS = [
   'conntrack-helper-enabled',
   'unreachable-after-accept-all',
   'recent-one-way',
+  'port-match-without-protocol',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -2727,4 +2729,68 @@ test('recent-one-way: a negated orphan check is called out as constant-TRUE', ()
 
 test('the paired SSH limiter in the accept-all sample stays silent', () => {
   assert.ok(!lintIds('iptables-accept-all-dead.txt').has('recent-one-way'));
+});
+
+// --- port-match-without-protocol ---------------------------------------------
+
+test('port-match-without-protocol: --dport with no -p is an error naming the whole-ruleset failure', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT --dport 22 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'port-match-without-protocol');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'error');
+  assert.match(f[0].title, /`--dport` with no `-p tcp`/);
+  assert.match(f[0].details, /whole ruleset|ENTIRE ruleset|atomic|ATOMIC/i);
+});
+
+test('port-match-without-protocol: multiport --dports and --sport are caught too', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -m multiport --dports 80,443 -j ACCEPT',
+    '-A INPUT --sport 53 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'port-match-without-protocol');
+  assert.equal(f.length, 2);
+  assert.ok(f.some((x) => /--dports/.test(x.title)));
+  assert.ok(f.some((x) => /--sport/.test(x.title)));
+});
+
+test('port-match-without-protocol stays silent when the protocol is present (any -p)', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --dport 22 -j ACCEPT',
+    '-A INPUT -p udp --sport 53 -j ACCEPT',
+    '-A INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'port-match-without-protocol');
+  assert.equal(f.length, 0);
+});
+
+test('port-match-without-protocol does not fire on rules with no port match at all', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -i lo -j ACCEPT',
+    '-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'port-match-without-protocol');
+  assert.equal(f.length, 0);
+});
+
+test('port-match-without-protocol is iptables-only (nft expresses port and protocol together)', () => {
+  const nft = [
+    'table inet filter {',
+    '  chain input {',
+    '    type filter hook input priority 0; policy drop;',
+    '    tcp dport 22 accept',
+    '  }',
+    '}',
+  ].join('\n');
+  const f = FS.lint(FS.parse(nft)).findings.filter((x) => x.id === 'port-match-without-protocol');
+  assert.equal(f.length, 0);
 });

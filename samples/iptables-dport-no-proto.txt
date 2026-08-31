@@ -1,0 +1,18 @@
+# A hand-written ruleset with the single most common iptables typo: a port
+# match with no protocol. `--dport 22` is an option of the tcp match, which
+# only exists once `-p tcp` pulls it in — without it iptables refuses the
+# rule ("unknown option --dport"), and because iptables-restore is atomic
+# the WHOLE file fails to load. On boot the firewall never comes up: the box
+# is left on the kernel's default policy, not this one. The ssh line and the
+# multiport web line are both broken; the DNS-reply and loopback lines are
+# fine (they carry their -p, or need none).
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT --dport 22 -j ACCEPT
+-A INPUT -m multiport --dports 80,443 -j ACCEPT
+-A INPUT -p udp --sport 53 -j ACCEPT
+COMMIT

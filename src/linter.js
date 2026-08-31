@@ -101,6 +101,7 @@
     detectDockerUserUnfiltered(result, findings);
     detectNotrackDefeatsStateMatch(result, findings);
     detectNotrackOneWay(result, findings);
+    detectRecentOneWay(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -385,6 +386,81 @@
       title: `NOTRACK on ${traffic} covers only the ${here} direction — the ${direction === 'inbound' ? 'replies' : 'responses coming back'} are still tracked`,
       details: `NOTRACK only matches packets crossing the hook it sits in, and a flow has two directions. With just this ${here} half, every packet of the other direction opens a FRESH conntrack entry (conntrack never saw the flow, so the ${direction === 'inbound' ? 'reply' : 'response'} becomes the "original" direction of a new one): the conntrack table still fills at line rate — exactly what this exemption was deployed to prevent — and any state-qualified rule on that path judges those packets as NEW forever, never ESTABLISHED. Add the missing ${missing} half: a \`${mirrorSpec}\` NOTRACK, the second line of the canonical recipe.`
     });
+  }
+
+  // ── recent-one-way ──────────────────────────────────────────────────
+  // `-m recent` is a two-line recipe, and each half is useless alone. The
+  // canonical ssh brute-force limiter:
+  //   -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --set
+  //   -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 -j DROP
+  // The first line WRITES the per-source kernel list (--set, matches
+  // unconditionally — pure bookkeeping); the second READS it (--update /
+  // --rcheck / --remove) and is where the protection actually happens. Copy
+  // only the writer and the list fills forever while nothing consults it —
+  // the port keeps accepting at full line speed while the ruleset reads like
+  // it throttles. Copy only the reader and it consults a list nothing ever
+  // fills — the plain check is constant-false (the DROP that looks like
+  // brute-force protection can never match), and a NEGATED check
+  // (`! --rcheck`) is constant-TRUE, silently unconditional. Both halves
+  // load without a word. Same state-written-that-nothing-reads family as
+  // notrack-one-way. Lists are keyed kernel-wide by --name (default
+  // "DEFAULT"), so pairing is judged across every table and chain in the
+  // paste. iptables/ip6tables only: nft's equivalent (a dynamic set / meter)
+  // declares the state and its use in one statement and cannot be split, and
+  // ufw's `limit` verb compiles both halves itself.
+  function detectRecentOneWay(result, findings) {
+    if (result.format !== 'iptables' && result.format !== 'ip6tables') return;
+    const byName = new Map(); // list name -> { writers: [entry], readers: [entry] }
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          const raw = String(rule.raw || '');
+          if (!/-m\s+recent\b/.test(raw)) return;
+          const nameM = raw.match(/--name\s+(\S+)/);
+          const name = nameM ? nameM[1] : 'DEFAULT';
+          const group = byName.get(name) || { writers: [], readers: [] };
+          const opM = raw.match(/--(rcheck|update|remove)\b/);
+          if (/--set\b/.test(raw)) group.writers.push({ table, chain, rule, idx });
+          if (opM) {
+            group.readers.push({
+              table, chain, rule, idx,
+              op: opM[1],
+              negated: new RegExp(`!\\s+--${opM[1]}\\b`).test(raw),
+            });
+          }
+          byName.set(name, group);
+        });
+      }
+    }
+    for (const [name, { writers, readers }] of byName) {
+      if (writers.length && !readers.length) {
+        for (const w of writers) {
+          findings.push({
+            id: 'recent-one-way',
+            severity: 'warning',
+            table: w.table.name,
+            tableFamily: w.table.family || null,
+            chain: w.chain.name,
+            ruleIdx: w.idx,
+            title: `-m recent --set fills list "${name}" that nothing ever consults — the limiter it was meant to feed never fires`,
+            details: `\`--set\` is the bookkeeping half of the \`-m recent\` recipe: it records the source address in kernel list \`${name}\` (/proc/net/xt_recent/${name}) and matches unconditionally — the protection lives in a second rule that READS the list and acts on it, and no rule in this paste does (\`--update\`, \`--rcheck\` or \`--remove\` on the same \`--name\`). The list fills forever while the traffic it was deployed to throttle keeps arriving at full speed; nothing errors, and the ruleset reads like it limits. Add the reader half, above the ACCEPT: \`-m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 --name ${name} -j DROP\` with the same protocol/port match as this rule.`
+          });
+        }
+      } else if (readers.length && !writers.length) {
+        for (const r of readers) {
+          findings.push({
+            id: 'recent-one-way',
+            severity: 'warning',
+            table: r.table.name,
+            tableFamily: r.table.family || null,
+            chain: r.chain.name,
+            ruleIdx: r.idx,
+            title: `-m recent --${r.op} consults list "${name}" that nothing ever fills — ${r.negated ? 'the negated check matches every packet' : 'this rule can never match'}`,
+            details: `\`--${r.op}\` reads kernel list \`${name}\`, but no rule in this paste ever writes to it (\`--set\` on the same \`--name\`). A check against a list that stays empty is a constant: ${r.negated ? 'this NEGATED check is constant-TRUE — the match is decoration and the rule fires for every packet, whatever the intent was' : 'constant-false — this rule never matches, and the verdict it carries (the brute-force DROP, the port-knock ACCEPT) is silently inert; every attempt sails past it'}. Add the writer half on the same traffic: \`-m conntrack --ctstate NEW -m recent --set --name ${name}\` (a rule with no \`-j\` is valid — it only does the bookkeeping).`
+          });
+        }
+      }
+    }
   }
 
   // ── docker-user-unfiltered ─────────────────────────────────────────

@@ -32,6 +32,7 @@ const EXPECTED = {
   'iptables-ftp-helper.txt': ['conntrack-helper-enabled'],
   'iptables-notrack-oneway.txt': ['notrack-one-way'],
   'iptables-accept-all-dead.txt': ['unreachable-after-accept-all', 'permissive-accept'],
+  'iptables-recent-oneway.txt': ['recent-one-way'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -95,6 +96,7 @@ const ALL_SMELLS = [
   'notrack-one-way',
   'conntrack-helper-enabled',
   'unreachable-after-accept-all',
+  'recent-one-way',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -2655,4 +2657,74 @@ test('the accept-all-dead sample flags the dead rules AND composes with permissi
   // recent --update drop, the ssh accept, the INVALID drop and the LOG.
   assert.equal(dead.length, 5);
   assert.ok(findings.some((x) => x.id === 'permissive-accept'), 'the catch-all ACCEPT opens the box too');
+});
+
+// --- recent-one-way ----------------------------------------------------------
+
+test('recent-one-way: a reader without a writer is constant-false, and names the missing --set half', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 --name SSH -j DROP',
+    '-A INPUT -p tcp --dport 22 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'recent-one-way');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'warning');
+  assert.match(f[0].title, /--update consults list "SSH"/);
+  assert.match(f[0].title, /can never match/);
+  assert.match(f[0].details, /--set --name SSH/);
+});
+
+test('recent-one-way: a writer without a reader is bookkeeping nothing consults', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p udp --dport 51820 -m conntrack --ctstate NEW -m recent --set --name WG',
+    '-A INPUT -p udp --dport 51820 -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'recent-one-way');
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /--set fills list "WG"/);
+  assert.match(f[0].details, /--update --seconds 60 --hitcount 4 --name WG/);
+});
+
+test('recent-one-way stays silent when both halves exist, and rules without --name pair on DEFAULT', () => {
+  const paired = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --set --name SSH',
+    '-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 --name SSH -j DROP',
+    '-A INPUT -p tcp --dport 2222 -m conntrack --ctstate NEW -m recent --set',
+    '-A INPUT -p tcp --dport 2222 -m conntrack --ctstate NEW -m recent --rcheck --seconds 60 --hitcount 4 -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(paired)).findings.filter((x) => x.id === 'recent-one-way');
+  assert.equal(f.length, 0);
+});
+
+test('recent-one-way: two names do not cover for each other', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --dport 22 -m recent --set --name SSH',
+    '-A INPUT -p tcp --dport 22 -m recent --update --seconds 60 --hitcount 4 --name SSHD -j DROP',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'recent-one-way');
+  assert.equal(f.length, 2);
+});
+
+test('recent-one-way: a negated orphan check is called out as constant-TRUE', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --dport 22 -m recent ! --rcheck --seconds 60 --name KNOCK -j ACCEPT',
+    'COMMIT',
+  ].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'recent-one-way');
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /matches every packet/);
+  assert.match(f[0].details, /constant-TRUE/);
+});
+
+test('the paired SSH limiter in the accept-all sample stays silent', () => {
+  assert.ok(!lintIds('iptables-accept-all-dead.txt').has('recent-one-way'));
 });

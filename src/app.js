@@ -23,7 +23,8 @@
     notrackoneway: 'samples/iptables-notrack-oneway.txt',
     ftphelper: 'samples/iptables-ftp-helper.txt',
     acceptalldead: 'samples/iptables-accept-all-dead.txt',
-    recentoneway: 'samples/iptables-recent-oneway.txt'
+    recentoneway: 'samples/iptables-recent-oneway.txt',
+    dportnoproto: 'samples/iptables-dport-no-proto.txt'
   };
 
   const FORMAT_LABELS = {

@@ -1,0 +1,24 @@
+# Hand-written INPUT chain — the protocol IS named on every line, and on
+# three of them it is the wrong one for the port option that follows.
+# iptables-restore stops at the first: the whole file never loads at boot.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j ACCEPT
+# fine: sctp and a numeric protocol (17 = udp) both carry ports
+-A INPUT -p sctp --dport 3868 -j ACCEPT
+-A INPUT -p 17 --dport 53 -j ACCEPT
+# "allow pings to the web port" — icmp has no ports: unknown option "--dport"
+-A INPUT -p icmp --dport 80 -j ACCEPT
+# copy-pasted -m from a tcp rule onto a udp one: UDP match requires '-p udp'
+-A INPUT -p tcp -m udp --dport 53 -j ACCEPT
+# multiport on icmp: multiport only works with TCP, UDP, UDPLITE, SCTP and DCCP
+-A INPUT -p icmp -m multiport --dports 123,161 -j ACCEPT
+# fine: a negated protocol with a port option loads (and matches nothing tcp)
+-A INPUT ! -p tcp --dport 22 -j DROP
+-A INPUT -j REJECT --reject-with icmp-port-unreachable
+COMMIT

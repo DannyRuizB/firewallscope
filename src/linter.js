@@ -104,6 +104,7 @@
     detectRecentOneWay(result, findings);
     detectPortMatchWithoutProtocol(result, findings);
     detectRejectTypeMismatch(result, findings);
+    detectPortMatchProtocolMismatch(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -642,6 +643,112 @@
               details: `\`${typeWord} type\` reject types belong to the ${icmpv6 ? 'IPv6' : 'IPv4'} family, and this table is \`${fam}\` — nft rejects the file at load time (measured with \`nft -c\`: "conflicting protocols specified: ip vs ip6"), and \`nft -f\` is atomic: the ENTIRE ruleset is refused. Use \`reject with ${wantWord} type …\` in this table, \`reject with icmpx type …\` (family-neutral, valid everywhere), or a bare \`reject\`. Inside \`table inet\` either spelling is accepted (nft scopes it to the matching family).`
             });
           }
+        });
+      }
+    }
+  }
+
+  // ── port-match-protocol-mismatch ────────────────────────────────────
+  // The sibling of port-match-without-protocol for the OTHER half of the
+  // mistake: a protocol IS named, and it is the wrong one for the port option
+  // that follows. Measured with `iptables-restore --test` (these are PARSER
+  // errors, so the dry run does see them — v1.8.11) and with `nft -c`:
+  //   -A INPUT -p icmp --dport 80 -j ACCEPT         -> unknown option "--dport"
+  //   -A INPUT -p esp | igmp | all | 1 --dport …     -> unknown option "--dport"
+  //   -A INPUT -p udplite --dport 80                 -> unknown option (no udplite match carries ports)
+  //   -A INPUT -p tcp -m udp --dport 53              -> UDP match requires '-p udp'
+  //   -A INPUT -p icmp -m tcp --dport 80             -> TCP match requires '-p tcp'
+  //   -A INPUT -p icmp -m multiport --dports 53,123  -> multiport only works with TCP, UDP, UDPLITE, SCTP and DCCP
+  //   ip6tables -p ipv6-icmp | icmpv6 --dport 80     -> unknown option "--dport"
+  //   LOADS fine: -p sctp/dccp --dport, -p 17 --dport, -p 6 --sport,
+  //               -p udp -m multiport --dports, and ! -p tcp --dport 22.
+  //   nft: meta l4proto udp tcp dport 22 / ip protocol udp tcp dport 22 /
+  //        udp dport 53 tcp dport 22 / icmp type echo-request udp dport 53 /
+  //        icmpv6 type echo-request tcp dport 22
+  //          -> "conflicting transport layer protocols specified: X vs. Y"
+  //        (same-protocol pairs and `meta l4proto { tcp, udp } th dport` load.)
+  // Same consequence as its sibling: one unparsable line and the ATOMIC
+  // restore refuses the whole ruleset, so the firewall never comes up at
+  // boot. The negated form loads (measured) and stays silent, as does any
+  // protocol the linter cannot read.
+  const PORT_PROTOCOLS = new Set(['tcp', 'udp', 'sctp', 'dccp', '6', '17', '132', '33']);
+  const MULTIPORT_PROTOCOLS = new Set([...PORT_PROTOCOLS, 'udplite', '136']);
+  const MATCH_EXTENSION_PROTOCOL = {
+    tcp: new Set(['tcp', '6']),
+    udp: new Set(['udp', '17']),
+    sctp: new Set(['sctp', '132']),
+    dccp: new Set(['dccp', '33']),
+    udplite: new Set(['udplite', '136'])
+  };
+  const NFT_TRANSPORT_PORT_RE = /(?:^|\s)(tcp|udp|sctp|dccp|udplite)\s+(?:dport|sport)\b/g;
+  const NFT_PROTO_NUMBERS = { 1: 'icmp', 6: 'tcp', 17: 'udp', 33: 'dccp', 58: 'icmpv6', 132: 'sctp', 136: 'udplite' };
+
+  function detectPortMatchProtocolMismatch(result, findings) {
+    const format = result.format;
+    const isIpt = format === 'iptables' || format === 'ip6tables';
+    if (!isIpt && format !== 'nftables') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          const where = {
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx
+          };
+          const t = rule.tokens || {};
+          const match = String(rule.match || '');
+
+          if (isIpt) {
+            if (!t.protocol) return; // no -p at all: port-match-without-protocol's case
+            if (/(?:^|\s)!\s+-p\s/.test(match)) return; // negated protocol loads (measured)
+            const proto = String(t.protocol).toLowerCase();
+            const multi = match.match(/--(dports|sports)\s/);
+            const plain = (t.dport && '--dport') || (t.sport && '--sport') || null;
+            if (!multi && !plain) return;
+            const portOpt = multi ? `--${multi[1]}` : plain;
+            const ext = match.match(/(?:^|\s)-m\s+(tcp|udp|sctp|dccp|udplite)\b/i);
+            let title, details;
+            if (ext && !MATCH_EXTENSION_PROTOCOL[ext[1].toLowerCase()].has(proto)) {
+              const e = ext[1].toLowerCase();
+              title = `\`-m ${e}\` with \`-p ${proto}\` — ${e.toUpperCase()} match requires \`-p ${e}\`, so this rule will not parse and takes the whole ruleset down with it`;
+              details = `The \`${e}\` match extension only attaches to its own protocol: iptables refuses the line (\`${e.toUpperCase()} match requires '-p ${e}'\`, measured with \`iptables-restore --test\`). And iptables-restore is ATOMIC — one unparsable rule and the ENTIRE ruleset fails to load, so at boot the firewall never comes up and the box sits on the kernel's default policy. Make the two agree: \`-p ${e} -m ${e} ${portOpt} …\` (or drop the explicit \`-m\` — \`-p ${proto} ${portOpt}\` pulls the right match in by itself when ${proto} carries ports).`;
+            } else if (multi && !MULTIPORT_PROTOCOLS.has(proto)) {
+              title = `\`${portOpt}\` (multiport) with \`-p ${proto}\` — multiport only works with TCP, UDP, UDPLITE, SCTP and DCCP; this rule will not parse and takes the whole ruleset down with it`;
+              details = `\`-m multiport\` needs a protocol that has ports, and \`${proto}\` has none: iptables refuses the line (\`multiport only works with TCP, UDP, UDPLITE, SCTP and DCCP\`, measured with \`iptables-restore --test\`). iptables-restore is ATOMIC, so the ENTIRE ruleset fails to load and the firewall never comes up at boot. Name the protocol the ports belong to (\`-p tcp\` / \`-p udp\`), or drop the port list if \`${proto}\` really is what you meant to match.`;
+            } else if (!multi && !PORT_PROTOCOLS.has(proto)) {
+              title = `\`${portOpt}\` with \`-p ${proto}\` — ${proto} has no ports, so this rule will not parse and takes the whole ruleset down with it`;
+              details = `\`${portOpt}\` is an option of the tcp/udp/sctp/dccp match extensions, and \`-p ${proto}\` pulls none of them in: iptables refuses the line (\`unknown option "${portOpt}"\`, measured with \`iptables-restore --test\` — the same failure as a missing \`-p\`, and udplite is in this group too: no udplite match carries ports). iptables-restore is ATOMIC, so the ENTIRE ruleset fails to load and at boot the firewall never comes up. Name the protocol the port belongs to (\`-p tcp ${portOpt} …\` / \`-p udp\`), or drop the port option if \`${proto}\` is what you meant to match.`;
+            } else {
+              return;
+            }
+            findings.push({ id: 'port-match-protocol-mismatch', severity: 'error', ...where, title, details });
+            return;
+          }
+
+          // nftables: two different transport protocols named in one rule,
+          // reported in the order they appear (nft's own "X vs. Y" order).
+          const found = [];
+          let m;
+          NFT_TRANSPORT_PORT_RE.lastIndex = 0;
+          while ((m = NFT_TRANSPORT_PORT_RE.exec(match)) !== null) {
+            found.push({ proto: m[1].toLowerCase(), at: m.index });
+          }
+          const l4 = match.match(/(?:ip\s+protocol|ip6\s+nexthdr|meta\s+l4proto)\s+(?!!=)(\w+)/);
+          if (l4) found.push({ proto: NFT_PROTO_NUMBERS[l4[1]] || l4[1].toLowerCase(), at: l4.index });
+          const ic = match.match(/(?:^|\s)(icmpv6|icmp)\s+type\b/);
+          if (ic) found.push({ proto: ic[1], at: ic.index });
+          found.sort((a, b) => a.at - b.at);
+          const list = [];
+          for (const f of found) if (!list.includes(f.proto)) list.push(f.proto);
+          if (list.length < 2) return;
+          findings.push({
+            id: 'port-match-protocol-mismatch',
+            severity: 'error',
+            ...where,
+            title: `\`${list[0]}\` and \`${list[1]}\` in one rule — nft refuses it ("conflicting transport layer protocols specified"), and the whole file with it`,
+            details: `A rule can match ONE transport protocol; this one names ${list.map((p) => `\`${p}\``).join(' and ')} (a \`dport\`/\`sport\` match, \`meta l4proto\`, \`ip protocol\` or an \`icmp type\` all pin it). nft rejects the file at load time (measured with \`nft -c\`: "conflicting transport layer protocols specified: ${list[0]} vs. ${list[1]}"), and \`nft -f\` is atomic, so the ENTIRE ruleset is refused and the firewall never comes up at boot. Split it into one rule per protocol, or match several at once with a set: \`meta l4proto { tcp, udp } th dport 53\`.`
+          });
         });
       }
     }

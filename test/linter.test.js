@@ -36,6 +36,7 @@ const EXPECTED = {
   'iptables-dport-no-proto.txt': ['port-match-without-protocol'],
   'iptables-reject-mismatch.txt': ['reject-type-mismatch'],
   'iptables-port-wrong-proto.txt': ['port-match-protocol-mismatch'],
+  'iptables-nat-state-dead.txt': ['nat-state-match-dead'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -103,6 +104,7 @@ const ALL_SMELLS = [
   'port-match-without-protocol',
   'reject-type-mismatch',
   'port-match-protocol-mismatch',
+  'nat-state-match-dead',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3012,4 +3014,56 @@ test('port-match-protocol-mismatch (nft): two transport protocols in one rule fi
   assert.match(f[0].title, /`udp` and `tcp` in one rule/);
   assert.match(f[3].details, /conflicting transport layer protocols specified: icmp vs\. udp/);
   assert.match(f[0].details, /meta l4proto \{ tcp, udp \} th dport 53/);
+});
+
+// --- nat-state-match-dead ----------------------------------------------------
+// Measured: nat sees only the NEW packet of a connection — 3/0/0/0 packets on
+// NEW / ESTABLISHED,RELATED / INVALID / unconditional rules in a nat chain
+// after three connections, against 3/10 for the same pair in filter.
+
+function natHits(text) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'nat-state-match-dead');
+}
+
+test('nat-state-match-dead: ESTABLISHED,RELATED and INVALID matches in nat are dead rules, warnings that name the mechanism', () => {
+  const rs = ['*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -m conntrack --ctstate INVALID -j DROP',
+    '-A PREROUTING -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+    '-A PREROUTING -i eth0 -p tcp --dport 80 -j DNAT --to-destination 10.0.0.10:80',
+    '-A POSTROUTING -m state --state ESTABLISHED -j ACCEPT',
+    'COMMIT'].join('\n');
+  const f = natHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.chain, x.ruleIdx]))), [['PREROUTING', 0], ['PREROUTING', 1], ['POSTROUTING', 0]]);
+  for (const x of f) {
+    assert.equal(x.severity, 'warning');
+    assert.match(x.details, /3 packets on the NEW rule and 0/);
+  }
+  assert.match(f[0].title, /`--ctstate INVALID` in the nat table can never match/);
+  assert.match(f[2].title, /`--state ESTABLISHED`/);
+});
+
+test('nat-state-match-dead: a set that includes NEW, a negated match and the filter table are left alone', () => {
+  const rs = ['*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A POSTROUTING -o eth0 -m conntrack --ctstate NEW,ESTABLISHED -j MASQUERADE',
+    '-A PREROUTING -m conntrack --ctstate NEW -p tcp --dport 80 -j DNAT --to-destination 10.0.0.10:80',
+    '-A PREROUTING ! --ctstate ESTABLISHED -j ACCEPT',
+    'COMMIT',
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+    '-A INPUT -m conntrack --ctstate INVALID -j DROP',
+    'COMMIT'].join('\n');
+  assert.equal(natHits(rs).length, 0);
+});
+
+test('nat-state-match-dead (nft): ct state in a type nat chain fires; the same in a filter chain does not', () => {
+  const nft = ['table ip n {', '  chain pre {', '    type nat hook prerouting priority -100;', '    ct state established,related accept', '    ct state invalid drop', '    ct state new tcp dport 80 dnat to 10.0.0.10', '  }', '  chain post {', '    type nat hook postrouting priority 100;', '    ct state new,established masquerade', '  }', '  chain in {', '    type filter hook input priority 0; policy drop;', '    ct state established,related accept', '  }', '}'].join('\n');
+  const f = natHits(nft);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.chain, x.ruleIdx]))), [['pre', 0], ['pre', 1]]);
+  assert.match(f[0].title, /`ct state established,related` in the nat table can never match/);
+});
+
+test('nft parser: chains carry their type (nat / filter)', () => {
+  const nft = ['table ip n {', '  chain pre {', '    type nat hook prerouting priority -100;', '    accept', '  }', '  chain in {', '    type filter hook input priority 0;', '    accept', '  }', '}'].join('\n');
+  const r = FS.parse(nft);
+  assert.deepEqual(JSON.parse(JSON.stringify(r.tables[0].chains.map((c) => [c.name, c.type, c.hook]))), [['pre', 'nat', 'prerouting'], ['in', 'filter', 'input']]);
 });

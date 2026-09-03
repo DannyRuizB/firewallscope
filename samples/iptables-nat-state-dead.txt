@@ -1,0 +1,31 @@
+# A small NAT box: port-forwards to an internal web server, masquerades the
+# LAN. Three lines were copied from the filter chain "because they worked
+# there" — in the nat table each of them matches nothing, ever.
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+# "drop invalid before anything else" — nat never sees an INVALID packet
+-A PREROUTING -m conntrack --ctstate INVALID -j DROP
+# "don't re-DNAT existing connections" — nat never sees them either
+-A PREROUTING -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A PREROUTING -i eth0 -p tcp --dport 80 -j DNAT --to-destination 10.0.0.10:80
+-A PREROUTING -i eth0 -p tcp --dport 443 -j DNAT --to-destination 10.0.0.10:443
+# fine: a set that includes NEW still matches (on the NEW packet)
+-A POSTROUTING -o eth0 -m conntrack --ctstate NEW,ESTABLISHED -j MASQUERADE
+# "allow replies" — belongs in filter; here it is decoration
+-A POSTROUTING -m state --state ESTABLISHED -j ACCEPT
+COMMIT
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j ACCEPT
+-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A FORWARD -i eth0 -o eth1 -d 10.0.0.10 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -j ACCEPT
+-A FORWARD -i eth1 -o eth0 -j ACCEPT
+COMMIT

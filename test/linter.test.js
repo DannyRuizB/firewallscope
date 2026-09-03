@@ -34,6 +34,7 @@ const EXPECTED = {
   'iptables-accept-all-dead.txt': ['unreachable-after-accept-all', 'permissive-accept'],
   'iptables-recent-oneway.txt': ['recent-one-way'],
   'iptables-dport-no-proto.txt': ['port-match-without-protocol'],
+  'iptables-reject-mismatch.txt': ['reject-type-mismatch'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -99,6 +100,7 @@ const ALL_SMELLS = [
   'unreachable-after-accept-all',
   'recent-one-way',
   'port-match-without-protocol',
+  'reject-type-mismatch',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -2793,4 +2795,140 @@ test('port-match-without-protocol is iptables-only (nft expresses port and proto
   ].join('\n');
   const f = FS.lint(FS.parse(nft)).findings.filter((x) => x.id === 'port-match-without-protocol');
   assert.equal(f.length, 0);
+});
+
+// --- reject-type-mismatch ----------------------------------------------------
+// Measured in a NET_ADMIN container (iptables 1.8.11, legacy AND nf_tables
+// backends): `--reject-with tcp-reset` on a rule not pinned to `-p tcp`
+// passes `iptables-restore --test` and FAILS the real commit — the whole
+// (atomic) ruleset with it. Cross-family ICMP names fail in the parser.
+// nft -c: "you cannot use tcp reset with this protocol" / "conflicting
+// protocols specified: ip vs ip6"; the bare `reject with tcp reset` and
+// `icmp type` inside `inet` are accepted.
+
+function rejectHits(text) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'reject-type-mismatch');
+}
+
+test('reject-type-mismatch: the catch-all `-j REJECT --reject-with tcp-reset` (no -p) is an error naming the --test lie', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]', '-A INPUT -p tcp --dport 22 -j ACCEPT', '-A INPUT -j REJECT --reject-with tcp-reset', 'COMMIT'].join('\n');
+  const f = rejectHits(rs);
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'error');
+  assert.equal(f[0].ruleIdx, 1);
+  assert.match(f[0].title, /tcp-reset/);
+  assert.match(f[0].title, /no `-p` at all/);
+  assert.match(f[0].details, /--test/);
+  assert.match(f[0].details, /ATOMIC|atomic/);
+});
+
+test('reject-type-mismatch: tcp-reset on another protocol or on `! -p tcp` fires; -p tcp / -p 6 / tcp-rst on tcp stay silent', () => {
+  const rs = [
+    '*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p udp --dport 53 -j REJECT --reject-with tcp-reset',
+    '-A INPUT ! -p tcp -j REJECT --reject-with tcp-reset',
+    '-A INPUT -p tcp --dport 113 -j REJECT --reject-with tcp-reset',
+    '-A INPUT -p 6 -j REJECT --reject-with tcp-reset',
+    '-A INPUT -p tcp -j REJECT --reject-with tcp-rst',
+    'COMMIT',
+  ].join('\n');
+  const f = rejectHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0, 1]); // findings live in the vm realm: compare by value
+  assert.match(f[0].title, /`-p udp`/);
+  assert.match(f[1].title, /! -p tcp/);
+});
+
+test('reject-type-mismatch: a bare -j REJECT and the valid ICMP types of the family never fire', () => {
+  const v4 = ['*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -j REJECT',
+    '-A INPUT -p udp -j REJECT --reject-with icmp-port-unreachable',
+    '-A INPUT -j REJECT --reject-with icmp-admin-prohibited',
+    'COMMIT'].join('\n');
+  assert.equal(rejectHits(v4).length, 0);
+  const v6 = ['*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p udp -j REJECT --reject-with icmp6-port-unreachable',
+    '-A INPUT -j REJECT --reject-with port-unreach',
+    '-A INPUT -j REJECT --reject-with adm-prohibited',
+    '-A INPUT -p tcp -j REJECT --reject-with tcp-reset',
+    'COMMIT'].join('\n');
+  const r6 = FS.parse(v6, { format: 'ip6tables' });
+  assert.equal(r6.format, 'ip6tables');
+  assert.equal(FS.lint(r6).findings.filter((x) => x.id === 'reject-type-mismatch').length, 0);
+});
+
+test('reject-type-mismatch: an ip6tables name under iptables (and vice versa) is an error that names the other tool', () => {
+  const v4 = ['*filter', ':INPUT DROP [0:0]', '-A INPUT -p tcp --dport 3306 -j REJECT --reject-with icmp6-port-unreachable', 'COMMIT'].join('\n');
+  const f4 = rejectHits(v4);
+  assert.equal(f4.length, 1);
+  assert.match(f4[0].title, /not a iptables reject type \(it is ip6tables's\)/);
+  assert.match(f4[0].details, /unknown reject type "icmp6-port-unreachable"/);
+  const v6 = ['*filter', ':INPUT DROP [0:0]', '-A INPUT -p tcp -j REJECT --reject-with icmp-port-unreachable', 'COMMIT'].join('\n');
+  const f6 = FS.lint(FS.parse(v6, { format: 'ip6tables' })).findings.filter((x) => x.id === 'reject-type-mismatch');
+  assert.equal(f6.length, 1);
+  assert.match(f6[0].title, /it is iptables's/);
+});
+
+test('reject-type-mismatch: a misspelled reject type is an error too (same parser failure), without a family claim', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]', '-A INPUT -j REJECT --reject-with icmp-port-unreach', 'COMMIT'].join('\n');
+  const f = rejectHits(rs);
+  assert.equal(f.length, 1);
+  assert.doesNotMatch(f[0].title, /it is/);
+  assert.match(f[0].details, /no such reject type/);
+});
+
+test('reject-type-mismatch: ipv6 tcp-reset on a non-tcp rule fires the same way', () => {
+  const v6 = ['*filter', ':INPUT DROP [0:0]', '-A INPUT -p udp -j REJECT --reject-with tcp-reset', 'COMMIT'].join('\n');
+  const f = FS.lint(FS.parse(v6, { format: 'ip6tables' })).findings.filter((x) => x.id === 'reject-type-mismatch');
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /`-p udp`/);
+});
+
+function nftChain(family, ...rules) {
+  return [`table ${family} f {`, '  chain input {', '    type filter hook input priority 0; policy drop;', ...rules.map((r) => `    ${r}`), '  }', '}'].join('\n');
+}
+
+test('reject-type-mismatch (nft): tcp reset on a udp/icmp rule fires; tcp-pinned and bare forms stay silent', () => {
+  const f = rejectHits(nftChain('inet',
+    'udp dport 53 reject with tcp reset',
+    'ip protocol udp reject with tcp reset',
+    'meta l4proto sctp reject with tcp reset',
+    'icmp type echo-request reject with tcp reset',
+    'tcp dport 22 reject with tcp reset',
+    'meta l4proto tcp reject with tcp reset',
+    'reject with tcp reset',
+    'reject'));
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0, 1, 2, 3]);
+  assert.match(f[0].title, /`udp` rule/);
+  assert.match(f[1].title, /`udp` rule/);
+  assert.match(f[2].title, /`sctp` rule/);
+  assert.match(f[3].title, /`icmp` rule/);
+  assert.match(f[0].details, /you cannot use tcp reset with this protocol/);
+});
+
+test('reject-type-mismatch (nft): icmpv6 type in table ip and icmp type in table ip6 fire; inet and icmpx never do', () => {
+  assert.equal(rejectHits(nftChain('ip', 'reject with icmpv6 type port-unreachable')).length, 1);
+  assert.match(rejectHits(nftChain('ip', 'reject with icmpv6 type port-unreachable'))[0].title, /conflicting protocols/);
+  assert.equal(rejectHits(nftChain('ip6', 'reject with icmp type port-unreachable')).length, 1);
+  assert.equal(rejectHits(nftChain('ip', 'reject with icmp type port-unreachable')).length, 0);
+  assert.equal(rejectHits(nftChain('ip6', 'reject with icmpv6 type port-unreachable')).length, 0);
+  assert.equal(rejectHits(nftChain('inet', 'reject with icmp type port-unreachable', 'reject with icmpv6 type port-unreachable', 'reject with icmpx type port-unreachable')).length, 0);
+});
+
+test('nft parser: `reject with …` is a REJECT verdict carrying its type (it used to leave the rule with no action)', () => {
+  const r = FS.parse(nftChain('inet', 'udp dport 53 reject with tcp reset', 'reject with icmpx type admin-prohibited', 'tcp dport 22 reject'));
+  const rules = r.tables[0].chains[0].rules;
+  assert.equal(rules[0].action, 'REJECT');
+  assert.equal(rules[0].actionDetail, 'tcp reset');
+  assert.equal(rules[0].match, 'udp dport 53');
+  assert.equal(rules[1].action, 'REJECT');
+  assert.equal(rules[1].actionDetail, 'icmpx type admin-prohibited');
+  assert.equal(rules[2].action, 'REJECT');
+  assert.equal(rules[2].actionDetail, null);
+});
+
+test('nft parser: l4proto token from ip protocol / ip6 nexthdr / meta l4proto / icmp type, never from a negation', () => {
+  const r = FS.parse(nftChain('inet', 'ip protocol udp accept', 'ip6 nexthdr udp accept', 'meta l4proto sctp accept', 'icmpv6 type echo-request accept', 'icmp type echo-request accept', 'meta l4proto != tcp accept', 'tcp dport 22 accept'));
+  const rules = r.tables[0].chains[0].rules;
+  assert.deepEqual(JSON.parse(JSON.stringify(rules.map((x) => x.tokens.l4proto || null))), ['udp', 'udp', 'sctp', 'icmpv6', 'icmp', null, null]);
+  assert.equal(rules[6].tokens.protocol, 'tcp');
 });

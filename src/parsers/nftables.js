@@ -8,7 +8,12 @@
     { re: /\bredirect(?:\s+to\s+(:?\S+))?$/i, verb: 'REDIRECT' },
     { re: /\bdnat(?:\s+to\s+(\S+))?$/i, verb: 'DNAT' },
     { re: /\bsnat(?:\s+to\s+(\S+))?$/i, verb: 'SNAT' },
-    { re: /\bmasquerade$/i,          verb: 'MASQUERADE' }
+    { re: /\bmasquerade$/i,          verb: 'MASQUERADE' },
+    // `reject with tcp reset` / `reject with icmp type port-unreachable` /
+    // `reject with icmpx type …` — a REJECT verdict carrying its reject type.
+    // Before this, only a bare `reject` was recognised and the rule ended up
+    // with NO action at all (the smell that reads the reject type needs it).
+    { re: /\breject\s+with\s+(.+)$/i, verb: 'REJECT' }
   ];
 
   function parseNftRuleset(text) {
@@ -166,6 +171,16 @@
     if (oifname) t.iface_out = oifname[1];
     const ctstate = match.match(/ct\s+state\s+([\w,]+)/);
     if (ctstate) t.ctstate = ctstate[1];
+    // The transport protocol when it is named WITHOUT a port match:
+    // `ip protocol udp`, `ip6 nexthdr udp`, `meta l4proto udp`, or an
+    // `icmp type` / `icmpv6 type` match (which pins the protocol to icmp).
+    // Kept apart from `protocol` (set by the port matches above) so the
+    // smells that pair protocol WITH a port keep their exact meaning;
+    // negated forms (`!=`) are deliberately not recorded.
+    const l4 = match.match(/(?:ip\s+protocol|ip6\s+nexthdr|meta\s+l4proto)\s+(?!!=)(\w+)/);
+    if (l4) t.l4proto = l4[1];
+    else if (/(?:^|\s)icmpv6\s+type\s/.test(match)) t.l4proto = 'icmpv6';
+    else if (/(?:^|\s)icmp\s+type\s/.test(match)) t.l4proto = 'icmp';
     return t;
   }
 

@@ -1,0 +1,23 @@
+# Hand-written INPUT chain for a small web host — the kind that lives in
+# /etc/iptables/rules.v4 and gets loaded by iptables-restore at boot.
+# `iptables-restore --test` is happy with every line. The REAL load is not.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j ACCEPT
+-A INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A INPUT -p icmp --icmp-type echo-request -m limit --limit 5/s -j ACCEPT
+# ident: answer fast so mail servers don't wait — fine, this one IS tcp.
+-A INPUT -p tcp --dport 113 -j REJECT --reject-with tcp-reset
+# "be polite to DNS clients" — but a TCP reset cannot answer UDP:
+-A INPUT -p udp --dport 53 -j REJECT --reject-with tcp-reset
+# an ip6tables name pasted into the v4 file — the parser stops here:
+-A INPUT -p tcp --dport 3306 -j REJECT --reject-with icmp6-port-unreachable
+# the classic ending: "reject everything else with a reset" — no -p at all,
+# so the kernel refuses the rule and the whole file never loads at boot.
+-A INPUT -j REJECT --reject-with tcp-reset
+COMMIT

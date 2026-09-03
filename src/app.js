@@ -24,7 +24,8 @@
     ftphelper: 'samples/iptables-ftp-helper.txt',
     acceptalldead: 'samples/iptables-accept-all-dead.txt',
     recentoneway: 'samples/iptables-recent-oneway.txt',
-    dportnoproto: 'samples/iptables-dport-no-proto.txt'
+    dportnoproto: 'samples/iptables-dport-no-proto.txt',
+    rejectmismatch: 'samples/iptables-reject-mismatch.txt'
   };
 
   const FORMAT_LABELS = {

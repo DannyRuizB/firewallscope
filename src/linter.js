@@ -103,6 +103,7 @@
     detectNotrackOneWay(result, findings);
     detectRecentOneWay(result, findings);
     detectPortMatchWithoutProtocol(result, findings);
+    detectRejectTypeMismatch(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -511,6 +512,136 @@
             title: `\`${portOpt}\` with no \`-p tcp\`/\`-p udp\` — this rule will not load, and takes the whole ruleset down with it`,
             details: `\`${portOpt}\` is an option of the tcp/udp match extension, which only exists once a protocol pulls it in — with no \`-p\`, iptables refuses the rule (\`unknown option "${portOpt}"\`, or \`TCP match requires '-p tcp'\` under an explicit \`-m tcp\`; measured). And iptables-restore is ATOMIC: this one bad line makes the ENTIRE ruleset fail to load, so on boot the firewall never comes up — the box is left on the kernel's default policy, not the one in this file. Add the protocol the port belongs to: \`-p tcp ${portOpt} <port>\` (or \`-p udp\`). Only hand-written rules hit this; \`iptables-save\` always emits the \`-p tcp\` itself.`
           });
+        });
+      }
+    }
+  }
+
+  // ── reject-type-mismatch ────────────────────────────────────────────
+  // REJECT's `--reject-with` names the packet sent back, and it has to fit
+  // the rule it rides on — twice over. (1) `tcp-reset` is a TCP RST: the
+  // kernel refuses to install it on a rule that isn't pinned to `-p tcp`
+  // (no `-p`, another protocol, or `! -p tcp`). And this one is a trap the
+  // dry run cannot see: `iptables-restore --test` says nothing (the check
+  // lives in the kernel's target verification, not in the parser) and the
+  // REAL commit fails — measured in a NET_ADMIN container, both backends:
+  //   -A INPUT -j REJECT --reject-with tcp-reset            -> COMMIT fails
+  //   -A INPUT -p udp --dport 53 -j REJECT --reject-with tcp-reset -> fails
+  //   -A INPUT ! -p tcp -j REJECT --reject-with tcp-reset   -> fails
+  //   -A INPUT -p tcp / -p 6 ... --reject-with tcp-reset    -> loads
+  // and, restore being atomic, a good `-p tcp --dport 22 -j ACCEPT` above
+  // the bad line went down with it. The catch-all "reject everything else
+  // with a reset" at the bottom of a hand-written INPUT chain is exactly
+  // this mistake, and it means the firewall never comes up at boot.
+  // (2) The ICMP reject types are per family: iptables knows the `icmp-*`
+  // names, ip6tables the `icmp6-*` ones (plus short aliases) — cross them
+  // and the PARSER refuses (`unknown reject type "icmp6-port-unreachable"`
+  // under iptables, `unknown reject type "icmp-port-unreachable"` under
+  // ip6tables; measured, rc 2), so a typo'd name fails the same way.
+  // nft has the same two edges with its own grammar, measured with `nft -c`:
+  // `udp dport 53 reject with tcp reset` / `ip protocol udp reject with tcp
+  // reset` -> "you cannot use tcp reset with this protocol"; `reject with
+  // icmpv6 type …` inside `table ip` (or `icmp type` inside `table ip6`)
+  // -> "conflicting protocols specified: ip vs ip6"; and nft -f is atomic
+  // too. Two nft forms are FINE and stay silent: a bare `reject with tcp
+  // reset` with no transport match (nft adds the `meta l4proto tcp`
+  // dependency itself — the rule simply only ever sees TCP), and `icmp type`
+  // / `icmpv6 type` inside `table inet` (accepted; `icmpx` is the
+  // family-neutral spelling). Reject types nobody named (a bare `-j REJECT`)
+  // default to port-unreachable and are always valid.
+  const REJECT_TYPES_V4 = new Set([
+    'icmp-net-unreachable', 'icmp-host-unreachable', 'icmp-port-unreachable',
+    'icmp-proto-unreachable', 'icmp-net-prohibited', 'icmp-host-prohibited',
+    'icmp-admin-prohibited', 'tcp-reset', 'tcp-rst'
+  ]);
+  const REJECT_TYPES_V6 = new Set([
+    'icmp6-no-route', 'no-route', 'icmp6-adm-prohibited', 'adm-prohibited',
+    'icmp6-addr-unreachable', 'addr-unreach', 'icmp6-port-unreachable',
+    'port-unreach', 'icmp6-policy-fail', 'policy-fail', 'icmp6-reject-route',
+    'reject-route', 'tcp-reset', 'tcp-rst'
+  ]);
+  const TCP_PROTOCOL_NAMES = new Set(['tcp', '6']);
+
+  function detectRejectTypeMismatch(result, findings) {
+    const format = result.format;
+    const isIpt = format === 'iptables' || format === 'ip6tables';
+    if (!isIpt && format !== 'nftables') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          if (rule.action !== 'REJECT') return;
+          const detail = String(rule.actionDetail || '').trim().toLowerCase();
+          if (!detail) return;
+          const where = {
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx
+          };
+          const t = rule.tokens || {};
+
+          if (isIpt) {
+            const m = detail.match(/--reject-with\s+(\S+)/);
+            if (!m) return;
+            const type = m[1];
+            if (type === 'tcp-reset' || type === 'tcp-rst') {
+              const proto = t.protocol ? String(t.protocol).toLowerCase() : null;
+              const negated = /(?:^|\s)!\s+-p\s/.test(String(rule.match || ''));
+              if (proto && !negated && TCP_PROTOCOL_NAMES.has(proto)) return;
+              const why = !proto
+                ? 'no `-p` at all — it matches every protocol'
+                : negated ? '`! -p tcp` — it matches everything BUT tcp' : `\`-p ${proto}\``;
+              findings.push({
+                id: 'reject-type-mismatch',
+                severity: 'error',
+                ...where,
+                title: `\`--reject-with tcp-reset\` on a rule not pinned to \`-p tcp\` (${why}) — the kernel refuses it at load, and the whole ruleset with it`,
+                details: `A TCP reset can only answer TCP, so the REJECT target's kernel-side check demands \`-p tcp\` on the rule — and this rule has ${why}. The trap: \`iptables-restore --test\` passes (the check is not in the parser) and the REAL commit fails (measured: both the legacy and the nf_tables backends refuse it, \`! -p tcp\` included). Restore is ATOMIC, so this one line takes the ENTIRE ruleset down: at boot the firewall never comes up and the box sits on the kernel's default policy. Either pin the rule to TCP (\`-p tcp -j REJECT --reject-with tcp-reset\`, with a separate \`-j REJECT\` for the rest) or drop the type and let the default \`icmp-port-unreachable\` answer everything.`
+              });
+              return;
+            }
+            const valid = format === 'iptables' ? REJECT_TYPES_V4 : REJECT_TYPES_V6;
+            if (valid.has(type)) return;
+            const other = format === 'iptables' ? REJECT_TYPES_V6 : REJECT_TYPES_V4;
+            const otherTool = format === 'iptables' ? 'ip6tables' : 'iptables';
+            const crossed = other.has(type);
+            findings.push({
+              id: 'reject-type-mismatch',
+              severity: 'error',
+              ...where,
+              title: `\`--reject-with ${type}\` is not a ${format} reject type${crossed ? ` (it is ${otherTool}'s)` : ''} — this rule will not parse, and takes the whole ruleset down with it`,
+              details: `${format} refuses the rule at parse time (\`unknown reject type "${type}"\`, measured) — ${crossed ? `the ICMP reject types are per address family, and \`${type}\` belongs to ${otherTool}; ${format} spells its own as ${format === 'iptables' ? '`icmp-port-unreachable`, `icmp-host-unreachable`, `icmp-admin-prohibited`…' : '`icmp6-port-unreachable` (`port-unreach`), `icmp6-adm-prohibited` (`adm-prohibited`), `icmp6-no-route`…'}` : `no such reject type exists in ${format}; check the spelling against \`${format} -j REJECT --help\``}. And iptables-restore is ATOMIC: one unparsable line and the ENTIRE ruleset fails to load, so on boot the firewall never comes up. Use a type of this family — or drop \`--reject-with\` altogether: the default (port-unreachable) is valid everywhere.`
+            });
+            return;
+          }
+
+          // nftables
+          const l4 = (t.protocol || t.l4proto) ? String(t.protocol || t.l4proto).toLowerCase() : null;
+          if (/^tcp\s+reset\b/.test(detail)) {
+            if (!l4 || TCP_PROTOCOL_NAMES.has(l4)) return; // bare form: nft adds the tcp dependency itself
+            findings.push({
+              id: 'reject-type-mismatch',
+              severity: 'error',
+              ...where,
+              title: `\`reject with tcp reset\` on a \`${l4}\` rule — nft refuses to load it ("you cannot use tcp reset with this protocol"), and the whole file with it`,
+              details: `A TCP reset can only answer TCP, and this rule pins the transport to \`${l4}\` — nft rejects the combination at load time (measured with \`nft -c\`: "you cannot use tcp reset with this protocol"), and \`nft -f\` is atomic, so the ENTIRE ruleset is refused and the firewall never comes up at boot. Match tcp (\`tcp dport …\` / \`meta l4proto tcp\`) if a reset is what you want, or use the protocol-neutral \`reject\` (port-unreachable) / \`reject with icmpx type …\`. A bare \`reject with tcp reset\` with no transport match is fine: nft adds the \`meta l4proto tcp\` dependency itself.`
+            });
+            return;
+          }
+          const fam = String(table.family || '').toLowerCase();
+          const icmpv6 = /^icmpv6\s+type\b/.test(detail);
+          const icmpv4 = /^icmp\s+type\b/.test(detail);
+          if ((icmpv6 && fam === 'ip') || (icmpv4 && fam === 'ip6')) {
+            const typeWord = icmpv6 ? 'icmpv6' : 'icmp';
+            const wantWord = icmpv6 ? 'icmp' : 'icmpv6';
+            findings.push({
+              id: 'reject-type-mismatch',
+              severity: 'error',
+              ...where,
+              title: `\`reject with ${typeWord} type …\` inside \`table ${fam}\` — nft refuses it ("conflicting protocols specified: ip vs ip6"), and the whole file with it`,
+              details: `\`${typeWord} type\` reject types belong to the ${icmpv6 ? 'IPv6' : 'IPv4'} family, and this table is \`${fam}\` — nft rejects the file at load time (measured with \`nft -c\`: "conflicting protocols specified: ip vs ip6"), and \`nft -f\` is atomic: the ENTIRE ruleset is refused. Use \`reject with ${wantWord} type …\` in this table, \`reject with icmpx type …\` (family-neutral, valid everywhere), or a bare \`reject\`. Inside \`table inet\` either spelling is accepted (nft scopes it to the matching family).`
+            });
+          }
         });
       }
     }

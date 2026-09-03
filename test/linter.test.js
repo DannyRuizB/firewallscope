@@ -35,6 +35,7 @@ const EXPECTED = {
   'iptables-recent-oneway.txt': ['recent-one-way'],
   'iptables-dport-no-proto.txt': ['port-match-without-protocol'],
   'iptables-reject-mismatch.txt': ['reject-type-mismatch'],
+  'iptables-port-wrong-proto.txt': ['port-match-protocol-mismatch'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -101,6 +102,7 @@ const ALL_SMELLS = [
   'recent-one-way',
   'port-match-without-protocol',
   'reject-type-mismatch',
+  'port-match-protocol-mismatch',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -2931,4 +2933,83 @@ test('nft parser: l4proto token from ip protocol / ip6 nexthdr / meta l4proto / 
   const rules = r.tables[0].chains[0].rules;
   assert.deepEqual(JSON.parse(JSON.stringify(rules.map((x) => x.tokens.l4proto || null))), ['udp', 'udp', 'sctp', 'icmpv6', 'icmp', null, null]);
   assert.equal(rules[6].tokens.protocol, 'tcp');
+});
+
+// --- port-match-protocol-mismatch --------------------------------------------
+// Measured with iptables-restore --test (parser errors) and nft -c; see the
+// smell's comment for the table. `! -p tcp --dport 22` loads and stays silent.
+
+function pmHits(text, opts) {
+  return FS.lint(FS.parse(text, opts)).findings.filter((x) => x.id === 'port-match-protocol-mismatch');
+}
+function ipt(...rules) { return ['*filter', ':INPUT DROP [0:0]', ...rules, 'COMMIT'].join('\n'); }
+
+test('port-match-protocol-mismatch: a port option on a protocol without ports is an error naming the unknown-option failure', () => {
+  const f = pmHits(ipt('-A INPUT -p icmp --dport 80 -j ACCEPT', '-A INPUT -p esp --sport 500 -j ACCEPT', '-A INPUT -p all --dport 80 -j ACCEPT', '-A INPUT -p 1 --dport 80 -j ACCEPT', '-A INPUT -p udplite --dport 80 -j ACCEPT'));
+  assert.equal(f.length, 5);
+  for (const x of f) {
+    assert.equal(x.severity, 'error');
+    assert.match(x.details, /unknown option/);
+    assert.match(x.details, /ATOMIC/);
+  }
+  assert.match(f[0].title, /`--dport` with `-p icmp`/);
+  assert.match(f[1].title, /`--sport` with `-p esp`/);
+});
+
+test('port-match-protocol-mismatch: protocols that carry ports, numeric ones and the negated form stay silent', () => {
+  assert.equal(pmHits(ipt(
+    '-A INPUT -p tcp --dport 22 -j ACCEPT',
+    '-A INPUT -p udp --sport 53 -j ACCEPT',
+    '-A INPUT -p sctp --dport 3868 -j ACCEPT',
+    '-A INPUT -p dccp --dport 5004 -j ACCEPT',
+    '-A INPUT -p 17 --dport 53 -j ACCEPT',
+    '-A INPUT -p 6 --sport 1024 -j ACCEPT',
+    '-A INPUT ! -p tcp --dport 22 -j DROP',
+    '-A INPUT -p icmp --icmp-type echo-request -j ACCEPT',
+  )).length, 0);
+});
+
+test('port-match-protocol-mismatch: no -p at all is the sibling smell, not this one', () => {
+  const rs = ipt('-A INPUT --dport 22 -j ACCEPT');
+  assert.equal(pmHits(rs).length, 0);
+  assert.equal(FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'port-match-without-protocol').length, 1);
+});
+
+test('port-match-protocol-mismatch: an explicit -m for another protocol names the extension that refuses', () => {
+  const f = pmHits(ipt('-A INPUT -p tcp -m udp --dport 53 -j ACCEPT', '-A INPUT -p icmp -m tcp --dport 80 -j ACCEPT', '-A INPUT -p 6 -m tcp --dport 22 -j ACCEPT', '-A INPUT -p udp -m udp --dport 53 -j ACCEPT'));
+  assert.equal(f.length, 2);
+  assert.match(f[0].title, /`-m udp` with `-p tcp`/);
+  assert.match(f[0].details, /UDP match requires '-p udp'/);
+  assert.match(f[1].title, /`-m tcp` with `-p icmp`/);
+});
+
+test('port-match-protocol-mismatch: multiport on a port-less protocol fires; on udp, udplite and tcp it does not', () => {
+  const f = pmHits(ipt('-A INPUT -p icmp -m multiport --dports 123,161 -j ACCEPT', '-A INPUT -p udp -m multiport --dports 53,123 -j ACCEPT', '-A INPUT -p udplite -m multiport --sports 53 -j ACCEPT', '-A INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT'));
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /`--dports` \(multiport\) with `-p icmp`/);
+  assert.match(f[0].details, /multiport only works with TCP, UDP, UDPLITE, SCTP and DCCP/);
+});
+
+test('port-match-protocol-mismatch: ip6tables refuses ports on ipv6-icmp/icmpv6 the same way', () => {
+  const f = pmHits(ipt('-A INPUT -p ipv6-icmp --dport 80 -j ACCEPT', '-A INPUT -p icmpv6 --sport 80 -j ACCEPT', '-A INPUT -p tcp --dport 22 -j ACCEPT'), { format: 'ip6tables' });
+  assert.equal(f.length, 2);
+  assert.match(f[0].title, /`-p ipv6-icmp`/);
+});
+
+test('port-match-protocol-mismatch (nft): two transport protocols in one rule fire; same-protocol pairs and the set form stay silent', () => {
+  const f = pmHits(nftChain('inet',
+    'meta l4proto udp tcp dport 22 accept',
+    'ip protocol udp tcp dport 22 accept',
+    'udp dport 53 tcp dport 22 accept',
+    'icmp type echo-request udp dport 53 accept',
+    'icmpv6 type echo-request tcp dport 22 accept',
+    'meta l4proto tcp tcp dport 22 accept',
+    'ip protocol tcp tcp dport 22 accept',
+    'tcp dport 22 tcp sport 1024-65535 accept',
+    'meta l4proto { tcp, udp } th dport 53 accept',
+    'meta l4proto sctp sctp dport 80 accept'));
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0, 1, 2, 3, 4]);
+  assert.match(f[0].title, /`udp` and `tcp` in one rule/);
+  assert.match(f[3].details, /conflicting transport layer protocols specified: icmp vs\. udp/);
+  assert.match(f[0].details, /meta l4proto \{ tcp, udp \} th dport 53/);
 });

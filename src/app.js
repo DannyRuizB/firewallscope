@@ -25,7 +25,8 @@
     acceptalldead: 'samples/iptables-accept-all-dead.txt',
     recentoneway: 'samples/iptables-recent-oneway.txt',
     dportnoproto: 'samples/iptables-dport-no-proto.txt',
-    rejectmismatch: 'samples/iptables-reject-mismatch.txt'
+    rejectmismatch: 'samples/iptables-reject-mismatch.txt',
+    portwrongproto: 'samples/iptables-port-wrong-proto.txt'
   };
 
   const FORMAT_LABELS = {

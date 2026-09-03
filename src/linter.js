@@ -105,6 +105,7 @@
     detectPortMatchWithoutProtocol(result, findings);
     detectRejectTypeMismatch(result, findings);
     detectPortMatchProtocolMismatch(result, findings);
+    detectNatStateMatchDead(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -748,6 +749,56 @@
             ...where,
             title: `\`${list[0]}\` and \`${list[1]}\` in one rule — nft refuses it ("conflicting transport layer protocols specified"), and the whole file with it`,
             details: `A rule can match ONE transport protocol; this one names ${list.map((p) => `\`${p}\``).join(' and ')} (a \`dport\`/\`sport\` match, \`meta l4proto\`, \`ip protocol\` or an \`icmp type\` all pin it). nft rejects the file at load time (measured with \`nft -c\`: "conflicting transport layer protocols specified: ${list[0]} vs. ${list[1]}"), and \`nft -f\` is atomic, so the ENTIRE ruleset is refused and the firewall never comes up at boot. Split it into one rule per protocol, or match several at once with a set: \`meta l4proto { tcp, udp } th dport 53\`.`
+          });
+        });
+      }
+    }
+  }
+
+  // ── nat-state-match-dead ─────────────────────────────────────────────
+  // The nat table sees ONE packet per connection: the first one, the one
+  // conntrack has just classified NEW. Every later packet of that flow
+  // follows the mapping already recorded and never traverses nat again. So
+  // a nat rule matching a conntrack state other than NEW can never match —
+  // ESTABLISHED, RELATED, INVALID and UNTRACKED packets do not reach it.
+  // MEASURED in a NET_ADMIN container (iptables 1.8.11): a nat OUTPUT chain
+  // with four rules on the same port — `--ctstate NEW`, `--ctstate
+  // ESTABLISHED,RELATED`, `--ctstate INVALID`, unconditional — after three
+  // curl connections counted 3 / 0 / 0 / 0 packets, while the identical pair
+  // in the filter table counted 3 NEW and 10 ESTABLISHED. iptables accepts
+  // the rule without a word; nft accepts `ct state established` in a `type
+  // nat` chain the same way. The usual shape is a copy-paste from a filter
+  // chain — the "allow replies" line that belongs in filter, or a DNAT
+  // meant to exempt existing connections, which exempts nothing. A state
+  // set that INCLUDES new (`NEW,ESTABLISHED`) still matches (on NEW) and is
+  // left alone; only a set without NEW is dead. ufw has no nat rules to
+  // show and is exempt by construction.
+  function detectNatStateMatchDead(result, findings) {
+    const format = result.format;
+    if (format === 'ufw') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        const inNat = format === 'nftables'
+          ? String(chain.type || '').toLowerCase() === 'nat'
+          : String(table.name || '').toLowerCase() === 'nat';
+        if (!inNat) return;
+        chain.rules.forEach((rule, idx) => {
+          const t = rule.tokens || {};
+          const raw = String(t.ctstate || t.state || '');
+          if (!raw) return;
+          if (/(^|\s)!\s+(--ctstate|--state|ct\s+state)/.test(String(rule.match || ''))) return; // negated: leave alone
+          const states = raw.toLowerCase().split(/[,\s]+/).filter(Boolean);
+          if (!states.length || states.includes('new')) return;
+          const spelled = format === 'nftables' ? `ct state ${raw}` : (t.ctstate ? `--ctstate ${raw}` : `--state ${raw}`);
+          findings.push({
+            id: 'nat-state-match-dead',
+            severity: 'warning',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx,
+            title: `\`${spelled}\` in the nat table can never match — nat sees only the first (NEW) packet of a connection, so this rule is dead`,
+            details: `The nat table is consulted ONCE per connection, for the packet conntrack has just classified NEW; every later packet follows the recorded mapping and never traverses nat again. A nat rule matching ${states.map((x) => x.toUpperCase()).join('/')} therefore matches nothing (measured: 3 connections counted 3 packets on the NEW rule and 0 on the ESTABLISHED,RELATED / INVALID rules in the same nat chain, against 3 / 10 for the same pair in filter). Whatever this rule was meant to do — allow replies, exempt existing connections from a DNAT, drop invalid packets — is not happening, and neither iptables nor nft complains. Move it to the filter table (where ESTABLISHED,RELATED and INVALID mean something), or drop the state match here: in nat, every packet that arrives is NEW by definition.`
           });
         });
       }

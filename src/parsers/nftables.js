@@ -61,6 +61,7 @@
             policy: null,
             builtIn: false,
             hook: null,
+            type: null,
             priority: null,
             rules: []
           };
@@ -76,6 +77,8 @@
         if (typeMatch) {
           currentChain.builtIn = true;
           currentChain.hook = typeMatch[2];
+          // `type nat|filter|route` — the smell that judges conntrack state in a nat chain needs it.
+          currentChain.type = typeMatch[1];
           currentChain.priority = typeMatch[3].trim();
           const policyInLine = line.match(/policy\s+([a-zA-Z]+);?\s*$/);
           if (policyInLine) currentChain.policy = policyInLine[1].toUpperCase();

@@ -2053,6 +2053,13 @@
     // Layer-7 / rate / per-host counters
     if (/-m\s+(?:limit|recent|hashlimit|connlimit|owner|mark|mac|string|hexstring|set|policy|conntrack(?!\s+--ctstate))/.test(raw)) return true;
     if (/\b(?:limit\s+rate|meter\s)/.test(raw)) return true;
+    // Header-content matches the 5-dimension model does not see: TCP flags
+    // and options, ICMP types. MEASURED on the tcp-flags sample: without
+    // this line a dead `--tcp-flags SYN,ACK ...` DROP was reported as
+    // shadowing six later rules it can never match - `-p tcp -j DROP` and
+    // `-p tcp --tcp-flags X Y -j DROP` are not the same packet space.
+    if (/(?:^|\s)(?:--tcp-flags|--syn|--tcp-option|--icmp-type|--icmpv6-type)(?=\s|$)/.test(raw)) return true;
+    if (/\b(?:tcp\s+(?:flags|option)|icmp(?:v6)?\s+type)\b/.test(raw)) return true;
     return false;
   }
 

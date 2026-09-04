@@ -184,6 +184,12 @@
     if (l4) t.l4proto = l4[1];
     else if (/(?:^|\s)icmpv6\s+type\s/.test(match)) t.l4proto = 'icmpv6';
     else if (/(?:^|\s)icmp\s+type\s/.test(match)) t.l4proto = 'icmp';
+    // `tcp flags & MASK == COMP` (or `!=`), the mask-and-compare form. Each
+    // side is a flag name, a parenthesised `(a | b)` set or a number; the
+    // bare `tcp flags syn` / `tcp flags == syn` forms have no mask and are
+    // deliberately not recorded.
+    const tf = match.match(/tcp\s+flags\s*&\s*(\([^)]*\)|\S+)\s*(==|!=)\s*(\([^)]*\)|\S+)/);
+    if (tf) { t.tcp_flags_mask = tf[1]; t.tcp_flags_comp = tf[3]; t.tcp_flags_negated = tf[2] === '!='; }
     return t;
   }
 

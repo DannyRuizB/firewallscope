@@ -37,6 +37,7 @@ const EXPECTED = {
   'iptables-reject-mismatch.txt': ['reject-type-mismatch'],
   'iptables-port-wrong-proto.txt': ['port-match-protocol-mismatch'],
   'iptables-nat-state-dead.txt': ['nat-state-match-dead'],
+  'iptables-tcp-flags-dead.txt': ['tcp-flags-never-match'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -105,6 +106,7 @@ const ALL_SMELLS = [
   'reject-type-mismatch',
   'port-match-protocol-mismatch',
   'nat-state-match-dead',
+  'tcp-flags-never-match',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3066,4 +3068,83 @@ test('nft parser: chains carry their type (nat / filter)', () => {
   const nft = ['table ip n {', '  chain pre {', '    type nat hook prerouting priority -100;', '    accept', '  }', '  chain in {', '    type filter hook input priority 0;', '    accept', '  }', '}'].join('\n');
   const r = FS.parse(nft);
   assert.deepEqual(JSON.parse(JSON.stringify(r.tables[0].chains.map((c) => [c.name, c.type, c.hook]))), [['pre', 'nat', 'prerouting'], ['in', 'filter', 'input']]);
+});
+
+// --- tcp-flags-never-match ---------------------------------------------------
+// Measured (iptables 1.8.11 / nft 1.1.3): every form loads with rc 0; dead
+// rules counted 0 packets over three connections, the negated form took all
+// 12 and shadowed the rules after it.
+
+function flagHits(text) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'tcp-flags-never-match');
+}
+
+test('tcp-flags-never-match: comp flags outside the mask are dead rules (errors naming the flag); the negated form matches everything', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp --tcp-flags SYN FIN -j DROP',
+    '-A INPUT -p tcp -m tcp --tcp-flags SYN,ACK FIN,SYN,RST,PSH,ACK,URG -j DROP',
+    '-A INPUT -p tcp -m tcp --tcp-flags NONE SYN -j DROP',
+    '-A INPUT -p tcp -m tcp ! --tcp-flags SYN FIN -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT',
+    'COMMIT'].join('\n');
+  const f = flagHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0, 1, 2, 3]);
+  for (const x of f) assert.equal(x.severity, 'error');
+  assert.match(f[0].title, /`--tcp-flags SYN FIN` can never match — FIN is tested but not in the mask/);
+  assert.match(f[1].title, /FIN\/RST\/PSH\/URG is tested but not in the mask/);
+  assert.match(f[2].title, /`--tcp-flags NONE SYN` can never match/);
+  assert.match(f[3].title, /`! --tcp-flags SYN FIN` matches EVERY TCP packet/);
+  assert.match(f[3].details, /a DROP here blackholes TCP, an ACCEPT lets everything through/);
+  assert.match(f[0].details, /counted 0 packets over three TCP connections/);
+});
+
+test('tcp-flags-never-match: comp inside the mask, ALL/NONE patterns, --syn as printed by iptables-save and rules without flags are left alone', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG FIN,SYN -j DROP',
+    '-A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG NONE -j DROP',
+    '-A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG FIN,SYN,RST,PSH,ACK,URG -j DROP',
+    '-A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m limit --limit 25/s -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --tcp-flags SYN,FIN FIN -j DROP',
+    '-A INPUT -p tcp -m tcp ! --tcp-flags FIN,SYN,RST,ACK SYN -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT',
+    'COMMIT'].join('\n');
+  assert.equal(flagHits(rs).length, 0);
+});
+
+test('tcp-flags-never-match (nft): `tcp flags & mask == comp` with comp outside the mask fires, `!=` fires as always-true, correct and mask-less forms do not', () => {
+  const nft = ['table inet f {', '  chain in {', '    type filter hook input priority 0;',
+    '    tcp flags & syn == fin drop',
+    '    tcp flags & (syn|ack) == syn|fin drop',
+    '    tcp flags & syn != fin accept',
+    '    tcp flags & (fin | syn | rst | ack) == syn accept',
+    '    tcp flags & (fin|syn) == 0x0 drop',
+    '    tcp flags syn accept',
+    '    tcp flags == syn accept',
+    '    tcp dport 22 accept', '  }', '}'].join('\n');
+  const f = flagHits(nft);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0, 1, 2]);
+  assert.match(f[0].title, /`tcp flags & syn == fin` can never match — FIN is tested/);
+  assert.match(f[1].title, /`tcp flags & \(syn\|ack\) == syn\|fin` can never match/);
+  assert.match(f[2].title, /`tcp flags & syn != fin` matches EVERY TCP packet/);
+});
+
+test('parsers: --tcp-flags is a two-argument option (mask, comp, negation); nft records the & mask ==|!= comp form only', () => {
+  const ipt = FS.parse(['*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp ! --tcp-flags FIN,SYN,RST,ACK SYN -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --tcp-flags ALL NONE -j DROP', 'COMMIT'].join('\n'));
+  const [r0, r1] = ipt.tables[0].chains[0].rules;
+  assert.deepEqual(JSON.parse(JSON.stringify([r0.tokens.tcp_flags_mask, r0.tokens.tcp_flags_comp, r0.tokens.tcp_flags_negated])), ['FIN,SYN,RST,ACK', 'SYN', true]);
+  assert.deepEqual(JSON.parse(JSON.stringify([r1.tokens.tcp_flags_mask, r1.tokens.tcp_flags_comp, r1.tokens.tcp_flags_negated])), ['ALL', 'NONE', false]);
+  const nft = FS.parse(['table inet f {', '  chain in {', '    type filter hook input priority 0;',
+    '    tcp flags & (fin | syn) != syn drop', '    tcp flags syn accept', '  }', '}'].join('\n'));
+  const [n0, n1] = nft.tables[0].chains[0].rules;
+  assert.deepEqual(JSON.parse(JSON.stringify([n0.tokens.tcp_flags_mask, n0.tokens.tcp_flags_comp, n0.tokens.tcp_flags_negated])), ['(fin | syn)', 'syn', true]);
+  assert.equal(n1.tokens.tcp_flags_mask, undefined);
+});
+
+test('nat-state-match-dead: a dump with *filter before *nat (the common order) still inspects the nat table (regression: an early return skipped it)', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]', '-A INPUT -p tcp --dport 22 -j ACCEPT', 'COMMIT',
+    '*nat', ':PREROUTING ACCEPT [0:0]', '-A PREROUTING -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT', 'COMMIT'].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'nat-state-match-dead');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.table, x.chain, x.ruleIdx]))), [['nat', 'PREROUTING', 0]]);
 });

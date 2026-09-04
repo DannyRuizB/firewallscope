@@ -147,6 +147,12 @@
     grab(/--to-destination\s+(\S+)/, 'to_destination');
     grab(/--to-source\s+(\S+)/, 'to_source');
     grab(/--to-ports\s+(\S+)/, 'to_ports');
+    // `--tcp-flags MASK COMP` takes TWO arguments: the mask, then the flags
+    // that must be set inside it. iptables-save prints both normalised
+    // (`--syn` becomes `--tcp-flags FIN,SYN,RST,ACK SYN`); the negation
+    // binds to the option, so it is captured with it.
+    const tf = match.match(/(!\s+)?--tcp-flags\s+(\S+)\s+(\S+)/);
+    if (tf) { t.tcp_flags_mask = tf[2]; t.tcp_flags_comp = tf[3]; t.tcp_flags_negated = Boolean(tf[1]); }
     return t;
   }
 

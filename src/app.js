@@ -27,7 +27,8 @@
     dportnoproto: 'samples/iptables-dport-no-proto.txt',
     rejectmismatch: 'samples/iptables-reject-mismatch.txt',
     portwrongproto: 'samples/iptables-port-wrong-proto.txt',
-    natstatedead: 'samples/iptables-nat-state-dead.txt'
+    natstatedead: 'samples/iptables-nat-state-dead.txt',
+    tcpflagsdead: 'samples/iptables-tcp-flags-dead.txt'
   };
 
   const FORMAT_LABELS = {

@@ -106,6 +106,7 @@
     detectRejectTypeMismatch(result, findings);
     detectPortMatchProtocolMismatch(result, findings);
     detectNatStateMatchDead(result, findings);
+    detectTcpFlagsNeverMatch(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -781,7 +782,7 @@
         const inNat = format === 'nftables'
           ? String(chain.type || '').toLowerCase() === 'nat'
           : String(table.name || '').toLowerCase() === 'nat';
-        if (!inNat) return;
+        if (!inNat) continue; // `return` here skipped the nat table whenever filter came first (measured: 0 findings on a filter-first dump)
         chain.rules.forEach((rule, idx) => {
           const t = rule.tokens || {};
           const raw = String(t.ctstate || t.state || '');
@@ -804,6 +805,77 @@
       }
     }
   }
+  // ── tcp-flags-never-match ────────────────────────────────────────────
+  // The kernel evaluates a tcp-flags match as (packet flags AND mask) ==
+  // comp. A flag named in comp but absent from the mask is cleared by the
+  // AND before the comparison, so equality can never hold: the rule is
+  // dead. MEASURED in a NET_ADMIN container (iptables 1.8.11, nft 1.1.3):
+  // every form loads with rc 0 — `--tcp-flags SYN FIN`, `--tcp-flags
+  // SYN,ACK FIN,SYN`, even `--tcp-flags NONE SYN` — and over three TCP
+  // connections the two dead rules counted 0 packets. The negated form is
+  // the mirror image and worse: an impossible test negated is ALWAYS true,
+  // so `! --tcp-flags SYN FIN` matched all 12 packets and shadowed the
+  // correct `--tcp-flags FIN,SYN,RST,ACK SYN` rule and the unconditional
+  // one after it (both at 0). nft accepts `tcp flags & syn == fin` the same
+  // way. The usual shape is an anti-scan block copied from a blog with the
+  // mask narrowed by hand. Correct shapes — comp inside the mask, `ALL
+  // NONE`, `--syn` (printed as `FIN,SYN,RST,ACK SYN`) — are left alone, as
+  // is anything whose flag spelling we cannot read (conservative). ufw
+  // shows no flag matches.
+  const TCP_FLAG_BITS = { fin: 1, syn: 2, rst: 4, psh: 8, ack: 16, urg: 32, ecn: 64, ece: 64, cwr: 128 };
+  function tcpFlagBits(spec) {
+    const s = String(spec || '').trim().replace(/^\(|\)$/g, '').trim();
+    if (!s) return null;
+    if (/^0x[0-9a-f]+$/i.test(s) || /^\d+$/.test(s)) return { bits: Number(s) };
+    let bits = 0;
+    for (const p of s.toLowerCase().split(/[,|\s]+/).filter(Boolean)) {
+      if (p === 'all') bits |= 0x3f;
+      else if (p === 'none') continue;
+      else if (p in TCP_FLAG_BITS) bits |= TCP_FLAG_BITS[p];
+      else return null;
+    }
+    return { bits };
+  }
+  function tcpFlagNames(bits) {
+    const out = [];
+    for (const [n, b] of Object.entries(TCP_FLAG_BITS)) if ((bits & b) && n !== 'ece') out.push(n.toUpperCase());
+    return out;
+  }
+  function detectTcpFlagsNeverMatch(result, findings) {
+    const format = result.format;
+    if (format === 'ufw') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          const t = rule.tokens || {};
+          if (t.tcp_flags_mask === undefined) return;
+          const mask = tcpFlagBits(t.tcp_flags_mask);
+          const comp = tcpFlagBits(t.tcp_flags_comp);
+          if (!mask || !comp) return;
+          const outside = comp.bits & ~mask.bits;
+          if (!outside) return;
+          const names = tcpFlagNames(outside).join('/');
+          const spelled = format === 'nftables'
+            ? `tcp flags & ${t.tcp_flags_mask} ${t.tcp_flags_negated ? '!=' : '=='} ${t.tcp_flags_comp}`
+            : `${t.tcp_flags_negated ? '! ' : ''}--tcp-flags ${t.tcp_flags_mask} ${t.tcp_flags_comp}`;
+          const title = t.tcp_flags_negated
+            ? `\`${spelled}\` matches EVERY TCP packet — ${names} is tested but not in the mask, the test is impossible and its negation is always true: the flag check is a no-op`
+            : `\`${spelled}\` can never match — ${names} is tested but not in the mask, so (flags & mask) == comp is impossible: this rule is dead`;
+          findings.push({
+            id: 'tcp-flags-never-match',
+            severity: 'error',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx,
+            title,
+            details: `The kernel evaluates a tcp-flags match as (packet flags AND mask) == comp. ${names} is named in comp but absent from the mask, so the AND clears it before the comparison and equality can never hold. Measured (iptables 1.8.11 / nft 1.1.3): every such rule loads with rc 0 — \`--tcp-flags SYN FIN\` and \`--tcp-flags SYN,ACK FIN,SYN\` counted 0 packets over three TCP connections, while the negated \`! --tcp-flags SYN FIN\` took all 12 and shadowed every rule after it. ${t.tcp_flags_negated ? 'Negated, this rule applies to every TCP packet that reaches it — a DROP here blackholes TCP, an ACCEPT lets everything through.' : 'If this rule was meant as a guard (an anti-scan DROP, say), that guard does not exist.'} Put the tested flags in the mask — \`--tcp-flags ${format === 'nftables' ? '' : ''}SYN,FIN FIN\` tests FIN with SYN clear — or use the canonical scan patterns (\`--tcp-flags ALL FIN,SYN\`, \`--tcp-flags ALL NONE\`, \`--syn\`).`
+          });
+        });
+      }
+    }
+  }
+
 
   // ── docker-user-unfiltered ─────────────────────────────────────────
   // The most famous iptables surprise of the container era: a published

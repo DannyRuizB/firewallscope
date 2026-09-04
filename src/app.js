@@ -29,7 +29,8 @@
     portwrongproto: 'samples/iptables-port-wrong-proto.txt',
     natstatedead: 'samples/iptables-nat-state-dead.txt',
     tcpflagsdead: 'samples/iptables-tcp-flags-dead.txt',
-    synonudp: 'samples/iptables-syn-on-udp.txt'
+    synonudp: 'samples/iptables-syn-on-udp.txt',
+    icmpontcp: 'samples/iptables-icmp-on-tcp.txt'
   };
 
   const FORMAT_LABELS = {

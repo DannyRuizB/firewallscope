@@ -1,0 +1,15 @@
+# A hand-written iptables-restore file. One line pins an ICMP type under -p tcp
+# ("only let pings through on the web port", copy-pasted and edited): iptables
+# has no --icmp-type without -p icmp, iptables-restore stops there and loads
+# NOTHING (measured: unknown option "--icmp-type", 0 rules). No firewall at boot.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p icmp --icmp-type echo-request -m limit --limit 5/s -j ACCEPT
+# "allow ping to the web service" - the --icmp-type rode along onto the tcp rule
+-A INPUT -p tcp --dport 443 --icmp-type echo-request -j ACCEPT
+-A INPUT -p tcp --dport 22 -j ACCEPT
+COMMIT

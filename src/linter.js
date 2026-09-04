@@ -107,6 +107,7 @@
     detectPortMatchProtocolMismatch(result, findings);
     detectNatStateMatchDead(result, findings);
     detectTcpFlagsNeverMatch(result, findings);
+    detectTcpOptionWithoutTcp(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -875,6 +876,68 @@
       }
     }
   }
+  // ── tcp-option-without-tcp ───────────────────────────────────────────
+  // `--syn`, `--tcp-flags` and `--tcp-option` are options of the tcp match
+  // extension, which only exists once `-p tcp` pulls it in. Under another
+  // protocol, or with no `-p` at all, iptables does not have the option:
+  // MEASURED (iptables 1.8.11): `-p udp --syn`, `-p icmp --syn`, a bare
+  // `--syn`, `-p udp --tcp-flags SYN SYN` and `-p udp --tcp-option 8` all die
+  // with `unknown option "--syn"` (rc 2) — and iptables-restore stops at that
+  // line and loads NOTHING ("Error occurred at line: 4", 0 rules present).
+  // The negated `! -p tcp --syn` loads (measured) and is left alone, as is a
+  // protocol the linter cannot read. nft has the same wall for `tcp flags`:
+  // `udp dport 53 tcp flags syn`, `meta l4proto udp tcp flags syn` and `ip
+  // protocol udp tcp flags syn` are refused with "conflicting transport layer
+  // protocols specified: udp vs. tcp" (nft -c rc 1, the whole file). nft
+  // ACCEPTS `udp dport 53 tcp option maxseg exists` (measured), so only `tcp
+  // flags` is judged there. Rules whose only tcp-ness is `-m tcp` with a port
+  // option belong to port-match-protocol-mismatch and are not repeated here.
+  const TCP_ONLY_OPTION_RE = /(?:^|\s)(--syn|--tcp-flags|--tcp-option)(?=\s|$)/;
+  const NFT_NON_TCP_TRANSPORT_RE = /(?:^|\s)(?:(udp|sctp|dccp|udplite)\s+(?:dport|sport)\b|(?:meta\s+l4proto|ip\s+protocol|ip6\s+nexthdr)\s+(?!!=)(udp|sctp|dccp|udplite|icmp|icmpv6|ipv6-icmp|17|132|33|136|1|58)\b|(icmp|icmpv6)\s+type\b)/;
+  function detectTcpOptionWithoutTcp(result, findings) {
+    const format = result.format;
+    const isIpt = format === 'iptables' || format === 'ip6tables';
+    if (!isIpt && format !== 'nftables') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          const match = String(rule.match || '');
+          const t = rule.tokens || {};
+          const where = { table: table.name, tableFamily: table.family || null, chain: chain.name, ruleIdx: idx };
+          if (isIpt) {
+            const opt = match.match(TCP_ONLY_OPTION_RE);
+            if (!opt) return;
+            if (/(?:^|\s)!\s+-p\s/.test(match)) return; // negated protocol loads (measured)
+            const proto = t.protocol ? String(t.protocol).toLowerCase() : null;
+            if (proto === 'tcp' || proto === '6') return;
+            const spelledProto = proto ? `-p ${proto}` : 'no -p at all';
+            findings.push({
+              id: 'tcp-option-without-tcp',
+              severity: 'error',
+              ...where,
+              title: `\`${opt[1]}\` with ${spelledProto} — a TCP-only option, so this rule will not parse and takes the whole ruleset down with it`,
+              details: `\`${opt[1]}\` belongs to the tcp match extension, which only exists once \`-p tcp\` pulls it in. Measured (iptables 1.8.11): \`-p udp --syn\`, \`-p icmp --syn\`, a bare \`--syn\`, \`-p udp --tcp-flags SYN SYN\` and \`-p udp --tcp-option 8\` all fail with \`unknown option "${opt[1]}"\` (rc 2), and iptables-restore stops at that line and loads NOTHING — the boot ends with no firewall at all. ${proto ? `${proto.toUpperCase()} has no SYN flag to test; if the rule is about TCP, change the protocol; if it is about ${proto}, drop the option.` : 'Add `-p tcp` (the option makes no sense for any other protocol).'}`
+            });
+            return;
+          }
+          // nftables: `tcp flags` alongside a non-tcp transport is refused
+          // ("conflicting transport layer protocols"); `tcp option` is not.
+          if (!/(?:^|\s)tcp\s+flags\b/.test(match)) return;
+          const other = match.match(NFT_NON_TCP_TRANSPORT_RE);
+          if (!other) return;
+          const named = other[1] || other[2] || other[3];
+          findings.push({
+            id: 'tcp-option-without-tcp',
+            severity: 'error',
+            ...where,
+            title: `\`tcp flags\` next to a ${named} transport match — nft refuses the rule ("conflicting transport layer protocols specified: ${named} vs. tcp") and the whole file with it`,
+            details: `A rule can name one transport protocol; \`tcp flags\` pins it to TCP and the ${named} match pins it elsewhere. Measured (nft 1.1.3): \`udp dport 53 tcp flags syn\`, \`meta l4proto udp tcp flags syn\` and \`ip protocol udp tcp flags syn\` are all refused at \`nft -c\` with "conflicting transport layer protocols specified" — nothing loads. Decide which protocol the rule is about and drop the other half.`
+          });
+        });
+      }
+    }
+  }
+
 
 
   // ── docker-user-unfiltered ─────────────────────────────────────────

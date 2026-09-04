@@ -3206,3 +3206,42 @@ test('tcp-option-without-tcp leaves ufw alone and does not duplicate port-match-
     'COMMIT'].join('\n');
   assert.equal(tcpOptHits(rs).length, 0);
 });
+
+// --- shadowed-rule vs. header-content matches ------------------------------------
+// Measured: the tcp-flags sample produced six shadowed-rule findings, all "shadowed
+// by" a dead --tcp-flags DROP that cannot match any of them. A flags/option/icmp-type
+// match is a packet-space dimension the 5-dimension model does not see, so such
+// rules are not comparable - like -i/-o or -m limit already were.
+
+test('shadowed-rule: a --tcp-flags / --syn / --tcp-option / --icmp-type rule neither shadows nor is shadowed (not comparable)', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp -m tcp --tcp-flags SYN,ACK FIN,SYN,RST,PSH,ACK,URG -j DROP',
+    '-A INPUT -p tcp -m tcp --syn -m limit --limit 25/s -j ACCEPT',
+    '-A INPUT -p tcp -m tcp --tcp-option 8 -j DROP',
+    '-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT',
+    '-A INPUT -p icmp --icmp-type echo-request -j ACCEPT',
+    '-A INPUT -p icmp -j DROP',
+    '-A INPUT -p tcp -j DROP',
+    '-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT',
+    'COMMIT'].join('\n');
+  const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'shadowed-rule');
+  // Only the genuine one survives: rule #8 (tcp/443) after the plain `-p tcp -j DROP`.
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.ruleIdx, x.shadowedBy]))), [[7, 6]]);
+});
+
+test('shadowed-rule (nft): tcp flags / tcp option / icmp type rules are not comparable either', () => {
+  const nft = ['table inet f {', '  chain in {', '    type filter hook input priority 0;',
+    '    tcp flags & (fin|syn) == fin|syn drop',
+    '    tcp dport 22 accept',
+    '    icmp type echo-request accept',
+    '    ip protocol icmp drop',
+    '    tcp dport 80 drop',
+    '    tcp dport 80 accept', '  }', '}'].join('\n');
+  const f = FS.lint(FS.parse(nft)).findings.filter((x) => x.id === 'shadowed-rule');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.ruleIdx, x.shadowedBy]))), [[5, 4]]);
+});
+
+test('shadowed-rule: the tcp-flags sample no longer reports the dead DROP as shadowing the rules after it (was 6)', () => {
+  const f = FS.lint(FS.parse(sample('iptables-tcp-flags-dead.txt'))).findings.filter((x) => x.id === 'shadowed-rule');
+  assert.equal(f.length, 0);
+});

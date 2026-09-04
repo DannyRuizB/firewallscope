@@ -1,0 +1,18 @@
+# A hand-written iptables-restore file ("firewall.rules" in /etc, loaded at
+# boot). One line carries a TCP-only option under -p udp: iptables does not
+# have the option there, iptables-restore stops at that line and loads NOTHING
+# (measured: "unknown option --syn", "Error occurred at line: N", 0 rules).
+# The boot ends with no firewall at all.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+# "rate-limit new connections" - copied from a TCP rule and changed to udp for DNS
+-A INPUT -p udp --dport 53 --syn -m limit --limit 25/s --limit-burst 50 -j ACCEPT
+-A INPUT -p tcp --syn -m limit --limit 25/s --limit-burst 50 -j ACCEPT
+-A INPUT -p tcp --dport 22 -j ACCEPT
+-A INPUT -p tcp --dport 443 -j ACCEPT
+COMMIT

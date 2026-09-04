@@ -38,6 +38,7 @@ const EXPECTED = {
   'iptables-port-wrong-proto.txt': ['port-match-protocol-mismatch'],
   'iptables-nat-state-dead.txt': ['nat-state-match-dead'],
   'iptables-tcp-flags-dead.txt': ['tcp-flags-never-match'],
+  'iptables-syn-on-udp.txt': ['tcp-option-without-tcp'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -107,6 +108,7 @@ const ALL_SMELLS = [
   'port-match-protocol-mismatch',
   'nat-state-match-dead',
   'tcp-flags-never-match',
+  'tcp-option-without-tcp',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3147,4 +3149,60 @@ test('nat-state-match-dead: a dump with *filter before *nat (the common order) s
     '*nat', ':PREROUTING ACCEPT [0:0]', '-A PREROUTING -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT', 'COMMIT'].join('\n');
   const f = FS.lint(FS.parse(rs)).findings.filter((x) => x.id === 'nat-state-match-dead');
   assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.table, x.chain, x.ruleIdx]))), [['nat', 'PREROUTING', 0]]);
+});
+
+// --- tcp-option-without-tcp --------------------------------------------------
+// Measured (iptables 1.8.11 / nft 1.1.3): --syn/--tcp-flags/--tcp-option under
+// a non-tcp -p (or none) die with `unknown option` and iptables-restore loads
+// NOTHING; nft refuses `tcp flags` next to a udp/icmp match ("conflicting
+// transport layer protocols") but accepts `tcp option` there.
+
+function tcpOptHits(text) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'tcp-option-without-tcp');
+}
+
+test('tcp-option-without-tcp: --syn / --tcp-flags / --tcp-option under -p udp, -p icmp or no -p are errors that name the option and the protocol', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p udp --syn -j DROP',
+    '-A INPUT --syn -j DROP',
+    '-A INPUT -p icmp --tcp-flags SYN SYN -j DROP',
+    '-A INPUT -p udp --dport 53 --tcp-option 8 -j DROP',
+    '-A INPUT -p tcp --syn -j ACCEPT',
+    '-A INPUT -p 6 --tcp-flags FIN,SYN,RST,ACK SYN -j ACCEPT',
+    '-A INPUT ! -p tcp --syn -j DROP',
+    '-A INPUT -p tcp --dport 22 -j ACCEPT',
+    'COMMIT'].join('\n');
+  const f = tcpOptHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0, 1, 2, 3]);
+  for (const x of f) assert.equal(x.severity, 'error');
+  assert.match(f[0].title, /`--syn` with -p udp — a TCP-only option/);
+  assert.match(f[1].title, /`--syn` with no -p at all/);
+  assert.match(f[2].title, /`--tcp-flags` with -p icmp/);
+  assert.match(f[3].title, /`--tcp-option` with -p udp/);
+  assert.match(f[0].details, /loads NOTHING/);
+  assert.match(f[1].details, /Add `-p tcp`/);
+});
+
+test('tcp-option-without-tcp (nft): tcp flags next to a udp/icmp transport fires, tcp option does not (measured accepted), tcp-only rules are fine', () => {
+  const nft = ['table inet f {', '  chain in {', '    type filter hook input priority 0;',
+    '    udp dport 53 tcp flags syn drop',
+    '    meta l4proto udp tcp flags syn drop',
+    '    ip protocol udp tcp flags & (fin|syn) == syn drop',
+    '    icmp type echo-request tcp flags syn drop',
+    '    udp dport 53 tcp option maxseg exists drop',
+    '    tcp dport 22 tcp flags syn accept',
+    '    tcp flags syn accept',
+    '    meta l4proto tcp tcp flags syn accept', '  }', '}'].join('\n');
+  const f = tcpOptHits(nft);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0, 1, 2, 3]);
+  assert.match(f[0].title, /`tcp flags` next to a udp transport match — nft refuses the rule/);
+  assert.match(f[3].title, /next to a icmp transport match/);
+  assert.match(f[0].details, /conflicting transport layer protocols specified/);
+});
+
+test('tcp-option-without-tcp leaves ufw alone and does not duplicate port-match-protocol-mismatch (-m tcp with -p udp and a port is theirs)', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p udp -m tcp --dport 53 -j ACCEPT',
+    'COMMIT'].join('\n');
+  assert.equal(tcpOptHits(rs).length, 0);
 });

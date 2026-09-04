@@ -39,6 +39,7 @@ const EXPECTED = {
   'iptables-nat-state-dead.txt': ['nat-state-match-dead'],
   'iptables-tcp-flags-dead.txt': ['tcp-flags-never-match'],
   'iptables-syn-on-udp.txt': ['tcp-option-without-tcp'],
+  'iptables-icmp-on-tcp.txt': ['icmp-match-without-icmp'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -109,6 +110,7 @@ const ALL_SMELLS = [
   'nat-state-match-dead',
   'tcp-flags-never-match',
   'tcp-option-without-tcp',
+  'icmp-match-without-icmp',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3244,4 +3246,54 @@ test('shadowed-rule (nft): tcp flags / tcp option / icmp type rules are not comp
 test('shadowed-rule: the tcp-flags sample no longer reports the dead DROP as shadowing the rules after it (was 6)', () => {
   const f = FS.lint(FS.parse(sample('iptables-tcp-flags-dead.txt'))).findings.filter((x) => x.id === 'shadowed-rule');
   assert.equal(f.length, 0);
+});
+
+// --- icmp-match-without-icmp -------------------------------------------------
+// Measured (iptables 1.8.11 / nft 1.1.3): --icmp-type under a non-icmp -p (or
+// none) dies (unknown option / Invalid argument) and iptables-restore loads
+// nothing; nft refuses `icmp type` next to a tcp/udp match.
+
+function icmpHits(text) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'icmp-match-without-icmp');
+}
+
+test('icmp-match-without-icmp: --icmp-type under -p tcp / -p udp / no -p is an error naming the option and protocol; under -p icmp it is fine', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --icmp-type echo-request -j DROP',
+    '-A INPUT -p udp -m icmp --icmp-type 8 -j DROP',
+    '-A INPUT --icmp-type echo-request -j DROP',
+    '-A INPUT -p icmp --icmp-type echo-request -j ACCEPT',
+    '-A INPUT -p icmp -m icmp --icmp-type 8 -j ACCEPT',
+    '-A INPUT ! -p icmp --icmp-type echo-request -j DROP',
+    '-A INPUT -p tcp --dport 22 -j ACCEPT',
+    'COMMIT'].join('\n');
+  const f = icmpHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0, 1, 2]);
+  for (const x of f) assert.equal(x.severity, 'error');
+  assert.match(f[0].title, /`--icmp-type` with -p tcp — an ICMP-only option/);
+  assert.match(f[2].title, /`--icmp-type` with no -p at all/);
+  assert.match(f[0].details, /loads NOTHING/);
+});
+
+test('icmp-match-without-icmp (ip6tables): --icmpv6-type needs -p ipv6-icmp', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]',
+    '-A INPUT -p tcp --icmpv6-type echo-request -j DROP',
+    '-A INPUT -p ipv6-icmp --icmpv6-type echo-request -j ACCEPT',
+    'COMMIT'].join('\n');
+  const f = FS.lint(FS.parse(rs, 'ip6tables')).findings.filter((x) => x.id === 'icmp-match-without-icmp');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0]);
+  assert.match(f[0].title, /`--icmpv6-type` with -p tcp/);
+});
+
+test('icmp-match-without-icmp (nft): icmp type next to a tcp/udp transport fires, a lone icmp type does not', () => {
+  const nft = ['table inet f {', '  chain in {', '    type filter hook input priority 0;',
+    '    tcp dport 22 icmp type echo-request drop',
+    '    meta l4proto tcp icmp type echo-request drop',
+    '    icmp type echo-request accept',
+    '    icmpv6 type echo-request accept',
+    '    udp dport 53 icmpv6 type nd-neighbor-solicit drop', '  }', '}'].join('\n');
+  const f = icmpHits(nft);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0, 1, 4]);
+  assert.match(f[0].title, /`icmp type` next to a tcp transport match/);
+  assert.match(f[2].title, /`icmpv6 type` next to a udp transport match/);
 });

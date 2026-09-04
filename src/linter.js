@@ -108,6 +108,7 @@
     detectNatStateMatchDead(result, findings);
     detectTcpFlagsNeverMatch(result, findings);
     detectTcpOptionWithoutTcp(result, findings);
+    detectIcmpMatchWithoutIcmp(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -937,6 +938,69 @@
       }
     }
   }
+  // ── icmp-match-without-icmp ──────────────────────────────────────────
+  // The ICMP sibling of tcp-option-without-tcp: `--icmp-type` (iptables) and
+  // `--icmpv6-type` (ip6tables) belong to the icmp / icmp6 match, which only
+  // exists under `-p icmp` / `-p ipv6-icmp`. Under any other protocol, or no
+  // `-p`, iptables refuses the line and iptables-restore loads NOTHING.
+  // MEASURED (iptables 1.8.11): `-p tcp --icmp-type echo-request` and
+  // `-p udp --icmp-type echo-request` die with `unknown option "--icmp-type"`
+  // (rc 2); `-p tcp -m icmp --icmp-type 8` dies with `Invalid argument`
+  // (rc 1). `-p icmp --icmp-type echo-request` loads. nft has the same wall:
+  // `tcp dport 22 icmp type echo-request` and `meta l4proto tcp icmp type
+  // echo-request` are refused at `nft -c` with "conflicting transport layer
+  // protocols specified: tcp vs. icmp"; a lone `icmp type echo-request`
+  // loads. The negated `! -p icmp` form and unreadable protocols are left
+  // alone (the tcp-option-without-tcp trade).
+  const ICMP_OPT_RE = /(?:^|\s)(--icmp-type|--icmpv6-type)(?=\s|$)/;
+  const ICMP_PROTO = { '--icmp-type': new Set(['icmp', '1']), '--icmpv6-type': new Set(['ipv6-icmp', 'icmpv6', '58']) };
+  const NFT_NON_ICMP_TRANSPORT_RE = /(?:^|\s)(?:(tcp|udp|sctp|dccp|udplite)\s+(?:dport|sport)\b|(?:meta\s+l4proto|ip\s+protocol|ip6\s+nexthdr)\s+(?!!=)(tcp|udp|sctp|dccp|udplite|6|17|132|33|136)\b)/;
+  function detectIcmpMatchWithoutIcmp(result, findings) {
+    const format = result.format;
+    const isIpt = format === 'iptables' || format === 'ip6tables';
+    if (!isIpt && format !== 'nftables') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          const match = String(rule.match || '');
+          const t = rule.tokens || {};
+          const where = { table: table.name, tableFamily: table.family || null, chain: chain.name, ruleIdx: idx };
+          if (isIpt) {
+            const opt = match.match(ICMP_OPT_RE);
+            if (!opt) return;
+            if (/(?:^|\s)!\s+-p\s/.test(match)) return;
+            const proto = t.protocol ? String(t.protocol).toLowerCase() : null;
+            if (proto && ICMP_PROTO[opt[1]].has(proto)) return;
+            const spelledProto = proto ? `-p ${proto}` : 'no -p at all';
+            const want = opt[1] === '--icmp-type' ? '-p icmp' : '-p ipv6-icmp';
+            findings.push({
+              id: 'icmp-match-without-icmp',
+              severity: 'error',
+              ...where,
+              title: `\`${opt[1]}\` with ${spelledProto} — an ICMP-only option, so this rule will not parse and takes the whole ruleset down with it`,
+              details: `\`${opt[1]}\` belongs to the icmp match extension, which only exists under \`${want}\`. Measured (iptables 1.8.11): \`-p tcp --icmp-type echo-request\` dies with \`unknown option "--icmp-type"\` (rc 2) and \`-p tcp -m icmp --icmp-type 8\` with \`Invalid argument\` (rc 1); iptables-restore stops at that line and loads NOTHING — the boot ends with no firewall. ${proto ? `${proto.toUpperCase()} has no ICMP types; if the rule is about ICMP, change the protocol to ${want.slice(3)}; if it is about ${proto}, drop the option.` : `Add \`${want}\`.`}`
+            });
+            return;
+          }
+          // nftables: `icmp type` / `icmpv6 type` next to a non-icmp transport
+          // is refused ("conflicting transport layer protocols").
+          const nftIcmp = match.match(/(?:^|\s)(icmpv6|icmp)\s+type\b/);
+          if (!nftIcmp) return;
+          const other = match.match(NFT_NON_ICMP_TRANSPORT_RE);
+          if (!other) return;
+          const named = other[1] || other[2];
+          findings.push({
+            id: 'icmp-match-without-icmp',
+            severity: 'error',
+            ...where,
+            title: `\`${nftIcmp[1]} type\` next to a ${named} transport match — nft refuses the rule ("conflicting transport layer protocols specified: ${named} vs. ${nftIcmp[1]}") and the whole file with it`,
+            details: `A rule can name one transport protocol; \`${nftIcmp[1]} type\` pins it to ${nftIcmp[1]} and the ${named} match pins it elsewhere. Measured (nft 1.1.3): \`tcp dport 22 icmp type echo-request\` and \`meta l4proto tcp icmp type echo-request\` are refused at \`nft -c\` with "conflicting transport layer protocols specified". Decide which protocol the rule is about and drop the other half.`
+          });
+        });
+      }
+    }
+  }
+
 
 
 

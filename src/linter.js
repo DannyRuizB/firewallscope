@@ -109,6 +109,7 @@
     detectTcpFlagsNeverMatch(result, findings);
     detectTcpOptionWithoutTcp(result, findings);
     detectIcmpMatchWithoutIcmp(result, findings);
+    detectInterfaceMatchWrongDirection(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -1002,6 +1003,88 @@
   }
 
 
+
+
+
+  // ── interface-match-wrong-direction ──────────────────────────────────
+  // A packet only has an INPUT interface where it arrived on one, and an
+  // OUTPUT interface once routing has picked one. Netfilter's hooks are not
+  // symmetric about that, and the two front-ends disagree about what to do
+  // with a rule that asks anyway.
+  //
+  // MEASURED, iptables 1.8.11 (nf_tables backend), every built-in chain of
+  // filter/nat/mangle/raw:
+  //   filter/INPUT -o, nat|mangle|raw/PREROUTING -o  -> refused:
+  //     "Can't use --out-interface with INPUT / PREROUTING"
+  //   filter|nat|raw/OUTPUT -i, nat|mangle/POSTROUTING -i  -> refused:
+  //     "Can't use --in-interface with OUTPUT / POSTROUTING"
+  // and iptables-restore stops at that line: `iptables -S OUTPUT` shows 0
+  // rules loaded. Same class as tcp-option-without-tcp and
+  // icmp-match-without-icmp — one typo, no firewall at all after the boot.
+  //
+  // MEASURED, nft 1.1.x: every combination is ACCEPTED. The rule loads and
+  // is simply dead, which is worse than an error because nothing says so.
+  // With one HTTP request through the box, the counters read:
+  //   input hook:       iifname eth0 = 5 pkts,  oifname eth0 = 0
+  //   prerouting hook:  iifname eth0 = 5 pkts,  oifname eth0 = 0
+  //   output hook:      iifname eth0 = 0,       oifname eth0 = 7 pkts
+  //   postrouting hook: iifname eth0 = 0,       oifname eth0 = 7 pkts
+  // Three of those zeros are structural: at input the packet is already
+  // home, at prerouting the route has not been chosen yet, and a locally
+  // generated packet entered on no interface at all. The fourth is NOT —
+  // `iifname` at postrouting is the standard NAT idiom for FORWARDED
+  // traffic (`iifname "wg0" oifname "eth0" masquerade`), which this box
+  // simply wasn't doing, so postrouting is deliberately left alone.
+  const IPT_NO_IFACE_IN = new Set(['OUTPUT', 'POSTROUTING']);
+  const IPT_NO_IFACE_OUT = new Set(['INPUT', 'PREROUTING']);
+  const NFT_NO_IFACE_IN = new Set(['output']);
+  const NFT_NO_IFACE_OUT = new Set(['input', 'prerouting']);
+  function detectInterfaceMatchWrongDirection(result, findings) {
+    const format = result.format;
+    const isIpt = format === 'iptables' || format === 'ip6tables';
+    if (!isIpt && format !== 'nftables') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        // A user-defined chain can be jumped to from any hook, so which
+        // interfaces exist there is unknowable from the paste alone.
+        if (!chain.builtIn) continue;
+        const hook = isIpt ? String(chain.name || '').toUpperCase() : String(chain.hook || '');
+        const noIn = isIpt ? IPT_NO_IFACE_IN.has(hook) : NFT_NO_IFACE_IN.has(hook);
+        const noOut = isIpt ? IPT_NO_IFACE_OUT.has(hook) : NFT_NO_IFACE_OUT.has(hook);
+        if (!noIn && !noOut) continue;
+        chain.rules.forEach((rule, idx) => {
+          const t = rule.tokens || {};
+          const dead = noIn ? (t.iface_in ? 'in' : null) : (t.iface_out ? 'out' : null);
+          if (!dead) return;
+          const iface = dead === 'in' ? t.iface_in : t.iface_out;
+          const spelled = isIpt
+            ? `${dead === 'in' ? '-i' : '-o'} ${iface}`
+            : `${dead === 'in' ? 'iifname' : 'oifname'} "${iface}"`;
+          const why = dead === 'in'
+            ? (hook === 'OUTPUT' || hook === 'output'
+              ? 'a locally generated packet entered on no interface at all'
+              : 'the incoming interface is not part of what this hook decides')
+            : (hook === 'INPUT' || hook === 'input'
+              ? 'a packet delivered to this host never leaves it, so it has no outgoing interface'
+              : 'routing has not run yet at this hook, so no outgoing interface has been chosen');
+          findings.push({
+            id: 'interface-match-wrong-direction',
+            severity: isIpt ? 'error' : 'warning',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx,
+            title: isIpt
+              ? `\`${spelled}\` in ${hook} — iptables refuses this line and the whole ruleset with it`
+              : `\`${spelled}\` in ${/^[aeiou]/.test(hook) ? 'an' : 'a'} ${hook}-hook chain — the rule loads and can never match`,
+            details: isIpt
+              ? `Measured (iptables 1.8.11): \`iptables -A ${hook} ${spelled} -j ACCEPT\` is refused with "Can't use --${dead === 'in' ? 'in' : 'out'}-interface with ${hook}" — ${why}. In a saved ruleset that is worse than a dead rule: \`iptables-restore\` stops at the offending line and loads NOTHING, so the boot that replays this file ends with no firewall at all. ${dead === 'in' ? 'Match the outgoing interface here (`-o`), or move the rule to a chain that sees the arrival (INPUT / FORWARD / PREROUTING).' : 'Match the incoming interface here (`-i`), or move the rule to a chain that sees the departure (OUTPUT / FORWARD / POSTROUTING).'}`
+              : `nft accepts the rule — and then it never matches, because ${why}. Measured (nft 1.1.x) with one HTTP request through the box: in ${/^[aeiou]/.test(hook) ? 'an' : 'a'} ${hook}-hook chain \`${dead === 'in' ? 'iifname' : 'oifname'}\` counted 0 packets while its opposite counted every one of them. A dead \`accept\` under a deny policy is a service that looks configured and is unreachable; a dead \`drop\` is a hole. Use \`${dead === 'in' ? 'oifname' : 'iifname'}\` here, or move the rule to the hook that sees that side. (\`iifname\` in a postrouting chain is a different case and not flagged: it is the standard idiom for FORWARDED traffic.)`
+          });
+        });
+      }
+    }
+  }
 
 
   // ── docker-user-unfiltered ─────────────────────────────────────────

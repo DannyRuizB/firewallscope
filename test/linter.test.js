@@ -40,6 +40,7 @@ const EXPECTED = {
   'iptables-tcp-flags-dead.txt': ['tcp-flags-never-match'],
   'iptables-syn-on-udp.txt': ['tcp-option-without-tcp'],
   'iptables-icmp-on-tcp.txt': ['icmp-match-without-icmp'],
+  'iptables-iface-wrong-chain.txt': ['interface-match-wrong-direction'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -111,6 +112,7 @@ const ALL_SMELLS = [
   'tcp-flags-never-match',
   'tcp-option-without-tcp',
   'icmp-match-without-icmp',
+  'interface-match-wrong-direction',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3296,4 +3298,79 @@ test('icmp-match-without-icmp (nft): icmp type next to a tcp/udp transport fires
   assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => x.ruleIdx))), [0, 1, 4]);
   assert.match(f[0].title, /`icmp type` next to a tcp transport match/);
   assert.match(f[2].title, /`icmpv6 type` next to a udp transport match/);
+});
+
+
+// --- interface-match-wrong-direction ----------------------------------------
+// Measured (iptables 1.8.11): `-o` in INPUT/PREROUTING and `-i` in
+// OUTPUT/POSTROUTING are refused ("Can't use --out-interface with INPUT"),
+// and iptables-restore loads nothing. Measured (nft 1.1.x): every
+// combination is ACCEPTED and simply never matches — one HTTP request
+// through the box left `oifname` at the input hook and `iifname` at the
+// output hook on 0 packets while their opposites counted every one.
+
+function ifaceHits(text) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'interface-match-wrong-direction');
+}
+
+test('interface-match-wrong-direction (iptables): -o in INPUT and -i in OUTPUT are errors; FORWARD takes both and the right-way-round rules are fine', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]', ':FORWARD DROP [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A INPUT -o eth0 -p tcp --dport 22 -j ACCEPT',
+    '-A INPUT -i eth0 -p tcp --dport 443 -j ACCEPT',
+    '-A FORWARD -i eth1 -o eth0 -j ACCEPT',
+    '-A OUTPUT -i eth0 -j ACCEPT',
+    '-A OUTPUT -o eth0 -j ACCEPT',
+    'COMMIT'].join('\n');
+  const f = ifaceHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.chain, x.ruleIdx]))), [['INPUT', 0], ['OUTPUT', 0]]);
+  for (const x of f) assert.equal(x.severity, 'error');
+  assert.match(f[0].title, /`-o eth0` in INPUT/);
+  assert.match(f[0].details, /Can't use --out-interface with INPUT/);
+  assert.match(f[0].details, /loads NOTHING/);
+  assert.match(f[1].title, /`-i eth0` in OUTPUT/);
+});
+
+test('interface-match-wrong-direction (iptables): the nat/mangle hooks follow the same rule — -o in PREROUTING, -i in POSTROUTING', () => {
+  const rs = ['*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]',
+    '-A PREROUTING -o eth0 -p tcp --dport 80 -j DNAT --to-destination 10.0.0.5:80',
+    '-A PREROUTING -i eth0 -p tcp --dport 443 -j DNAT --to-destination 10.0.0.5:443',
+    '-A POSTROUTING -i eth1 -j MASQUERADE',
+    '-A POSTROUTING -o eth0 -j MASQUERADE',
+    'COMMIT'].join('\n');
+  const f = ifaceHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.chain, x.ruleIdx]))), [['PREROUTING', 0], ['POSTROUTING', 0]]);
+  assert.match(f[1].details, /Can't use --in-interface with POSTROUTING/);
+});
+
+test('interface-match-wrong-direction (nft): oifname at input and iifname at output are dead rules, postrouting iifname (forwarded traffic) is not', () => {
+  const rs = ['table inet f {',
+    '\tchain input {',
+    '\t\ttype filter hook input priority filter; policy drop;',
+    '\t\tiifname "eth0" accept',
+    '\t\toifname "eth0" tcp dport 22 accept',
+    '\t}',
+    '\tchain output {',
+    '\t\ttype filter hook output priority filter; policy accept;',
+    '\t\tiifname "eth0" accept',
+    '\t}',
+    '\tchain postrouting {',
+    '\t\ttype nat hook postrouting priority srcnat; policy accept;',
+    '\t\tiifname "wg0" oifname "eth0" masquerade',
+    '\t}',
+    '}', ''].join('\n');
+  const f = ifaceHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.chain, x.ruleIdx]))), [['input', 1], ['output', 0]]);
+  for (const x of f) assert.equal(x.severity, 'warning');
+  assert.match(f[0].title, /in an input-hook chain — the rule loads and can never match/);
+  assert.match(f[0].details, /counted 0 packets/);
+  assert.match(f[1].details, /postrouting chain is a different case/);
+});
+
+test('interface-match-wrong-direction: a user-defined chain is left alone (it can be jumped to from any hook)', () => {
+  const rs = ['*filter', ':INPUT DROP [0:0]', ':OUTPUT ACCEPT [0:0]', ':MYCHAIN - [0:0]',
+    '-A INPUT -j MYCHAIN',
+    '-A MYCHAIN -o eth0 -j ACCEPT',
+    '-A MYCHAIN -i eth0 -j ACCEPT',
+    'COMMIT'].join('\n');
+  assert.equal(ifaceHits(rs).length, 0);
 });

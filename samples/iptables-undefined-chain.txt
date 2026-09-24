@@ -1,0 +1,34 @@
+# A hand-written /etc/iptables/rules.v4, refactored into per-service chains -
+# and three of the jumps point at chains this *filter never declares. Every
+# one of them makes iptables-restore refuse the file (measured, iptables
+# 1.8.11, both backends: "Chain 'accept' does not exist"). Measured on THIS
+# file: rc 2, the *nat section above (COMMITted first) loads, *filter loads
+# nothing and INPUT stays at policy ACCEPT - the box boots open. And
+# `iptables-restore --test` with the default nf_tables backend returns 0 for
+# it (measured): the dry run blesses the file.
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:PORTFWD - [0:0]
+-A PREROUTING -j PORTFWD
+COMMIT
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:WEB_IN - [0:0]
+-A INPUT -i lo -j accept
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p tcp --dport 443 -j WEB_IN
+# the ssh chain was renamed to SSH_ALLOW in one place and not the other
+-A INPUT -p tcp --dport 22 -j SSH_IN
+# PORTFWD lives in *nat: chains are per table
+-A FORWARD -j PORTFWD
+-A WEB_IN -j ACCEPT
+# LOGDROP was never declared: appending does not create a chain
+-A LOGDROP -j LOG --log-prefix "DROP: " --log-level 4
+-A LOGDROP -j DROP
+-A INPUT -j LOGDROP
+COMMIT

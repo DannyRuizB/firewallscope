@@ -7,7 +7,15 @@
     'REDIRECT', 'NETMAP', 'TPROXY', 'NOTRACK', 'AUDIT', 'CT',
     'CHECKSUM', 'CLASSIFY', 'CLUSTERIP', 'DSCP', 'ECN', 'HMARK',
     'IDLETIMER', 'LED', 'RATEEST', 'SECMARK', 'SET', 'TCPMSS',
-    'TCPOPTSTRIP', 'TEE', 'TRACE'
+    'TCPOPTSTRIP', 'TEE', 'TRACE',
+    // The rest of the in-tree extension targets, read off iptables 1.8.11's
+    // xtables directory (lib{xt,ipt,ip6t}_UPPERCASE.so) — without them a
+    // `-j NFQUEUE` read as a jump to a user chain.
+    'CONNSECMARK', 'DNPT', 'HL', 'NAT', 'NFQUEUE', 'SNPT', 'SYNPROXY', 'ULOG',
+    // Common xtables-addons targets (out of tree, but real on the boxes that
+    // install them).
+    'TARPIT', 'CHAOS', 'DELUDE', 'ECHO', 'IPMARK', 'LOGMARK', 'SYSRQ',
+    'STEAL', 'ACCOUNT', 'DHCPMAC', 'DNETMAP', 'RAWDNAT', 'RAWSNAT'
   ]);
 
   function parseIptablesSave(text, formatLabel) {
@@ -44,13 +52,17 @@
           const name = m[1];
           const policyTok = m[2];
           const policy = policyTok === '-' ? null : policyTok;
-          if (!current.chains.find(c => c.name === name)) {
+          const existing = current.chains.find(c => c.name === name);
+          if (!existing) {
             current.chains.push({
               name,
               policy,
               builtIn: policy !== null,
+              declared: true,
               rules: []
             });
+          } else {
+            existing.declared = true;
           }
         } else {
           warnings.push(`Line ${i + 1}: malformed chain declaration — "${raw}"`);
@@ -60,8 +72,11 @@
 
       if (line.startsWith('-N ')) {
         const name = line.split(/\s+/)[1];
-        if (!current.chains.find(c => c.name === name)) {
-          current.chains.push({ name, policy: null, builtIn: false, rules: [] });
+        const existing = current.chains.find(c => c.name === name);
+        if (!existing) {
+          current.chains.push({ name, policy: null, builtIn: false, declared: true, rules: [] });
+        } else {
+          existing.declared = true;
         }
         continue;
       }
@@ -71,7 +86,9 @@
         const chainName = tokens[1];
         let chain = current.chains.find(c => c.name === chainName);
         if (!chain) {
-          chain = { name: chainName, policy: null, builtIn: false, rules: [] };
+          // Created by its first -A: nothing declared it (no `:NAME` line, no
+          // -N). iptables-restore refuses that — jump-to-undefined-chain.
+          chain = { name: chainName, policy: null, builtIn: false, declared: false, rules: [] };
           current.chains.push(chain);
         }
         const rest = tokens.slice(2).join(' ');

@@ -41,6 +41,7 @@ const EXPECTED = {
   'iptables-syn-on-udp.txt': ['tcp-option-without-tcp'],
   'iptables-icmp-on-tcp.txt': ['icmp-match-without-icmp'],
   'iptables-iface-wrong-chain.txt': ['interface-match-wrong-direction'],
+  'iptables-undefined-chain.txt': ['jump-to-undefined-chain'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -113,6 +114,7 @@ const ALL_SMELLS = [
   'tcp-option-without-tcp',
   'icmp-match-without-icmp',
   'interface-match-wrong-direction',
+  'jump-to-undefined-chain',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3183,7 +3185,7 @@ test('tcp-option-without-tcp: --syn / --tcp-flags / --tcp-option under -p udp, -
   assert.match(f[1].title, /`--syn` with no -p at all/);
   assert.match(f[2].title, /`--tcp-flags` with -p icmp/);
   assert.match(f[3].title, /`--tcp-option` with -p udp/);
-  assert.match(f[0].details, /loads NOTHING/);
+  assert.match(f[0].details, /load NOTHING .*INPUT at ACCEPT/);
   assert.match(f[1].details, /Add `-p tcp`/);
 });
 
@@ -3274,7 +3276,7 @@ test('icmp-match-without-icmp: --icmp-type under -p tcp / -p udp / no -p is an e
   for (const x of f) assert.equal(x.severity, 'error');
   assert.match(f[0].title, /`--icmp-type` with -p tcp — an ICMP-only option/);
   assert.match(f[2].title, /`--icmp-type` with no -p at all/);
-  assert.match(f[0].details, /loads NOTHING/);
+  assert.match(f[0].details, /load NOTHING .*INPUT at ACCEPT/);
 });
 
 test('icmp-match-without-icmp (ip6tables): --icmpv6-type needs -p ipv6-icmp', () => {
@@ -3326,7 +3328,7 @@ test('interface-match-wrong-direction (iptables): -o in INPUT and -i in OUTPUT a
   for (const x of f) assert.equal(x.severity, 'error');
   assert.match(f[0].title, /`-o eth0` in INPUT/);
   assert.match(f[0].details, /Can't use --out-interface with INPUT/);
-  assert.match(f[0].details, /loads NOTHING/);
+  assert.match(f[0].details, /load NOTHING .*INPUT at ACCEPT/);
   assert.match(f[1].title, /`-i eth0` in OUTPUT/);
 });
 
@@ -3373,4 +3375,73 @@ test('interface-match-wrong-direction: a user-defined chain is left alone (it ca
     '-A MYCHAIN -i eth0 -j ACCEPT',
     'COMMIT'].join('\n');
   assert.equal(ifaceHits(rs).length, 0);
+});
+
+
+// --- jump-to-undefined-chain ------------------------------------------------
+// Measured (iptables 1.8.11, nf_tables AND legacy backends): a jump to a chain
+// the table does not declare, a lowercase `-j accept`, a jump to a chain of
+// ANOTHER table and an -A to an undeclared chain are all refused, 0 rules
+// loaded. `iptables-restore --test` (nf_tables) returned 0 for all four.
+// Measured (nft 1.1.3): `jump` to a missing chain -> "Could not process rule".
+
+function undefHits(text) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'jump-to-undefined-chain');
+}
+const FILTER_HEAD = ['*filter', ':INPUT DROP [0:0]', ':FORWARD DROP [0:0]', ':OUTPUT ACCEPT [0:0]'];
+
+test('jump-to-undefined-chain (iptables): a jump to an undeclared chain is an error; a declared one and every built-in target are fine', () => {
+  const rs = [...FILTER_HEAD, ':WEB - [0:0]',
+    '-A INPUT -p tcp --dport 80 -j WEB',
+    '-A INPUT -p tcp --dport 22 -j SSH_IN',
+    '-A INPUT -j NFQUEUE --queue-num 0',
+    '-A INPUT -p tcp --dport 25 -j SYNPROXY --mss 1460',
+    '-A INPUT -j RETURN',
+    '-A WEB -j ACCEPT', 'COMMIT'].join('\n');
+  const f = undefHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.chain, x.ruleIdx]))), [['INPUT', 1]]);
+  assert.equal(f[0].severity, 'error');
+  assert.match(f[0].title, /`-j SSH_IN` — no chain SSH_IN in \*filter/);
+  assert.match(f[0].details, /every table after it in the file load NOTHING/);
+  assert.match(f[0].details, /--test` does NOT catch this with the nf_tables backend/);
+});
+
+test('jump-to-undefined-chain (iptables): targets are case-sensitive — `-j accept` names a chain and gets the hint', () => {
+  const f = undefHits([...FILTER_HEAD, '-A INPUT -i lo -j accept', 'COMMIT'].join('\n'));
+  assert.equal(f.length, 1);
+  assert.match(f[0].details, /names a CHAIN called "accept", not the ACCEPT target/);
+});
+
+test('jump-to-undefined-chain (iptables): chains are per table — a chain declared in *nat does not exist for *filter', () => {
+  const rs = ['*nat', ':PREROUTING ACCEPT [0:0]', ':POSTROUTING ACCEPT [0:0]', ':PORTFWD - [0:0]',
+    '-A PREROUTING -j PORTFWD', 'COMMIT',
+    ...FILTER_HEAD, '-A FORWARD -j PORTFWD', 'COMMIT'].join('\n');
+  const f = undefHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.table, x.chain, x.ruleIdx]))), [['filter', 'FORWARD', 0]]);
+});
+
+test('jump-to-undefined-chain (iptables): -A to a chain nothing declared is flagged once, at the chain; -N counts as a declaration', () => {
+  const f = undefHits([...FILTER_HEAD, '-A INPUT -j LOGDROP', '-A LOGDROP -j DROP', 'COMMIT'].join('\n'));
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.chain, x.ruleIdx]))), [['LOGDROP', null]]);
+  assert.match(f[0].title, /appended to LOGDROP, which \*filter never declares/);
+  assert.equal(undefHits([...FILTER_HEAD, '-N LOGDROP', '-A INPUT -j LOGDROP', '-A LOGDROP -j DROP', 'COMMIT'].join('\n')).length, 0);
+});
+
+test('jump-to-undefined-chain (iptables): a fragment with no declarations at all is not judged, and an undeclared built-in name is fine', () => {
+  assert.equal(undefHits(['*filter', '-A INPUT -j SSH_IN', 'COMMIT'].join('\n')).length, 0);
+  assert.equal(undefHits(['*nat', ':PREROUTING ACCEPT [0:0]', '-A POSTROUTING -j MASQUERADE', 'COMMIT'].join('\n')).length, 0);
+});
+
+test('jump-to-undefined-chain (nft): jump/goto to a chain the table lacks is an error; a chain defined later in the table is fine', () => {
+  const rs = ['table inet f {',
+    '  chain input { type filter hook input priority 0; policy drop;',
+    '    tcp dport 22 jump ssh_in',
+    '    tcp dport 80 goto web_in',
+    '  }',
+    '  chain ssh_in { accept; }',
+    '}'].join('\n');
+  const f = undefHits(rs);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.chain, x.ruleIdx]))), [['input', 1]]);
+  assert.match(f[0].title, /`goto web_in` — no chain web_in in table inet f/);
+  assert.match(f[0].details, /Could not process rule/);
 });

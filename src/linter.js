@@ -110,6 +110,7 @@
     detectTcpOptionWithoutTcp(result, findings);
     detectIcmpMatchWithoutIcmp(result, findings);
     detectInterfaceMatchWrongDirection(result, findings);
+    detectJumpToUndefinedChain(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -878,6 +879,14 @@
       }
     }
   }
+  // What a refused line costs in a saved ruleset, measured once and shared by
+  // every smell whose line iptables refuses (iptables 1.8.11, nf_tables and
+  // legacy backends alike): the restore stops at that line, the table it sits
+  // in and every table after it load nothing, a table COMMITted above it DOES
+  // load, and the refused table's policies never apply (INPUT stayed ACCEPT
+  // under a `:INPUT DROP` header).
+  const RESTORE_REFUSED = 'iptables-restore stops at that line: this table and every table after it in the file load NOTHING (a section COMMITted above it still loads — measured, both backends), and the policies it declares never apply — a `:INPUT DROP` header leaves INPUT at ACCEPT, so the boot that replays this file leaves the box open';
+
   // ── tcp-option-without-tcp ───────────────────────────────────────────
   // `--syn`, `--tcp-flags` and `--tcp-option` are options of the tcp match
   // extension, which only exists once `-p tcp` pulls it in. Under another
@@ -918,7 +927,7 @@
               severity: 'error',
               ...where,
               title: `\`${opt[1]}\` with ${spelledProto} — a TCP-only option, so this rule will not parse and takes the whole ruleset down with it`,
-              details: `\`${opt[1]}\` belongs to the tcp match extension, which only exists once \`-p tcp\` pulls it in. Measured (iptables 1.8.11): \`-p udp --syn\`, \`-p icmp --syn\`, a bare \`--syn\`, \`-p udp --tcp-flags SYN SYN\` and \`-p udp --tcp-option 8\` all fail with \`unknown option "${opt[1]}"\` (rc 2), and iptables-restore stops at that line and loads NOTHING — the boot ends with no firewall at all. ${proto ? `${proto.toUpperCase()} has no SYN flag to test; if the rule is about TCP, change the protocol; if it is about ${proto}, drop the option.` : 'Add `-p tcp` (the option makes no sense for any other protocol).'}`
+              details: `\`${opt[1]}\` belongs to the tcp match extension, which only exists once \`-p tcp\` pulls it in. Measured (iptables 1.8.11): \`-p udp --syn\`, \`-p icmp --syn\`, a bare \`--syn\`, \`-p udp --tcp-flags SYN SYN\` and \`-p udp --tcp-option 8\` all fail with \`unknown option "${opt[1]}"\` (rc 2), and ${RESTORE_REFUSED}. ${proto ? `${proto.toUpperCase()} has no SYN flag to test; if the rule is about TCP, change the protocol; if it is about ${proto}, drop the option.` : 'Add `-p tcp` (the option makes no sense for any other protocol).'}`
             });
             return;
           }
@@ -979,7 +988,7 @@
               severity: 'error',
               ...where,
               title: `\`${opt[1]}\` with ${spelledProto} — an ICMP-only option, so this rule will not parse and takes the whole ruleset down with it`,
-              details: `\`${opt[1]}\` belongs to the icmp match extension, which only exists under \`${want}\`. Measured (iptables 1.8.11): \`-p tcp --icmp-type echo-request\` dies with \`unknown option "--icmp-type"\` (rc 2) and \`-p tcp -m icmp --icmp-type 8\` with \`Invalid argument\` (rc 1); iptables-restore stops at that line and loads NOTHING — the boot ends with no firewall. ${proto ? `${proto.toUpperCase()} has no ICMP types; if the rule is about ICMP, change the protocol to ${want.slice(3)}; if it is about ${proto}, drop the option.` : `Add \`${want}\`.`}`
+              details: `\`${opt[1]}\` belongs to the icmp match extension, which only exists under \`${want}\`. Measured (iptables 1.8.11): \`-p tcp --icmp-type echo-request\` dies with \`unknown option "--icmp-type"\` (rc 2) and \`-p tcp -m icmp --icmp-type 8\` with \`Invalid argument\` (rc 1); ${RESTORE_REFUSED}. ${proto ? `${proto.toUpperCase()} has no ICMP types; if the rule is about ICMP, change the protocol to ${want.slice(3)}; if it is about ${proto}, drop the option.` : `Add \`${want}\`.`}`
             });
             return;
           }
@@ -1078,8 +1087,78 @@
               ? `\`${spelled}\` in ${hook} — iptables refuses this line and the whole ruleset with it`
               : `\`${spelled}\` in ${/^[aeiou]/.test(hook) ? 'an' : 'a'} ${hook}-hook chain — the rule loads and can never match`,
             details: isIpt
-              ? `Measured (iptables 1.8.11): \`iptables -A ${hook} ${spelled} -j ACCEPT\` is refused with "Can't use --${dead === 'in' ? 'in' : 'out'}-interface with ${hook}" — ${why}. In a saved ruleset that is worse than a dead rule: \`iptables-restore\` stops at the offending line and loads NOTHING, so the boot that replays this file ends with no firewall at all. ${dead === 'in' ? 'Match the outgoing interface here (`-o`), or move the rule to a chain that sees the arrival (INPUT / FORWARD / PREROUTING).' : 'Match the incoming interface here (`-i`), or move the rule to a chain that sees the departure (OUTPUT / FORWARD / POSTROUTING).'}`
+              ? `Measured (iptables 1.8.11): \`iptables -A ${hook} ${spelled} -j ACCEPT\` is refused with "Can't use --${dead === 'in' ? 'in' : 'out'}-interface with ${hook}" — ${why}. In a saved ruleset that is worse than a dead rule: ${RESTORE_REFUSED}. ${dead === 'in' ? 'Match the outgoing interface here (`-o`), or move the rule to a chain that sees the arrival (INPUT / FORWARD / PREROUTING).' : 'Match the incoming interface here (`-i`), or move the rule to a chain that sees the departure (OUTPUT / FORWARD / POSTROUTING).'}`
               : `nft accepts the rule — and then it never matches, because ${why}. Measured (nft 1.1.x) with one HTTP request through the box: in ${/^[aeiou]/.test(hook) ? 'an' : 'a'} ${hook}-hook chain \`${dead === 'in' ? 'iifname' : 'oifname'}\` counted 0 packets while its opposite counted every one of them. A dead \`accept\` under a deny policy is a service that looks configured and is unreachable; a dead \`drop\` is a hole. Use \`${dead === 'in' ? 'oifname' : 'iifname'}\` here, or move the rule to the hook that sees that side. (\`iifname\` in a postrouting chain is a different case and not flagged: it is the standard idiom for FORWARDED traffic.)`
+          });
+        });
+      }
+    }
+  }
+
+
+  // ── jump-to-undefined-chain ──────────────────────────────────────────
+  // A jump to a chain that does not exist in THIS table is not a dead rule:
+  // it is a file that does not load. Measured (iptables 1.8.11, both
+  // backends, and nft 1.1.3), every shape refused, 0 rules loaded:
+  //   - `-j SSH_IN` with no `:SSH_IN` line         "Chain 'SSH_IN' does not exist"
+  //   - `-j accept` (targets are case-sensitive: lowercase is a chain name)
+  //   - `-j NATCHAIN` from filter, NATCHAIN declared in *nat — chains are
+  //     per table
+  //   - `-A LOGDROP ...` with no `:LOGDROP` / -N — appending does not create
+  //   - nft `jump ssh_in` with no chain ssh_in ("Could not process rule")
+  // And the trap that makes it worth a smell: `iptables-restore --test` with
+  // the nf_tables backend (the default on every current distro) returned 0
+  // for all four iptables files; only the legacy backend's --test refused
+  // them. The dry run says the file is fine; the boot that replays it ends
+  // with the box open (see RESTORE_REFUSED for exactly what still loads).
+  const IPT_BUILTIN_CHAINS = new Set(['INPUT', 'OUTPUT', 'FORWARD', 'PREROUTING', 'POSTROUTING']);
+  function detectJumpToUndefinedChain(result, findings) {
+    const format = result.format;
+    const isIpt = format === 'iptables' || format === 'ip6tables';
+    if (!isIpt && format !== 'nftables') return;
+    for (const table of result.tables) {
+      const chains = table.chains || [];
+      // A fragment with no declarations at all (a pasted handful of -A
+      // lines) says nothing about which chains exist.
+      if (isIpt && !chains.some((c) => c.declared)) continue;
+      if (!isIpt && chains.length === 0) continue;
+      const names = new Set(chains.map((c) => c.name));
+      const where = isIpt ? `*${table.name}` : `table ${table.family ? table.family + ' ' : ''}${table.name}`;
+      if (isIpt) {
+        for (const chain of chains) {
+          if (chain.declared !== false || IPT_BUILTIN_CHAINS.has(chain.name)) continue;
+          findings.push({
+            id: 'jump-to-undefined-chain',
+            severity: 'error',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: null,
+            title: `Rules are appended to ${chain.name}, which ${where} never declares — iptables-restore refuses the file`,
+            details: `Appending does not create a chain: measured (iptables 1.8.11), \`-A ${chain.name} ...\` with no \`:${chain.name} - [0:0]\` line (or \`-N ${chain.name}\`) is refused with "Chain '${chain.name}' does not exist" — ${RESTORE_REFUSED}. \`iptables-restore --test\` does NOT catch it with the nf_tables backend (rc 0, measured); only a real load or the legacy backend does. Declare the chain at the top of the *${table.name} section.`
+          });
+        }
+      }
+      for (const chain of chains) {
+        (chain.rules || []).forEach((rule, idx) => {
+          if (!rule.isJumpToChain || !rule.action) return;
+          if (names.has(rule.action) || (isIpt && IPT_BUILTIN_CHAINS.has(rule.action))) return;
+          const verb = isIpt ? (rule.isGoto ? '-g' : '-j') : (rule.isGoto ? 'goto' : 'jump');
+          const upper = String(rule.action).toUpperCase();
+          const caseHint = isIpt && rule.action !== upper && (upper === 'ACCEPT' || upper === 'DROP' || upper === 'REJECT' || upper === 'RETURN' || upper === 'LOG')
+            ? ` Targets are case-sensitive: \`${verb} ${rule.action}\` names a CHAIN called "${rule.action}", not the ${upper} target — write \`${verb} ${upper}\`.`
+            : '';
+          findings.push({
+            id: 'jump-to-undefined-chain',
+            severity: 'error',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx,
+            title: `\`${verb} ${rule.action}\` — no chain ${rule.action} in ${where}, so the whole file is refused`,
+            details: isIpt
+              ? `Measured (iptables 1.8.11): a jump to a chain the table does not declare is refused ("Chain '${rule.action}' does not exist" on the nf_tables backend, "Couldn't load target" on legacy): ${RESTORE_REFUSED}. Chains are per table: one declared in another *table section does not count. \`iptables-restore --test\` does NOT catch this with the nf_tables backend (rc 0, measured). If ${rule.action} is an extension target firewallscope does not know, ignore this.${caseHint}`
+              : `Measured (nft 1.1.3): \`${verb} ${rule.action}\` with no chain ${rule.action} in the table fails with "Could not process rule: No such file or directory", and \`nft -f\` is atomic — none of the file loads. Define the chain (anywhere in the table: nft resolves the whole file first), or fix the name.`
           });
         });
       }

@@ -42,6 +42,7 @@ const EXPECTED = {
   'iptables-icmp-on-tcp.txt': ['icmp-match-without-icmp'],
   'iptables-iface-wrong-chain.txt': ['interface-match-wrong-direction'],
   'iptables-undefined-chain.txt': ['jump-to-undefined-chain'],
+  'iptables-multiport-overflow.txt': ['multiport-too-many-ports'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -115,6 +116,7 @@ const ALL_SMELLS = [
   'icmp-match-without-icmp',
   'interface-match-wrong-direction',
   'jump-to-undefined-chain',
+  'multiport-too-many-ports',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3444,4 +3446,52 @@ test('jump-to-undefined-chain (nft): jump/goto to a chain the table lacks is an 
   assert.deepEqual(JSON.parse(JSON.stringify(f.map((x) => [x.chain, x.ruleIdx]))), [['input', 1]]);
   assert.match(f[0].title, /`goto web_in` — no chain web_in in table inet f/);
   assert.match(f[0].details, /Could not process rule/);
+});
+
+// --- multiport-too-many-ports -----------------------------------------------
+// Measured (iptables 1.8.13, nf_tables AND legacy, real loads): 15 slots load,
+// 16 are refused ("too many ports specified", 0 rules); a range a:b takes two
+// slots; --sports / --ports / negated lists / ip6tables behave the same, and
+// the cap is per -m multiport match.
+
+function mpHits(text) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'multiport-too-many-ports');
+}
+const ports = (n) => Array.from({ length: n }, (_, i) => String(1000 + i)).join(',');
+const mpRule = (body) => [...FILTER_HEAD, `-A INPUT ${body} -j ACCEPT`, 'COMMIT'].join('\n');
+
+test('multiport-too-many-ports: 16 ports is an error, 15 is fine', () => {
+  assert.equal(mpHits(mpRule(`-p tcp -m multiport --dports ${ports(15)}`)).length, 0);
+  const f = mpHits(mpRule(`-p tcp -m multiport --dports ${ports(16)}`));
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'error');
+  assert.equal(f[0].ruleIdx, 0);
+  assert.match(f[0].title, /`--dports` lists 16 port slots; multiport holds 15/);
+  assert.match(f[0].details, /too many ports specified/);
+  assert.match(f[0].details, /every table after it in the file load NOTHING/);
+});
+
+test('multiport-too-many-ports: a range takes two slots (13 + range loads, 14 + range and 8 ranges do not)', () => {
+  assert.equal(mpHits(mpRule(`-p tcp -m multiport --dports ${ports(13)},20:30`)).length, 0);
+  assert.equal(mpHits(mpRule('-p tcp -m multiport --dports 1:2,3:4,5:6,7:8,9:10,11:12,13:14,15')).length, 0);
+  const r = mpHits(mpRule(`-p tcp -m multiport --dports ${ports(14)},20:30`));
+  assert.equal(r.length, 1);
+  assert.match(r[0].title, /16 port slots \(14 single ports \+ 1 range — a range takes two slots\)/);
+  assert.equal(mpHits(mpRule('-p tcp -m multiport --dports 1:2,3:4,5:6,7:8,9:10,11:12,13:14,15:16')).length, 1);
+});
+
+test('multiport-too-many-ports: --sports, --ports, negated lists and ip6tables count too; the cap is per match', () => {
+  assert.equal(mpHits(mpRule(`-p udp -m multiport --sports ${ports(16)}`)).length, 1);
+  assert.equal(mpHits(mpRule(`-p tcp -m multiport --ports ${ports(16)}`)).length, 1);
+  assert.equal(mpHits(mpRule(`-p tcp -m multiport ! --dports ${ports(16)}`)).length, 1);
+  const v6 = ['*filter', ':INPUT DROP [0:0]', ':FORWARD DROP [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A INPUT -p ipv6-icmp -j ACCEPT', `-A INPUT -s fe80::/10 -p tcp -m multiport --dports ${ports(16)} -j ACCEPT`, 'COMMIT'].join('\n');
+  assert.equal(mpHits(v6).length, 1);
+  assert.equal(mpHits(mpRule(`-p tcp -m multiport --dports ${ports(8)} -m multiport --sports ${ports(8)}`)).length, 0);
+});
+
+test('multiport-too-many-ports: nft sets have no cap and are never judged', () => {
+  const nft = ['table inet filter {', '  chain input {', '    type filter hook input priority 0; policy drop;',
+    `    tcp dport { ${ports(40).split(',').join(', ')} } accept`, '  }', '}'].join('\n');
+  assert.equal(mpHits(nft).length, 0);
 });

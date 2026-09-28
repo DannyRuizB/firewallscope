@@ -111,6 +111,7 @@
     detectIcmpMatchWithoutIcmp(result, findings);
     detectInterfaceMatchWrongDirection(result, findings);
     detectJumpToUndefinedChain(result, findings);
+    detectMultiportTooManyPorts(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -1095,6 +1096,53 @@
     }
   }
 
+
+  // ── multiport-too-many-ports ────────────────────────────────────────
+  // `-m multiport` holds at most 15 ports per list, and a range `a:b` takes
+  // TWO of those slots (its two ends). Measured (iptables 1.8.13, nf_tables
+  // AND legacy, real loads with NET_ADMIN): 15 singles, 13 singles + one
+  // range, 7 ranges + one port all load; 16 singles, 14 singles + one range
+  // and 8 ranges are refused with "too many ports specified" and 0 rules
+  // loaded — for --dports, --sports, --ports, a negated `! --dports`, and
+  // ip6tables alike. The cap is per match: two `-m multiport` of 8 each in
+  // one rule load. It is the typical fate of a port list that grows one
+  // service at a time until the 16th. Unlike jump-to-undefined-chain this
+  // one IS caught by `iptables-restore --test` (a parser error) — but only
+  // if someone runs it. nft has no such cap (a set holds any number).
+  const MULTIPORT_MAX_SLOTS = 15;
+  const MULTIPORT_LIST_RE = /(?:^|\s)(?:!\s+)?--(dports|sports|ports|destination-ports|source-ports)\s+(!\s+)?(\S+)/g;
+  function detectMultiportTooManyPorts(result, findings) {
+    const format = result.format;
+    if (format !== 'iptables' && format !== 'ip6tables') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          const match = String(rule.match || '');
+          let m;
+          MULTIPORT_LIST_RE.lastIndex = 0;
+          while ((m = MULTIPORT_LIST_RE.exec(match)) !== null) {
+            const items = m[3].split(',').filter(Boolean);
+            const ranges = items.filter((p) => p.includes(':')).length;
+            const slots = items.length + ranges;
+            if (slots <= MULTIPORT_MAX_SLOTS) continue;
+            const rangeNote = ranges
+              ? ` (${items.length - ranges} single port${items.length - ranges === 1 ? '' : 's'} + ${ranges} range${ranges === 1 ? '' : 's'} — a range takes two slots)`
+              : '';
+            findings.push({
+              id: 'multiport-too-many-ports',
+              severity: 'error',
+              table: table.name,
+              tableFamily: table.family || null,
+              chain: chain.name,
+              ruleIdx: idx,
+              title: `\`--${m[1]}\` lists ${slots} port slots${rangeNote}; multiport holds 15 — iptables-restore refuses the file`,
+              details: `\`-m multiport\` takes at most 15 ports per list, and each range \`a:b\` counts as two. Measured (iptables 1.8.13, both backends): one slot over is refused with "too many ports specified" — ${RESTORE_REFUSED}. \`iptables-restore --test\` does catch this one, so a pre-flight check in the deploy would have. Split the list across two rules (or two \`-m multiport\` matches in one rule — the cap is per match), fold neighbouring ports into ranges only where they are truly contiguous, or move to an ipset (\`-m set --match-set\`) / an nft set, which have no such cap.`
+            });
+          }
+        });
+      }
+    }
+  }
 
   // ── jump-to-undefined-chain ──────────────────────────────────────────
   // A jump to a chain that does not exist in THIS table is not a dead rule:

@@ -1,0 +1,17 @@
+# A hand-maintained /etc/iptables/rules.v4 whose "open ports" line grew one
+# service at a time. multiport holds 15 port slots per list, and a range
+# takes two. Measured on THIS file (iptables 1.8.13, nf_tables and legacy):
+# iptables-restore stops at the web line with "too many ports specified",
+# rc 2, *filter loads nothing and INPUT stays at policy ACCEPT - the box
+# boots open. The mail line (13 ports + one range = 15 slots) is fine.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p tcp -m multiport --dports 25,110,143,465,587,993,995,4190,2525,10025,10024,11332,11334,6000:6010 -j ACCEPT
+# the 16th port was the one added last Friday
+-A INPUT -p tcp -m multiport --dports 22,80,443,3000,3001,5000,5601,8000,8080,8081,8443,8888,9000,9090,9100,9200 -j ACCEPT
+-A INPUT -p udp -m multiport --dports 53,123 -j ACCEPT
+COMMIT

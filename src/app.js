@@ -32,7 +32,8 @@
     synonudp: 'samples/iptables-syn-on-udp.txt',
     icmpontcp: 'samples/iptables-icmp-on-tcp.txt',
     ifacewrongchain: 'samples/iptables-iface-wrong-chain.txt',
-    undefinedchain: 'samples/iptables-undefined-chain.txt'
+    undefinedchain: 'samples/iptables-undefined-chain.txt',
+    multiportoverflow: 'samples/iptables-multiport-overflow.txt'
   };
 
   const FORMAT_LABELS = {

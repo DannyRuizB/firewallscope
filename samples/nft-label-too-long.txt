@@ -1,0 +1,14 @@
+# A ruleset that never loads: nft caps a rule comment at 128 bytes (this one
+# is 133) and a log prefix at 127 (this one is 135), and nft -f is atomic -
+# the whole file is refused and the box boots with no firewall at all.
+# A '#' line like this one has no limit: that is where the prose belongs.
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iifname "lo" accept
+		ct state established,related accept
+		tcp dport 22 accept comment "ssh from anywhere, key-only"
+		ip saddr 10.20.0.0/24 tcp dport 9100 accept comment "allow the monitoring VLAN to scrape node_exporter, ticket NET-4821, approved by the network change board on 2026-09-30, review yearly"
+		limit rate 5/minute log prefix "nft-input-drop: unexpected inbound connection to a host on the management segment, see the runbook for the incident response escalation"
+	}
+}

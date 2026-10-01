@@ -112,6 +112,8 @@
     detectInterfaceMatchWrongDirection(result, findings);
     detectJumpToUndefinedChain(result, findings);
     detectMultiportTooManyPorts(result, findings);
+    detectLogPrefixTooLong(result, findings);
+    detectCommentTooLong(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -1142,6 +1144,135 @@
         });
       }
     }
+  }
+
+  // ── log-prefix-too-long / comment-too-long ──────────────────────────
+  // Both labels live in fixed-size kernel buffers, and the tools disagree on
+  // what to do with a longer one. Measured (iptables 1.8.13 both backends,
+  // nft 1.1.x, real loads with NET_ADMIN):
+  //   - iptables `--log-prefix`: kept to 29 bytes, SILENTLY — rc 0, no
+  //     warning, from the command line and from restore alike. The prefix is
+  //     what a fail2ban filter or a SIEM rule greps for, so "FW-DROP-SSH-
+  //     BRUTEFORCE: " (30) is logged as "...BRUTEFORCE:" and the alert keyed
+  //     on the full string never fires again.
+  //   - NFLOG `--nflog-prefix`: legacy keeps 63 bytes; the nf_tables backend
+  //     kept 70 of 70. Truncated on one backend only.
+  //   - iptables `--comment`: kept to 255 bytes, silently.
+  //   - nft `log prefix`: 128 bytes or more is refused ("log prefix is too
+  //     long"); nft `comment`: more than 128 refused ("comment too long, 128
+  //     characters maximum allowed") — and `nft -f` is atomic, so the whole
+  //     ruleset with it.
+  // Lengths are bytes (the kernel's char arrays), so a UTF-8 label runs out
+  // sooner than its character count suggests.
+  function utf8Length(s) {
+    let n = 0;
+    for (const ch of s) {
+      const c = ch.codePointAt(0);
+      n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    }
+    return n;
+  }
+
+  function truncateUtf8(s, max) {
+    let out = '';
+    let n = 0;
+    for (const ch of s) {
+      const len = utf8Length(ch);
+      if (n + len > max) break;
+      out += ch;
+      n += len;
+    }
+    return out;
+  }
+
+  // The value after `key`: "double", 'single' or a bare token.
+  function quotedValueAfter(raw, keyRe) {
+    const m = new RegExp(keyRe.source + String.raw`\s+(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|(\S+))`).exec(raw);
+    if (!m) return null;
+    return m[1] != null ? m[1].replace(/\\(.)/g, '$1') : m[2] != null ? m[2] : m[3];
+  }
+
+  const IPT_LOG_PREFIX_MAX = 29;
+  const IPT_NFLOG_PREFIX_MAX = 63;
+  const IPT_COMMENT_MAX = 255;
+  const NFT_LOG_PREFIX_MAX = 127;
+  const NFT_COMMENT_MAX = 128;
+  const NFT_REFUSED = '`nft -f` is atomic: the ENTIRE ruleset is refused, and the firewall never comes up at boot';
+
+  function eachRule(result, fn) {
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => fn(rule, idx, chain, table));
+      }
+    }
+  }
+
+  function detectLogPrefixTooLong(result, findings) {
+    const format = result.format;
+    const ipt = format === 'iptables' || format === 'ip6tables';
+    if (!ipt && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const raw = String(rule.raw || '');
+      const base = { table: table.name, tableFamily: table.family || null, chain: chain.name, ruleIdx: idx };
+      if (ipt) {
+        for (const [key, max, nflog] of [['--log-prefix', IPT_LOG_PREFIX_MAX, false], ['--nflog-prefix', IPT_NFLOG_PREFIX_MAX, true]]) {
+          const value = quotedValueAfter(raw, new RegExp(`(?:^|\\s)${key}`));
+          if (value == null || utf8Length(value) <= max) continue;
+          const kept = truncateUtf8(value, max);
+          findings.push({
+            id: 'log-prefix-too-long',
+            severity: nflog ? 'info' : 'warning',
+            ...base,
+            title: nflog
+              ? `\`${key}\` is ${utf8Length(value)} bytes; the legacy backend keeps ${max}`
+              : `\`${key}\` is ${utf8Length(value)} bytes; the kernel keeps ${max} — silently`,
+            details: nflog
+              ? `NFLOG stores at most ${max} bytes of prefix on the legacy backend (measured: a longer one is cut, rc 0, no warning); the nf_tables backend kept 70 of 70. On a legacy box the log lines read "${kept}". Keep it within ${max} bytes so both backends log the same label.`
+              : `The LOG target keeps at most ${max} bytes of prefix and cuts the rest without a word — rc 0, no warning, from the command line and from iptables-restore, both backends (measured). Every line this rule logs reads "${kept}"${utf8Length(kept) < max ? ' plus half of the next character (it counts bytes and cuts a multi-byte UTF-8 character in two — measured)' : ''}, so a fail2ban filter or SIEM rule that greps for the full prefix never matches. Shorten it to ${max} bytes or fewer (the trailing space counts).`
+          });
+        }
+        return;
+      }
+      const value = quotedValueAfter(raw, /(?:^|\s)log\b(?:\s+(?!prefix\b)\S+)*?\s+prefix/);
+      if (value == null || utf8Length(value) <= NFT_LOG_PREFIX_MAX) return;
+      findings.push({
+        id: 'log-prefix-too-long',
+        severity: 'error',
+        ...base,
+        title: `\`log prefix\` is ${utf8Length(value)} bytes; nft accepts ${NFT_LOG_PREFIX_MAX} — the ruleset will not load`,
+        details: `nft refuses a log prefix of ${NFT_LOG_PREFIX_MAX + 1} bytes or more at load time (measured: "log prefix is too long"), and ${NFT_REFUSED}. Shorten it to ${NFT_LOG_PREFIX_MAX} bytes — and note that a box still on iptables would keep only the first ${IPT_LOG_PREFIX_MAX}.`
+      });
+    });
+  }
+
+  function detectCommentTooLong(result, findings) {
+    const format = result.format;
+    const ipt = format === 'iptables' || format === 'ip6tables';
+    if (!ipt && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const raw = String(rule.raw || '');
+      const value = quotedValueAfter(raw, ipt ? /(?:^|\s)--comment/ : /(?:^|\s)comment/);
+      if (value == null) return;
+      const len = utf8Length(value);
+      const base = { table: table.name, tableFamily: table.family || null, chain: chain.name, ruleIdx: idx };
+      if (ipt && len > IPT_COMMENT_MAX) {
+        findings.push({
+          id: 'comment-too-long',
+          severity: 'info',
+          ...base,
+          title: `\`--comment\` is ${len} bytes; the kernel keeps ${IPT_COMMENT_MAX} — silently`,
+          details: `The comment match stores at most ${IPT_COMMENT_MAX} bytes and drops the rest with no warning (measured, both backends): \`iptables-save\` gives back a different comment than the one written, so a diff against this file — or a tool keyed on the comment, like a config-management marker — sees a change that is not one.`
+        });
+      } else if (!ipt && len > NFT_COMMENT_MAX) {
+        findings.push({
+          id: 'comment-too-long',
+          severity: 'error',
+          ...base,
+          title: `\`comment\` is ${len} bytes; nft accepts ${NFT_COMMENT_MAX} — the ruleset will not load`,
+          details: `nft refuses a rule comment over ${NFT_COMMENT_MAX} bytes at load time (measured: "comment too long, 128 characters maximum allowed"), and ${NFT_REFUSED}. Shorten it, or move the prose to a \`#\` comment line, which has no limit.`
+        });
+      }
+    });
   }
 
   // ── jump-to-undefined-chain ──────────────────────────────────────────

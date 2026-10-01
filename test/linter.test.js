@@ -43,6 +43,8 @@ const EXPECTED = {
   'iptables-iface-wrong-chain.txt': ['interface-match-wrong-direction'],
   'iptables-undefined-chain.txt': ['jump-to-undefined-chain'],
   'iptables-multiport-overflow.txt': ['multiport-too-many-ports'],
+  'iptables-log-prefix-truncated.txt': ['log-prefix-too-long'],
+  'nft-label-too-long.txt': ['log-prefix-too-long', 'comment-too-long'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -117,6 +119,8 @@ const ALL_SMELLS = [
   'interface-match-wrong-direction',
   'jump-to-undefined-chain',
   'multiport-too-many-ports',
+  'log-prefix-too-long',
+  'comment-too-long',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3494,4 +3498,68 @@ test('multiport-too-many-ports: nft sets have no cap and are never judged', () =
   const nft = ['table inet filter {', '  chain input {', '    type filter hook input priority 0; policy drop;',
     `    tcp dport { ${ports(40).split(',').join(', ')} } accept`, '  }', '}'].join('\n');
   assert.equal(mpHits(nft).length, 0);
+});
+
+// --- log-prefix-too-long / comment-too-long ----------------------------------
+// Measured (iptables 1.8.13 both backends, nftables 1.1.6, real loads):
+// iptables keeps 29 bytes of --log-prefix and 255 of --comment SILENTLY (rc 0);
+// NFLOG keeps 63 on legacy only; nft refuses a log prefix of 128+ bytes and a
+// comment over 128, and nft -f is atomic.
+
+function labelHits(text, id) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === id);
+}
+const iptRule = (body) => [...FILTER_HEAD, `-A INPUT ${body}`, 'COMMIT'].join('\n');
+const nftRule = (body) => ['table inet t {', ' chain i {', '  type filter hook input priority 0; policy drop;', `  ${body}`, ' }', '}'].join('\n');
+
+test('log-prefix-too-long (iptables): 30 bytes is cut to 29 silently; 29 is fine', () => {
+  const f = labelHits(iptRule('-j LOG --log-prefix "FW-INPUT-DROP-SSH-BRUTEFORCE: "'), 'log-prefix-too-long');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'warning');
+  assert.match(f[0].title, /`--log-prefix` is 30 bytes; the kernel keeps 29 — silently/);
+  assert.match(f[0].details, /reads "FW-INPUT-DROP-SSH-BRUTEFORCE:", so a fail2ban/);
+  assert.equal(labelHits(iptRule('-j LOG --log-prefix "FW-INPUT-DROP-DEFAULT-POLICY "'), 'log-prefix-too-long').length, 0);
+  assert.equal(labelHits(iptRule(`-j LOG --log-prefix ${'P'.repeat(31)}`), 'log-prefix-too-long').length, 1, 'bare token');
+  assert.equal(labelHits(iptRule(`-j LOG --log-prefix '${'P'.repeat(31)}'`), 'log-prefix-too-long').length, 1, 'single quotes');
+});
+
+test('log-prefix-too-long (iptables): bytes, not characters — and the cut lands mid-character', () => {
+  const f = labelHits(iptRule(`-j LOG --log-prefix "${'Ñ'.repeat(15)}"`), 'log-prefix-too-long');
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /30 bytes/);
+  assert.match(f[0].details, /plus half of the next character/);
+  assert.equal(labelHits(iptRule(`-j LOG --log-prefix "${'Ñ'.repeat(14)}"`), 'log-prefix-too-long').length, 0);
+});
+
+test('log-prefix-too-long (NFLOG): over 63 bytes is info (legacy cuts, nf_tables does not)', () => {
+  const f = labelHits(iptRule(`-j NFLOG --nflog-group 1 --nflog-prefix "${'N'.repeat(64)}"`), 'log-prefix-too-long');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'info');
+  assert.match(f[0].title, /legacy backend keeps 63/);
+  assert.equal(labelHits(iptRule(`-j NFLOG --nflog-group 1 --nflog-prefix "${'N'.repeat(63)}"`), 'log-prefix-too-long').length, 0);
+});
+
+test('log-prefix-too-long (nft): 128 bytes is an error (the ruleset will not load); 127 is fine', () => {
+  const f = labelHits(nftRule(`tcp dport 22 log level warn prefix "${'P'.repeat(128)}" accept`), 'log-prefix-too-long');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'error');
+  assert.match(f[0].details, /log prefix is too long/);
+  assert.match(f[0].details, /ENTIRE ruleset is refused/);
+  assert.equal(labelHits(nftRule(`tcp dport 22 log prefix "${'P'.repeat(127)}" accept`), 'log-prefix-too-long').length, 0);
+  assert.equal(labelHits(nftRule('tcp dport 22 log prefix "short: " accept'), 'log-prefix-too-long').length, 0);
+});
+
+test('comment-too-long: iptables over 255 bytes is info (cut silently); nft over 128 is an error', () => {
+  const ipt = labelHits(iptRule(`-m comment --comment "${'c'.repeat(256)}" -j ACCEPT`), 'comment-too-long');
+  assert.equal(ipt.length, 1);
+  assert.equal(ipt[0].severity, 'info');
+  assert.match(ipt[0].title, /256 bytes; the kernel keeps 255/);
+  assert.equal(labelHits(iptRule(`-m comment --comment "${'c'.repeat(255)}" -j ACCEPT`), 'comment-too-long').length, 0);
+  const nft = labelHits(nftRule(`tcp dport 9100 accept comment "${'c'.repeat(129)}"`), 'comment-too-long');
+  assert.equal(nft.length, 1);
+  assert.equal(nft[0].severity, 'error');
+  assert.match(nft[0].details, /comment too long, 128 characters maximum allowed/);
+  assert.equal(labelHits(nftRule(`tcp dport 9100 accept comment "${'c'.repeat(128)}"`), 'comment-too-long').length, 0);
+  // A 200-byte nft comment is not ALSO judged by the iptables 255 rule, and vice versa.
+  assert.equal(labelHits(iptRule(`-m comment --comment "${'c'.repeat(200)}" -j ACCEPT`), 'comment-too-long').length, 0);
 });

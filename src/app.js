@@ -33,7 +33,9 @@
     icmpontcp: 'samples/iptables-icmp-on-tcp.txt',
     ifacewrongchain: 'samples/iptables-iface-wrong-chain.txt',
     undefinedchain: 'samples/iptables-undefined-chain.txt',
-    multiportoverflow: 'samples/iptables-multiport-overflow.txt'
+    multiportoverflow: 'samples/iptables-multiport-overflow.txt',
+    logprefixtruncated: 'samples/iptables-log-prefix-truncated.txt',
+    nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 
   const FORMAT_LABELS = {

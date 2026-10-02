@@ -46,6 +46,7 @@ const EXPECTED = {
   'iptables-log-prefix-truncated.txt': ['log-prefix-too-long'],
   'nft-label-too-long.txt': ['log-prefix-too-long', 'comment-too-long'],
   'iptables-limit-default.txt': ['limit-default-rate'],
+  'iptables-cidr-host-bits.txt': ['cidr-host-bits-set'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -123,6 +124,7 @@ const ALL_SMELLS = [
   'log-prefix-too-long',
   'comment-too-long',
   'limit-default-rate',
+  'cidr-host-bits-set',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3614,4 +3616,49 @@ test('limit-default-rate: the sample flags SSH (warning) and the drop log (info)
   assert.equal(f.map((x) => x.severity).sort().join(','), 'info,warning');
   assert.ok(f.every((x) => x.ruleIdx !== 4), 'the 50/sec HTTPS rule is fine');
   assert.match(f.find((x) => x.severity === 'info').title, /logs 10 lines/);
+});
+
+// --- cidr-host-bits-set --------------------------------------------------------
+// Measured (iptables 1.8.13 both backends, ip6tables, nft 1.1.x): a prefix with
+// host bits loads with rc 0 and comes back masked (10.20.0.15/24 -> 10.20.0.0/24).
+
+function hbHits(text) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'cidr-host-bits-set');
+}
+
+test('cidr-host-bits-set: a host written with a /24 on an ACCEPT is a warning naming what is kept', () => {
+  const f = hbHits(iptRule('-s 10.20.0.15/24 -p tcp --dport 22 -j ACCEPT'));
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'warning');
+  assert.match(f[0].title, /`10\.20\.0\.15\/24` has host bits set: the kernel keeps `10\.20\.0\.0\/24`/);
+  assert.match(f[0].details, /256 addresses/);
+  assert.equal(hbHits(iptRule('-d 192.168.7.9/16 -j DROP'))[0].severity, 'info', 'a DROP is info');
+});
+
+test('cidr-host-bits-set: comma lists, nft sets, != and IPv6 are all read', () => {
+  assert.equal(hbHits(iptRule('-s 10.0.0.0/8,10.1.2.3/16 -j ACCEPT')).length, 1);
+  const nft = hbHits(nftRule('ip saddr { 10.0.0.0/8, 172.16.5.1/12 } accept'));
+  assert.equal(nft.length, 1);
+  assert.match(nft[0].title, /keeps `172\.16\.0\.0\/12`/);
+  assert.equal(hbHits(nftRule('ip daddr != 192.168.0.1/16 drop')).length, 1);
+  const v6 = hbHits(nftRule('ip6 saddr 2001:db8::10/64 tcp dport 22 accept'));
+  assert.equal(v6.length, 1);
+  assert.match(v6[0].title, /keeps `2001:db8::\/64`/);
+});
+
+test('cidr-host-bits-set: networks, /32s, bare hosts and DNAT targets are fine', () => {
+  for (const body of ['-s 10.0.0.0/8 -j ACCEPT', '-s 10.20.0.40/32 -j ACCEPT', '-s 10.20.0.40 -j ACCEPT',
+    '-s 0.0.0.0/0 -j ACCEPT', '-s 192.168.1.128/25 -j ACCEPT']) {
+    assert.equal(hbHits(iptRule(body)).length, 0, body);
+  }
+  // Anchor: the same harness DOES flag the bad spelling.
+  assert.equal(hbHits(iptRule('-s 192.168.1.129/25 -j ACCEPT')).length, 1);
+  const nat = ['*nat', ':PREROUTING ACCEPT [0:0]', '-A PREROUTING -p tcp --dport 80 -j DNAT --to-destination 10.0.0.5:8080', 'COMMIT'].join('\n');
+  assert.equal(hbHits(nat).length, 0);
+});
+
+test('cidr-host-bits-set: the sample flags the SSH host, not the /32 or the office network', () => {
+  const f = hbHits(sample('iptables-cidr-host-bits.txt'));
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /10\.20\.0\.15\/24/);
 });

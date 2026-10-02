@@ -36,6 +36,7 @@
     multiportoverflow: 'samples/iptables-multiport-overflow.txt',
     logprefixtruncated: 'samples/iptables-log-prefix-truncated.txt',
     limitdefault: 'samples/iptables-limit-default.txt',
+    cidrhostbits: 'samples/iptables-cidr-host-bits.txt',
     nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 

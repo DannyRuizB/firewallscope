@@ -45,6 +45,7 @@ const EXPECTED = {
   'iptables-multiport-overflow.txt': ['multiport-too-many-ports'],
   'iptables-log-prefix-truncated.txt': ['log-prefix-too-long'],
   'nft-label-too-long.txt': ['log-prefix-too-long', 'comment-too-long'],
+  'iptables-limit-default.txt': ['limit-default-rate'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -121,6 +122,7 @@ const ALL_SMELLS = [
   'multiport-too-many-ports',
   'log-prefix-too-long',
   'comment-too-long',
+  'limit-default-rate',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3562,4 +3564,54 @@ test('comment-too-long: iptables over 255 bytes is info (cut silently); nft over
   assert.equal(labelHits(nftRule(`tcp dport 9100 accept comment "${'c'.repeat(128)}"`), 'comment-too-long').length, 0);
   // A 200-byte nft comment is not ALSO judged by the iptables 255 rule, and vice versa.
   assert.equal(labelHits(iptRule(`-m comment --comment "${'c'.repeat(200)}" -j ACCEPT`), 'comment-too-long').length, 0);
+});
+
+// --- limit-default-rate --------------------------------------------------------
+// Measured (iptables 1.8.13 both backends): `-m limit` with no --limit loads
+// as 3/hour burst 5, silently; in front of a DROP, 5 of 12 pings answered.
+
+function limitHits(body) {
+  return labelHits(iptRule(body), 'limit-default-rate');
+}
+
+test('limit-default-rate: -m limit with no --limit on an ACCEPT is a warning, burst quoted', () => {
+  const f = limitHits('-p tcp --dport 22 -m limit -j ACCEPT');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'warning');
+  assert.match(f[0].title, /lets 5 packets through/);
+  assert.match(f[0].details, /no `--limit` is given/);
+  const burst = limitHits('-p tcp --dport 22 -m limit --limit-burst 50 -j ACCEPT');
+  assert.equal(burst.length, 1, '--limit-burst alone still runs at 3/hour');
+  assert.match(burst[0].title, /lets 50 packets through/);
+});
+
+test('limit-default-rate: the dump spelling (--limit 3/hour) is judged too, and says it cannot tell', () => {
+  const f = limitHits('-p tcp -m tcp --dport 22 -m limit --limit 3/hour -j ACCEPT');
+  assert.equal(f.length, 1);
+  assert.match(f[0].details, /cannot tell a deliberate 3\/hour/);
+  assert.equal(limitHits('-p tcp --dport 22 -m limit --limit 3/h -j ACCEPT').length, 1, 'short unit');
+  assert.equal(limitHits('-p tcp --dport 22 -m limit --limit 1/min -j ACCEPT').length, 0, '1/min is not the default');
+  assert.equal(limitHits('-p tcp --dport 22 -m limit --limit 3/min -j ACCEPT').length, 0, '3/min is not the default');
+  assert.equal(limitHits('-p tcp --dport 22 -m limit --limit 10/sec -j ACCEPT').length, 0);
+});
+
+test('limit-default-rate: LOG is info; DROP and hashlimit are not judged', () => {
+  const f = limitHits('-m limit -j LOG --log-prefix "FW: "');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'info');
+  assert.match(f[0].title, /logs 5 lines/);
+  assert.equal(limitHits('-p icmp -m limit -j DROP').length, 0, 'DROP belongs to rate-limit-drop-inverted');
+  assert.equal(limitHits('-p tcp --dport 22 -m hashlimit --hashlimit-upto 3/hour --hashlimit-name x -j ACCEPT').length, 0);
+  assert.equal(limitHits('-p tcp --dport 22 -j ACCEPT').length, 0, 'no limit match at all');
+});
+
+test('limit-default-rate: nft is never judged (limit rate has no default)', () => {
+  assert.equal(labelHits(nftRule('tcp dport 22 limit rate 3/hour accept'), 'limit-default-rate').length, 0);
+});
+
+test('limit-default-rate: the sample flags SSH (warning) and the drop log (info), not HTTPS', () => {
+  const f = FS.lint(FS.parse(sample('iptables-limit-default.txt'))).findings.filter((x) => x.id === 'limit-default-rate');
+  assert.equal(f.map((x) => x.severity).sort().join(','), 'info,warning');
+  assert.ok(f.every((x) => x.ruleIdx !== 4), 'the 50/sec HTTPS rule is fine');
+  assert.match(f.find((x) => x.severity === 'info').title, /logs 10 lines/);
 });

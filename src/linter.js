@@ -114,6 +114,7 @@
     detectMultiportTooManyPorts(result, findings);
     detectLogPrefixTooLong(result, findings);
     detectCommentTooLong(result, findings);
+    detectLimitDefaultRate(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -3305,6 +3306,63 @@
         details: `This ACCEPT is gated by ${how}, which matches traffic only while it is ABOVE the rate — calm, legitimate traffic never matches and falls through to the rules below (usually the default deny), so the service is dead on a quiet day and answers only under flood. Flip the direction, not the keying: accept under the limit (\`-m hashlimit --hashlimit-upto … --hashlimit-mode srcip -j ACCEPT\`, nft \`limit rate 10/second accept\`) — or keep the over-limit match but make it a DROP that sheds the excess above a plain ACCEPT.`
       });
     }
+  }
+
+  // ── limit-default-rate ─────────────────────────────────────────────
+  // `-m limit` with no `--limit` is not "no limit": the match falls back
+  // to 3/hour with a burst of 5, and says nothing. Measured (iptables
+  // 1.8.13, both backends): `-m limit -j ACCEPT` and `-m limit
+  // --limit-burst 50 -j ACCEPT` load with rc 0 and come back from
+  // `iptables -S` / `iptables-save` as `--limit 3/hour`; with the first
+  // rule in front of a DROP, 5 of 12 pings were answered and the other 7
+  // dropped (with `--limit 10/s`, 12 of 12). So an ACCEPT admits the
+  // burst and then one packet every 20 minutes — the service looks fine
+  // for the first few connections of a test and is dead afterwards — and
+  // a LOG rule goes quiet after five lines. The dump prints `3/hour`
+  // whether or not it was written, so a deliberate 3/hour and a forgotten
+  // `--limit` look the same: both are judged, and the text says so.
+  // iptables only — nft's `limit rate` and hashlimit's `--hashlimit-upto`
+  // have no default (the rate is mandatory). DROP is left to
+  // rate-limit-drop-inverted, whose verdict is the bigger bug.
+  const LIMIT_UNIT_SECONDS = { s: 1, sec: 1, second: 1, m: 60, min: 60, minute: 60, h: 3600, hour: 3600, d: 86400, day: 86400 };
+
+  function limitDefaultRate(rule) {
+    const raw = String(rule.raw || '');
+    if (!/(^|\s)-m\s+limit\b/.test(raw)) return null;
+    const burstM = raw.match(/--limit-burst[\s=]+(\d+)/);
+    const burst = burstM ? Number(burstM[1]) : 5;
+    const rateM = raw.match(/--limit[\s=]+(\d+)\/([a-z]+)/i);
+    if (!rateM) return { burst, written: false };
+    const unit = LIMIT_UNIT_SECONDS[rateM[2].toLowerCase()];
+    if (!unit || Number(rateM[1]) * 3600 !== 3 * unit) return null;
+    return { burst, written: true };
+  }
+
+  function detectLimitDefaultRate(result, findings) {
+    if (result.format !== 'iptables' && result.format !== 'ip6tables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const accept = isAcceptAction(rule);
+      if (!accept && !isLogRule(rule)) return;
+      const hit = limitDefaultRate(rule);
+      if (!hit) return;
+      const spelled = hit.written
+        ? '`iptables-save` prints `--limit 3/hour` whether or not it was written, so this cannot tell a deliberate 3/hour from a forgotten `--limit`; if it is deliberate, ignore this'
+        : 'no `--limit` is given, so the match uses its default';
+      findings.push({
+        id: 'limit-default-rate',
+        severity: accept ? 'warning' : 'info',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: idx,
+        title: accept
+          ? `\`-m limit\` at 3/hour: this ACCEPT lets ${hit.burst} packets through, then one every 20 minutes`
+          : `\`-m limit\` at 3/hour: this rule logs ${hit.burst} lines, then one every 20 minutes`,
+        details: `\`-m limit\` without \`--limit\` is not unlimited: it falls back to 3/hour with a burst of 5, silently (measured: rc 0, and the dump shows \`--limit 3/hour\`). Here ${spelled}. ${accept
+          ? `After the first ${hit.burst} packets the rule matches about one packet every 20 minutes and the rest fall through to the rules below — measured in front of a DROP, 5 of 12 pings answered. A quick test passes and the service dies afterwards.`
+          : `After the first ${hit.burst} lines the log goes almost silent, so the attack you wanted a record of leaves one line every 20 minutes.`} Write the rate you mean: \`-m limit --limit 10/sec --limit-burst 20\` (nft: \`limit rate 10/second burst 20 packets\`).`
+      });
+    });
   }
 
   // ── mac-based-trust ────────────────────────────────────────────────

@@ -115,6 +115,7 @@
     detectLogPrefixTooLong(result, findings);
     detectCommentTooLong(result, findings);
     detectLimitDefaultRate(result, findings);
+    detectCidrHostBitsSet(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -3362,6 +3363,88 @@
           ? `After the first ${hit.burst} packets the rule matches about one packet every 20 minutes and the rest fall through to the rules below — measured in front of a DROP, 5 of 12 pings answered. A quick test passes and the service dies afterwards.`
           : `After the first ${hit.burst} lines the log goes almost silent, so the attack you wanted a record of leaves one line every 20 minutes.`} Write the rate you mean: \`-m limit --limit 10/sec --limit-burst 20\` (nft: \`limit rate 10/second burst 20 packets\`).`
       });
+    });
+  }
+
+  // ── cidr-host-bits-set ─────────────────────────────────────────────
+  // `-s 192.168.1.10/24` reads like "this host, in that subnet". The kernel
+  // reads a prefix: the host bits are dropped and the rule matches the whole
+  // /24. Measured (iptables 1.8.13 nf_tables + legacy, ip6tables, nftables
+  // 1.1.x, real loads): every one loads with rc 0, no warning, and comes back
+  // as 192.168.1.0/24 (2001:db8::10/64 as 2001:db8::/64). An ACCEPT meant for
+  // one admin workstation now trusts its 253 neighbours. A dump taken with
+  // iptables-save / nft list is already normalised - the smell lives in the
+  // files people write by hand (rules.v4, nft -f sources, scripts), which is
+  // exactly where the mistake is made. A reversed port range, by contrast, is
+  // refused by both tools ("invalid portrange (min > max)", "Range negative
+  // size") and needs no smell.
+  function cidrNetwork(c) {
+    const width = c.family === 'v6' ? 128n : 32n;
+    const host = (1n << (width - BigInt(c.bits))) - 1n;
+    return { net: c.value & ~host & ((1n << width) - 1n), hostBits: c.value & host };
+  }
+
+  function formatAddr(family, v) {
+    if (family === 'v4') return [24n, 16n, 8n, 0n].map((sh) => String((v >> sh) & 255n)).join('.');
+    const h = [];
+    for (let i = 7; i >= 0; i--) h.push(((v >> BigInt(i * 16)) & 0xffffn).toString(16));
+    let best = -1, bestLen = 0;
+    for (let i = 0; i < 8;) {
+      if (h[i] !== '0') { i++; continue; }
+      let j = i;
+      while (j < 8 && h[j] === '0') j++;
+      if (j - i > bestLen && j - i > 1) { best = i; bestLen = j - i; }
+      i = j;
+    }
+    if (best < 0) return h.join(':');
+    return `${h.slice(0, best).join(':')}::${h.slice(best + bestLen).join(':')}`;
+  }
+
+  // Every address literal in an address position of the rule's text.
+  function addressLiterals(raw, format) {
+    const out = [];
+    if (format === 'nftables') {
+      const re = /\b(?:saddr|daddr)\s+(!=\s*)?(\{[^}]*\}|\S+)/g;
+      let m;
+      while ((m = re.exec(raw)) !== null) {
+        for (const v of m[2].replace(/[{}]/g, ' ').split(/[\s,]+/)) if (v) out.push(v);
+      }
+      return out;
+    }
+    const re = /(?:^|\s)(?:-s|-d|--source|--destination)\s+(\S+)/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) for (const v of m[1].split(',')) if (v) out.push(v);
+    return out;
+  }
+
+  function detectCidrHostBitsSet(result, findings) {
+    const format = result.format;
+    if (format !== 'iptables' && format !== 'ip6tables' && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const seen = new Set();
+      for (const lit of addressLiterals(String(rule.raw || ''), format)) {
+        if (!lit.includes('/') || seen.has(lit)) continue;
+        seen.add(lit);
+        const c = parseCidr(lit);
+        if (!c) continue;
+        const { net, hostBits } = cidrNetwork(c);
+        if (hostBits === 0n) continue;
+        const kept = `${formatAddr(c.family, net)}/${c.bits}`;
+        const width = c.family === 'v6' ? 128 : 32;
+        const size = width - c.bits;
+        const span = c.family === 'v4' ? `${(2 ** size).toLocaleString('en-US')} addresses` : `a /${c.bits}`;
+        const accept = isAcceptAction(rule);
+        findings.push({
+          id: 'cidr-host-bits-set',
+          severity: accept ? 'warning' : 'info',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: idx,
+          title: `\`${lit}\` has host bits set: the kernel keeps \`${kept}\``,
+          details: `A prefix length means a network, so the address part is cut to its first ${c.bits} bits: this rule matches all of ${kept} (${span}), not the single host ${lit.split('/')[0]}. Loaded silently - rc 0, no warning, and the dump shows ${kept} (measured: iptables, ip6tables and nft alike).${accept ? ' On an ACCEPT that widens the trust from one machine to every neighbour in the block.' : ''} Write the host as a /${width} (or no prefix at all), or the network as ${kept} if the whole block is meant.`
+        });
+      }
     });
   }
 

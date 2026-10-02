@@ -35,6 +35,7 @@
     undefinedchain: 'samples/iptables-undefined-chain.txt',
     multiportoverflow: 'samples/iptables-multiport-overflow.txt',
     logprefixtruncated: 'samples/iptables-log-prefix-truncated.txt',
+    limitdefault: 'samples/iptables-limit-default.txt',
     nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 

@@ -1,0 +1,14 @@
+# An nft ruleset that means to allow IPv6 neighbor discovery but wrote a type
+# name nft does not know (nd-neighbour-solicit - nft spells it
+# nd-neighbor-solicit, no 'u'). Measured on THIS file (nftables 1.1.6): nft -f
+# fails with "Could not parse ICMPv6 type", and nft -f is atomic, so the whole
+# ruleset is refused and the box boots with no firewall at all.
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iifname "lo" accept
+		ct state established,related accept
+		icmpv6 type nd-neighbour-solicit accept
+		icmpv6 type echo-request limit rate 5/second accept
+	}
+}

@@ -109,6 +109,7 @@
     detectTcpFlagsNeverMatch(result, findings);
     detectTcpOptionWithoutTcp(result, findings);
     detectIcmpMatchWithoutIcmp(result, findings);
+    detectIcmpTypeUnknown(result, findings);
     detectInterfaceMatchWrongDirection(result, findings);
     detectJumpToUndefinedChain(result, findings);
     detectMultiportTooManyPorts(result, findings);
@@ -1021,6 +1022,95 @@
 
 
 
+
+  // ── icmp-type-unknown ────────────────────────────────────────────────
+  // A named `--icmp-type` / `--icmpv6-type` (iptables) or `icmp type` /
+  // `icmpv6 type` (nft) value the tools do not know is refused at load, so a
+  // hand-written rules.v4 / nft -f file with a typo ("echo-reqest") boots with
+  // no firewall. MEASURED (iptables/ip6tables 1.8.13, nft 1.1.6, real loads):
+  // `--icmp-type bogus-type` and `--icmp-type 300` -> "Unknown ICMP type",
+  // rc 2; `--icmpv6-type bogus6` -> "Unknown ICMPv6 type"; nft `icmp type
+  // bogus-type` -> "Could not parse ICMP type", the whole file refused. A
+  // NUMERIC type is accepted silently for 0-255 (even one with no name, like
+  // 255), so numbers are judged only by range; names are judged against the
+  // union of what iptables AND nft accept (so a name valid on either backend
+  // is never flagged), compared case-insensitively. Like cidr-host-bits-set
+  // and log-level-unknown, a dump is already normalised to numbers, so this
+  // lives in the files people write by hand. The type/code form (`8/0`) is
+  // split and each half range-checked; `any` is allowed everywhere.
+  const ICMP4_TYPES = new Set([
+    'any', 'echo-reply', 'pong', 'destination-unreachable', 'network-unreachable', 'host-unreachable',
+    'protocol-unreachable', 'port-unreachable', 'fragmentation-needed', 'source-route-failed',
+    'network-unknown', 'host-unknown', 'network-prohibited', 'host-prohibited', 'tos-network-unreachable',
+    'tos-host-unreachable', 'communication-prohibited', 'host-precedence-violation', 'precedence-cutoff',
+    'source-quench', 'redirect', 'network-redirect', 'host-redirect', 'tos-network-redirect', 'tos-host-redirect',
+    'echo-request', 'ping', 'router-advertisement', 'router-solicitation', 'time-exceeded', 'ttl-exceeded',
+    'ttl-zero-during-transit', 'ttl-zero-during-reassembly', 'parameter-problem', 'ip-header-bad',
+    'required-option-missing', 'timestamp-request', 'timestamp-reply', 'info-request', 'info-reply',
+    'address-mask-request', 'address-mask-reply'
+  ]);
+  const ICMP6_TYPES = new Set([
+    'any', 'destination-unreachable', 'no-route', 'communication-prohibited', 'beyond-scope', 'address-unreachable',
+    'port-unreachable', 'failed-policy', 'reject-route', 'packet-too-big', 'time-exceeded', 'ttl-exceeded',
+    'ttl-zero-during-transit', 'ttl-zero-during-reassembly', 'parameter-problem', 'bad-header', 'unknown-header-type',
+    'unknown-option', 'echo-request', 'ping', 'echo-reply', 'pong', 'mld-listener-query', 'mld-listener-report',
+    'mld-listener-done', 'mld-listener-reduction', 'router-solicitation', 'router-advertisement',
+    'neighbour-solicitation', 'neighbor-solicitation', 'neighbour-advertisement', 'neighbor-advertisement', 'redirect',
+    // nft's own spellings for the ND family (and a few nft-only types)
+    'nd-router-solicit', 'nd-router-advert', 'nd-neighbor-solicit', 'nd-neighbor-advert', 'nd-redirect',
+    'router-renumbering', 'ind-neighbor-solicit', 'ind-neighbor-advert', 'mld2-listener-report'
+  ]);
+
+  // Validate one type token (possibly `type/code`). Returns null when fine, or
+  // a short reason when not.
+  function badIcmpType(value, v6) {
+    for (const part of value.split('/')) {
+      if (part === '') return `empty type part in "${value}"`;
+      if (/^\d+$/.test(part)) {
+        if (Number(part) > 255) return `${part} is out of range (an ICMP type/code is a single byte, 0-255)`;
+      } else if (!(v6 ? ICMP6_TYPES : ICMP4_TYPES).has(part.toLowerCase())) {
+        return `"${part}" is not ${v6 ? 'an ICMPv6' : 'an ICMP'} type name`;
+      }
+    }
+    return null;
+  }
+
+  function detectIcmpTypeUnknown(result, findings) {
+    const format = result.format;
+    const isIpt = format === 'iptables' || format === 'ip6tables';
+    if (!isIpt && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const raw = String(rule.raw != null ? rule.raw : (rule.match || ''));
+      const where = { table: table.name, tableFamily: table.family || null, chain: chain.name, ruleIdx: idx };
+      const hits = [];
+      if (isIpt) {
+        const m = /(?:^|\s)--(icmpv6|icmp)-type\s+(\S+)/.exec(raw);
+        if (m) hits.push({ v6: m[1] === 'icmpv6', values: [m[2]], opt: `--${m[1]}-type` });
+      } else {
+        const m = /(?:^|\s)(icmpv6|icmp)\s+type\s+(\{[^}]*\}|\S+)/.exec(raw);
+        if (m) {
+          const values = m[2].replace(/[{}]/g, ' ').split(/[\s,]+/).filter(Boolean).filter((v) => v !== '!=');
+          hits.push({ v6: m[1] === 'icmpv6', values, opt: `${m[1]} type` });
+        }
+      }
+      for (const hit of hits) {
+        for (const value of hit.values) {
+          const reason = badIcmpType(value, hit.v6);
+          if (!reason) continue;
+          findings.push({
+            id: 'icmp-type-unknown',
+            severity: 'error',
+            ...where,
+            title: `\`${hit.opt} ${value}\` — ${reason}; the rule will not load`,
+            details: isIpt
+              ? `${hit.v6 ? 'ip6tables' : 'iptables'} refuses an unknown ${hit.v6 ? 'ICMPv6' : 'ICMP'} type at load (measured: "Unknown ${hit.v6 ? 'ICMPv6' : 'ICMP'} type \`${value}\`", rc 2), and ${RESTORE_REFUSED}. Check the spelling against \`${hit.v6 ? 'ip6tables -p ipv6-icmp -h' : 'iptables -p icmp -h'}\` (or use the numeric type, 0-255).`
+              : `nft refuses an unknown ${hit.v6 ? 'ICMPv6' : 'ICMP'} type at load (measured: "Could not parse ${hit.v6 ? 'ICMPv6' : 'ICMP'} type"), and ${NFT_REFUSED}. Check the spelling against \`nft describe ${hit.v6 ? 'icmpv6' : 'icmp'} type\` (or use the numeric type, 0-255).`
+          });
+          break; // one finding per rule is enough
+        }
+      }
+    });
+  }
 
   // ── interface-match-wrong-direction ──────────────────────────────────
   // A packet only has an INPUT interface where it arrived on one, and an

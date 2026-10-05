@@ -39,6 +39,8 @@
     cidrhostbits: 'samples/iptables-cidr-host-bits.txt',
     loglevelipt: 'samples/iptables-log-level-iface.txt',
     loglevelnft: 'samples/nft-log-level-iface.txt',
+    icmptypetypo: 'samples/iptables-icmp-type-typo.txt',
+    icmpv6typetypo: 'samples/nft-icmpv6-type-typo.txt',
     nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 

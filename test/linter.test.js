@@ -49,6 +49,8 @@ const EXPECTED = {
   'iptables-cidr-host-bits.txt': ['cidr-host-bits-set'],
   'iptables-log-level-iface.txt': ['log-level-unknown', 'interface-name-too-long'],
   'nft-log-level-iface.txt': ['log-level-unknown', 'interface-name-too-long'],
+  'iptables-icmp-type-typo.txt': ['icmp-type-unknown'],
+  'nft-icmpv6-type-typo.txt': ['icmp-type-unknown'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -129,6 +131,7 @@ const ALL_SMELLS = [
   'cidr-host-bits-set',
   'log-level-unknown',
   'interface-name-too-long',
+  'icmp-type-unknown',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3751,5 +3754,56 @@ test('log-level-unknown / interface-name-too-long: the two samples raise exactly
     const i = findings.filter((x) => x.id === 'interface-name-too-long');
     assert.equal(i.length, 1, name);
     assert.match(i[0].title, /wg-office-madrid|br-guest-vlan100/);
+  }
+});
+
+// --- icmp-type-unknown -------------------------------------------------------
+// Measured (iptables/ip6tables 1.8.13, nft 1.1.6, real loads): a named type
+// the tool does not know is refused ("Unknown ICMP type", "Could not parse
+// ICMP type"); a numeric type is accepted for 0-255 and rejected above; names
+// are checked against what iptables AND nft accept, case-insensitively.
+
+const itHits = (text) => FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'icmp-type-unknown');
+
+test('icmp-type-unknown (iptables): a typo in the ICMP type is an error, good names and numbers are fine', () => {
+  const f = itHits(iptRule('-p icmp --icmp-type echo-reqest -j ACCEPT'));
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'error');
+  assert.match(f[0].title, /`--icmp-type echo-reqest` — "echo-reqest" is not an ICMP type name; the rule will not load/);
+  assert.match(f[0].details, /Unknown ICMP type/);
+  for (const ok of ['echo-request', 'ping', 'echo-reply', 'destination-unreachable', 'TOS-host-unreachable', 'any', '8', '0', '255', '8/0', '3/4']) {
+    assert.equal(itHits(iptRule(`-p icmp --icmp-type ${ok} -j ACCEPT`)).length, 0, ok);
+  }
+  // a numeric type over 255 won't load
+  assert.match(itHits(iptRule('-p icmp --icmp-type 300 -j ACCEPT'))[0].title, /out of range/);
+});
+
+test('icmp-type-unknown (ip6tables): icmpv6 names are judged against the v6 set', () => {
+  const v6 = (body) => ['*filter', ':INPUT DROP [0:0]', ':FORWARD DROP [0:0]', ':OUTPUT ACCEPT [0:0]', `-A INPUT ${body}`, 'COMMIT'].join('\n');
+  // (parser auto-detects ip6tables from the icmpv6 option / addresses; the rule carries the family)
+  assert.equal(itHits(v6('-p ipv6-icmp --icmpv6-type nd-neighbor-solicit -j ACCEPT')).length, 0, 'nft spelling is allowed too');
+  assert.equal(itHits(v6('-p ipv6-icmp --icmpv6-type neighbour-solicitation -j ACCEPT')).length, 0, 'iptables spelling');
+  assert.equal(itHits(v6('-p ipv6-icmp --icmpv6-type packet-too-big -j ACCEPT')).length, 0);
+  const f = itHits(v6('-p ipv6-icmp --icmpv6-type bogus6 -j ACCEPT'));
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /ICMPv6 type/);
+});
+
+test('icmp-type-unknown (nft): names and sets are checked, numbers pass', () => {
+  assert.equal(itHits(nftRule('icmp type echo-request accept')).length, 0);
+  assert.equal(itHits(nftRule('icmp type { echo-request, echo-reply } accept')).length, 0);
+  const f = itHits(nftRule('icmp type bogus-type accept'));
+  assert.equal(f.length, 1);
+  assert.match(f[0].details, /Could not parse ICMP type/);
+  // a bad member of a set is caught
+  assert.equal(itHits(nftRule('icmp type { echo-request, nope } accept')).length, 1);
+  // icmpv6 family
+  assert.equal(itHits(nftRule('icmpv6 type nd-neighbor-solicit accept')).length, 0);
+  assert.equal(itHits(nftRule('icmpv6 type bogus6 accept')).length, 1);
+});
+
+test('icmp-type-unknown: the two samples each raise exactly one', () => {
+  for (const name of ['iptables-icmp-type-typo.txt', 'nft-icmpv6-type-typo.txt']) {
+    assert.equal(itHits(sample(name)).length, 1, name);
   }
 });

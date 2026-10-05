@@ -1,0 +1,15 @@
+# A hand-written /etc/iptables/rules.v4 that allows ping but fat-fingered the
+# ICMP type name (echo-reqest, missing a 'u'). Measured on THIS file
+# (iptables 1.8.13, nf_tables and legacy): iptables-restore stops at that line
+# with "Unknown ICMP type `echo-reqest'", rc 2, *filter loads NOTHING and
+# INPUT stays at policy ACCEPT - the box boots open. A numeric type (8) or the
+# correct name (echo-request) would have loaded.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p icmp --icmp-type echo-reqest -m limit --limit 1/s -j ACCEPT
+-A INPUT -p icmp --icmp-type destination-unreachable -j ACCEPT
+COMMIT

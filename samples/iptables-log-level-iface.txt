@@ -1,0 +1,18 @@
+# A hand-written /etc/iptables/rules.v4 whose author also writes nft. Two
+# lines carry nft habits that iptables refuses (measured on THIS file,
+# iptables 1.8.13, nf_tables and legacy): `--log-level warn` is nft's
+# spelling - iptables wants `warning` ('log level "warn" unknown') - and
+# the WireGuard name is 16 characters, one over the 15 an interface name
+# can have. iptables-restore stops at the first of them, rc 2, *filter
+# loads nothing and INPUT stays at policy ACCEPT - the box boots open.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p udp --dport 51820 -j ACCEPT
+-A INPUT -i wg-office-madrid -p tcp --dport 22 -j ACCEPT
+-A INPUT -p tcp --dport 443 -j ACCEPT
+-A INPUT -m limit --limit 5/min -j LOG --log-prefix "ipt-input-drop: " --log-level warn
+COMMIT

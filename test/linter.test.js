@@ -47,6 +47,8 @@ const EXPECTED = {
   'nft-label-too-long.txt': ['log-prefix-too-long', 'comment-too-long'],
   'iptables-limit-default.txt': ['limit-default-rate'],
   'iptables-cidr-host-bits.txt': ['cidr-host-bits-set'],
+  'iptables-log-level-iface.txt': ['log-level-unknown', 'interface-name-too-long'],
+  'nft-log-level-iface.txt': ['log-level-unknown', 'interface-name-too-long'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -125,6 +127,8 @@ const ALL_SMELLS = [
   'comment-too-long',
   'limit-default-rate',
   'cidr-host-bits-set',
+  'log-level-unknown',
+  'interface-name-too-long',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3661,4 +3665,91 @@ test('cidr-host-bits-set: the sample flags the SSH host, not the /32 or the offi
   const f = hbHits(sample('iptables-cidr-host-bits.txt'));
   assert.equal(f.length, 1);
   assert.match(f[0].title, /10\.20\.0\.15\/24/);
+});
+
+// --- log-level-unknown -------------------------------------------------------
+// Measured (iptables 1.8.13 nf_tables + legacy, ip6tables, nftables 1.1.x):
+// iptables takes emerg panic alert crit error warning notice info debug / 0-7
+// and refuses warn, err, audit, 8 and upper case; nft takes emerg alert crit
+// err warn notice info debug audit and refuses warning, error and numbers.
+
+const llHits = (text) => FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'log-level-unknown');
+
+test('log-level-unknown (iptables): nft spellings are refused, every iptables spelling is fine', () => {
+  for (const lvl of ['emerg', 'panic', 'alert', 'crit', 'error', 'warning', 'notice', 'info', 'debug', '0', '4', '7']) {
+    assert.equal(llHits(iptRule(`-j LOG --log-prefix "x: " --log-level ${lvl}`)).length, 0, lvl);
+  }
+  const f = llHits(iptRule('-j LOG --log-prefix "x: " --log-level warn'));
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'error');
+  assert.match(f[0].title, /`--log-level warn` is not an iptables level — iptables-restore refuses the file/);
+  assert.match(f[0].details, /log level "warn" unknown/);
+  assert.match(f[0].details, /how nft spells it/);
+  assert.match(f[0].details, /Write `--log-level warning`/);
+  assert.match(f[0].details, /every table after it in the file load NOTHING/);
+  for (const lvl of ['err', 'audit', '8', 'WARNING']) assert.equal(llHits(iptRule(`-j LOG --log-level ${lvl}`)).length, 1, lvl);
+  assert.match(llHits(iptRule('-j LOG --log-level WARNING'))[0].details, /Write `--log-level warning`/);
+});
+
+test('log-level-unknown (nft): iptables spellings and numbers are refused, nft spellings are fine', () => {
+  for (const lvl of ['emerg', 'alert', 'crit', 'err', 'warn', 'notice', 'info', 'debug', 'audit']) {
+    assert.equal(llHits(nftRule(`log prefix "x: " level ${lvl} drop`)).length, 0, lvl);
+  }
+  const f = llHits(nftRule('limit rate 5/minute log prefix "nft drop: " level warning'));
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'error');
+  assert.match(f[0].title, /`log level warning` is not an nft level — the ruleset will not load/);
+  assert.match(f[0].details, /how iptables spells it/);
+  assert.match(f[0].details, /Write `level warn` — or drop it: warn is the default/);
+  assert.match(f[0].details, /nft -f` is atomic/);
+  assert.match(llHits(nftRule('log level 3'))[0].details, /Write `level err`/);
+  assert.equal(llHits(nftRule('log level error prefix "x"')).length, 1, 'level before prefix');
+  // A prefix that merely contains the word "level" is not a level.
+  assert.equal(llHits(nftRule('log prefix "level warning: " drop')).length, 0);
+});
+
+// --- interface-name-too-long -------------------------------------------------
+// Measured: 15 characters load, 16 are refused by iptables (both backends,
+// -i/-o/long forms/negated, a trailing + counted) and by nft (iifname/oifname/
+// iif, sets, !=, a trailing * counted).
+
+const inHits = (text) => FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'interface-name-too-long');
+
+test('interface-name-too-long (iptables): 16 characters is an error, 15 is fine, the wildcard counts', () => {
+  assert.equal(inHits(iptRule('-i abcdefghijklmno -j ACCEPT')).length, 0);
+  assert.equal(inHits(iptRule('-i abcdefghijklmn+ -j ACCEPT')).length, 0);
+  const f = inHits(iptRule('-i wg-office-madrid -p tcp --dport 22 -j ACCEPT'));
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'error');
+  assert.match(f[0].title, /Interface `wg-office-madrid` is 16 characters; names stop at 15 — iptables-restore refuses the file/);
+  assert.match(f[0].details, /must be shorter than 16 characters/);
+  assert.match(f[0].details, /ip -br link/);
+  for (const body of ['-i abcdefghijklmno+ -j ACCEPT', '! -i abcdefghijklmnop -j ACCEPT', '--in-interface abcdefghijklmnop -j ACCEPT']) {
+    assert.equal(inHits(iptRule(body)).length, 1, body);
+  }
+  const fwd = [...FILTER_HEAD, '-A FORWARD -i eth0 -o br-guest-vlan100 -j ACCEPT', 'COMMIT'].join('\n');
+  assert.equal(inHits(fwd).length, 1);
+});
+
+test('interface-name-too-long (nft): quoted, sets, != and iif are read; variables are skipped', () => {
+  assert.equal(inHits(nftRule('iifname "abcdefghijklmn*" accept')).length, 0);
+  const f = inHits(nftRule('iifname "br-guest-vlan100" udp dport 53 accept'));
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /the ruleset will not load/);
+  assert.match(f[0].details, /String exceeds maximum length of 16/);
+  for (const body of ['iifname "abcdefghijklmno*" accept', 'iifname { "eth0", "abcdefghijklmnop" } accept',
+    'iifname != "abcdefghijklmnop" drop', 'oifname "abcdefghijklmnop" accept', 'iif "abcdefghijklmnop" accept']) {
+    assert.equal(inHits(nftRule(body)).length, 1, body);
+  }
+  assert.equal(inHits(nftRule('iifname $very_long_variable_name accept')).length, 0);
+});
+
+test('log-level-unknown / interface-name-too-long: the two samples raise exactly their two lines', () => {
+  for (const name of ['iptables-log-level-iface.txt', 'nft-log-level-iface.txt']) {
+    const { findings } = FS.lint(FS.parse(sample(name)));
+    assert.equal(findings.filter((x) => x.id === 'log-level-unknown').length, 1, name);
+    const i = findings.filter((x) => x.id === 'interface-name-too-long');
+    assert.equal(i.length, 1, name);
+    assert.match(i[0].title, /wg-office-madrid|br-guest-vlan100/);
+  }
 });

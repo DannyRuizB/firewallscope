@@ -1,0 +1,15 @@
+# The mirror image: an nft ruleset written by someone used to iptables.
+# `level warning` is iptables' spelling - nft wants `warn` (or nothing: it
+# is the default) - and the guest bridge name is 16 characters, one over
+# the 15 an interface name can have. Measured on THIS file (nftables
+# 1.1.x): both refused, nft -f is atomic, the box boots with no firewall.
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iifname "lo" accept
+		ct state established,related accept
+		tcp dport 22 accept
+		iifname "br-guest-vlan100" udp dport { 53, 67 } accept
+		limit rate 5/minute log prefix "nft-input-drop: " level warning
+	}
+}

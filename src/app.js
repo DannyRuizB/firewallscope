@@ -37,6 +37,8 @@
     logprefixtruncated: 'samples/iptables-log-prefix-truncated.txt',
     limitdefault: 'samples/iptables-limit-default.txt',
     cidrhostbits: 'samples/iptables-cidr-host-bits.txt',
+    loglevelipt: 'samples/iptables-log-level-iface.txt',
+    loglevelnft: 'samples/nft-log-level-iface.txt',
     nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 

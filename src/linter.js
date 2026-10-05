@@ -116,6 +116,8 @@
     detectCommentTooLong(result, findings);
     detectLimitDefaultRate(result, findings);
     detectCidrHostBitsSet(result, findings);
+    detectLogLevelUnknown(result, findings);
+    detectInterfaceNameTooLong(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -3443,6 +3445,110 @@
           ruleIdx: idx,
           title: `\`${lit}\` has host bits set: the kernel keeps \`${kept}\``,
           details: `A prefix length means a network, so the address part is cut to its first ${c.bits} bits: this rule matches all of ${kept} (${span}), not the single host ${lit.split('/')[0]}. Loaded silently - rc 0, no warning, and the dump shows ${kept} (measured: iptables, ip6tables and nft alike).${accept ? ' On an ACCEPT that widens the trust from one machine to every neighbour in the block.' : ''} Write the host as a /${width} (or no prefix at all), or the network as ${kept} if the whole block is meant.`
+        });
+      }
+    });
+  }
+
+  // ── log-level-unknown ──────────────────────────────────────────────
+  // The two front-ends spell syslog levels differently, and each refuses the
+  // other's spelling. Measured (iptables 1.8.13 nf_tables + legacy,
+  // ip6tables, nftables 1.1.x, real loads):
+  //   - iptables `--log-level` takes emerg panic alert crit error warning
+  //     notice info debug, or 0-7. `warn`, `err`, `audit`, `8` and upper case
+  //     are refused: 'log level "warn" unknown', rc 2.
+  //   - nft `log level` takes emerg alert crit err warn notice info debug
+  //     audit. `warning`, `error` and any number are refused, rc 1.
+  // So a level copied from one syntax into the other is a file that does not
+  // load. A dump never shows it (iptables-save prints the number, nft list
+  // the name) - like cidr-host-bits-set, it lives in hand-written files.
+  const IPT_LOG_LEVELS = new Set(['emerg', 'panic', 'alert', 'crit', 'error', 'warning', 'notice', 'info', 'debug', '0', '1', '2', '3', '4', '5', '6', '7']);
+  const NFT_LOG_LEVELS = new Set(['emerg', 'alert', 'crit', 'err', 'warn', 'notice', 'info', 'debug', 'audit']);
+  const IPT_LEVEL_FIX = { warn: 'warning', err: 'error' };
+  const NFT_LEVEL_FIX = { warning: 'warn', error: 'err', panic: 'emerg', 0: 'emerg', 1: 'alert', 2: 'crit', 3: 'err', 4: 'warn', 5: 'notice', 6: 'info', 7: 'debug' };
+
+  function detectLogLevelUnknown(result, findings) {
+    const format = result.format;
+    const ipt = format === 'iptables' || format === 'ip6tables';
+    if (!ipt && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const raw = String(rule.raw || '');
+      const m = ipt
+        ? /(?:^|\s)--log-level\s+"?([^\s"]+)"?/.exec(raw)
+        : /(?:^|\s)log\b(?:\s+(?!level\b)(?:"(?:[^"\\]|\\.)*"|\S+))*?\s+level\s+(\S+)/.exec(raw);
+      if (!m) return;
+      const level = m[1];
+      if ((ipt ? IPT_LOG_LEVELS : NFT_LOG_LEVELS).has(level)) return;
+      const fix = (ipt ? IPT_LEVEL_FIX : NFT_LEVEL_FIX)[level.toLowerCase()] ||
+        ((ipt ? IPT_LOG_LEVELS : NFT_LOG_LEVELS).has(level.toLowerCase()) ? level.toLowerCase() : null);
+      const other = ipt ? NFT_LOG_LEVELS.has(level) : IPT_LOG_LEVELS.has(level);
+      findings.push({
+        id: 'log-level-unknown',
+        severity: 'error',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: idx,
+        title: ipt
+          ? `\`--log-level ${level}\` is not an iptables level — iptables-restore refuses the file`
+          : `\`log level ${level}\` is not an nft level — the ruleset will not load`,
+        details: ipt
+          ? `iptables takes emerg, panic, alert, crit, error, warning, notice, info, debug or 0-7 — and nothing else (measured, both backends: 'log level "${level}" unknown', rc 2).${other ? ` \`${level}\` is how nft spells it; the two syntaxes disagree on exactly this word.` : ''} ${RESTORE_REFUSED}. ${fix ? `Write \`--log-level ${fix}\`.` : 'Use one of the names above, or a number 0-7.'}`
+          : `nft takes emerg, alert, crit, err, warn, notice, info, debug or audit — no numbers, and not iptables' spellings (measured: \`warning\`, \`error\` and \`4\` are all refused).${other ? ` \`${level}\` is how iptables spells it.` : ''} ${NFT_REFUSED}. ${fix ? `Write \`level ${fix}\`${fix === 'warn' ? ' — or drop it: warn is the default, which is why `nft list` never prints it' : ''}.` : 'Use one of the names above.'}`
+      });
+    });
+  }
+
+  // ── interface-name-too-long ────────────────────────────────────────
+  // An interface name is IFNAMSIZ (16) bytes including the NUL, so 15 is the
+  // most a name can be - and the matchers enforce it before any device is
+  // looked up. Measured (iptables 1.8.13 nf_tables + legacy, ip6tables,
+  // nftables 1.1.x): a 16-character name is refused for -i, -o, the long
+  // forms, negated, and with the wildcard counted in (`abcdefghijklmno+`);
+  // nft refuses iifname/oifname/iif, sets and `!=` alike ("String exceeds
+  // maximum length of 16"). 15 characters load. The usual victims are long
+  // bridge / VLAN / WireGuard names (`br-guest-vlan100`, `wg-office-madrid`)
+  // that the kernel itself would never have accepted either.
+  const IFNAME_MAX = 15;
+
+  function interfaceLiterals(raw, format) {
+    const out = [];
+    if (format === 'nftables') {
+      const re = /\b(?:iifname|oifname|iif|oif)\s+(?:!=\s*)?(\{[^}]*\}|"[^"]*"|\S+)/g;
+      let m;
+      while ((m = re.exec(raw)) !== null) {
+        for (const v of m[1].replace(/[{}]/g, ' ').split(/[\s,]+/)) {
+          const name = v.replace(/^"|"$/g, '');
+          if (name && !name.startsWith('$')) out.push(name);
+        }
+      }
+      return out;
+    }
+    const re = /(?:^|\s)(?:-i|-o|--in-interface|--out-interface)\s+(\S+)/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) out.push(m[1].replace(/^"|"$/g, ''));
+    return out;
+  }
+
+  function detectInterfaceNameTooLong(result, findings) {
+    const format = result.format;
+    const ipt = format === 'iptables' || format === 'ip6tables';
+    if (!ipt && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const seen = new Set();
+      for (const name of interfaceLiterals(String(rule.raw || ''), format)) {
+        const len = utf8Length(name);
+        if (len <= IFNAME_MAX || seen.has(name)) continue;
+        seen.add(name);
+        findings.push({
+          id: 'interface-name-too-long',
+          severity: 'error',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: idx,
+          title: `Interface \`${name}\` is ${len} characters; names stop at ${IFNAME_MAX} — ${ipt ? 'iptables-restore refuses the file' : 'the ruleset will not load'}`,
+          details: `An interface name is at most ${IFNAME_MAX} bytes (IFNAMSIZ is 16 with the terminating NUL), so no device can carry this name and the matcher refuses it outright — ${ipt ? `measured, both backends: "interface name \`${name}' must be shorter than 16 characters", rc 2, for -i/-o, the long forms and a negated match alike; a trailing \`+\` wildcard counts. ${RESTORE_REFUSED}` : `measured: "String exceeds maximum length of 16" for iifname/oifname/iif, inside a set or after \`!=\` alike; a trailing \`*\` wildcard counts. ${NFT_REFUSED}`}. Check the real name with \`ip -br link\` — the kernel would have refused to create the long one too, so the device is probably called something shorter.`
         });
       }
     });

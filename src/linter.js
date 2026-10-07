@@ -119,6 +119,8 @@
     detectCidrHostBitsSet(result, findings);
     detectLogLevelUnknown(result, findings);
     detectInterfaceNameTooLong(result, findings);
+    detectChainNotInTable(result, findings);
+    detectTargetNotValidHere(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -3587,6 +3589,138 @@
           : `nft takes emerg, alert, crit, err, warn, notice, info, debug or audit — no numbers, and not iptables' spellings (measured: \`warning\`, \`error\` and \`4\` are all refused).${other ? ` \`${level}\` is how iptables spells it.` : ''} ${NFT_REFUSED}. ${fix ? `Write \`level ${fix}\`${fix === 'warn' ? ' — or drop it: warn is the default, which is why `nft list` never prints it' : ''}.` : 'Use one of the names above.'}`
       });
     });
+  }
+
+  // ── chain-not-in-table / target-not-valid-here ─────────────────────
+  // Each iptables table has its own fixed set of built-in chains, and many
+  // targets are bound to one table - NAT ones even to the hooks they may run
+  // in. Get either wrong in a hand-written file and the line is refused.
+  // Measured (iptables 1.8.13, nf_tables and legacy, ip6tables; real loads):
+  //   - built-ins per table: filter INPUT/FORWARD/OUTPUT; nat PREROUTING/
+  //     INPUT/OUTPUT/POSTROUTING; mangle all five; raw PREROUTING/OUTPUT;
+  //     security INPUT/FORWARD/OUTPUT. `-A PREROUTING` in *filter, `-A FORWARD`
+  //     in *nat: "No chain/target/match by that name".
+  //   - a jump or goto to a built-in chain (`-j OUTPUT`, `-g FORWARD`) is
+  //     refused: built-ins are entered by the kernel, never jumped to.
+  //   - DNAT / SNAT / MASQUERADE / REDIRECT only in nat; REJECT only in filter
+  //     (mangle, raw, security and nat refuse it); NOTRACK and CT only in raw;
+  //     DROP in nat: "The nat table is not intended for filtering".
+  //   - inside nat: DNAT and REDIRECT run in PREROUTING/OUTPUT, SNAT in
+  //     POSTROUTING/INPUT, MASQUERADE in POSTROUTING only. A user chain is
+  //     judged by the built-ins that reach it: DNAT in a chain jumped from
+  //     POSTROUTING is refused (also through a second chain), DNAT in an
+  //     unreferenced chain loads.
+  // A dump never shows any of it (the kernel never held such a rule), so,
+  // like log-level-unknown, it lives in files people write by hand.
+  const IPT_TABLE_BUILTINS = {
+    filter: ['INPUT', 'FORWARD', 'OUTPUT'],
+    nat: ['PREROUTING', 'INPUT', 'OUTPUT', 'POSTROUTING'],
+    mangle: ['PREROUTING', 'INPUT', 'FORWARD', 'OUTPUT', 'POSTROUTING'],
+    raw: ['PREROUTING', 'OUTPUT'],
+    security: ['INPUT', 'FORWARD', 'OUTPUT']
+  };
+  const IPT_TARGET_PLACE = {
+    DNAT: { table: 'nat', hooks: ['PREROUTING', 'OUTPUT'] },
+    REDIRECT: { table: 'nat', hooks: ['PREROUTING', 'OUTPUT'] },
+    SNAT: { table: 'nat', hooks: ['POSTROUTING', 'INPUT'] },
+    MASQUERADE: { table: 'nat', hooks: ['POSTROUTING'] },
+    REJECT: { table: 'filter', hooks: null },
+    NOTRACK: { table: 'raw', hooks: null },
+    CT: { table: 'raw', hooks: null }
+  };
+
+  function detectChainNotInTable(result, findings) {
+    if (result.format !== 'iptables' && result.format !== 'ip6tables') return;
+    for (const table of result.tables) {
+      const builtins = IPT_TABLE_BUILTINS[table.name];
+      if (!builtins) continue;
+      for (const chain of table.chains) {
+        // Only an undeclared chain: the backends disagree on a declared
+        // `:PREROUTING ACCEPT` in *filter (legacy refuses, nf_tables loads).
+        if (chain.declared || !IPT_BUILTIN_CHAINS.has(chain.name) || builtins.includes(chain.name)) continue;
+        if (!chain.rules.length) continue;
+        const homes = Object.keys(IPT_TABLE_BUILTINS).filter((t) => IPT_TABLE_BUILTINS[t].includes(chain.name));
+        findings.push({
+          id: 'chain-not-in-table',
+          severity: 'error',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: null,
+          title: `*${table.name} has no ${chain.name} chain — \`-A ${chain.name}\` is refused and the file does not load`,
+          details: `The ${table.name} table's built-in chains are ${builtins.join(', ')}; ${chain.name} exists only in ${homes.join(', ')}. Measured (iptables 1.8.13, both backends): \`-A ${chain.name}\` under *${table.name} fails with "No chain/target/match by that name" — ${RESTORE_REFUSED}. Move the rules under the right *table section (often *${homes.includes('nat') && table.name === 'filter' ? 'nat' : homes[0]}), or into ${builtins.join('/')} if they belong here.`
+        });
+      }
+    }
+  }
+
+  // Built-ins of the table that reach `name` through jumps/gotos.
+  function builtinRootsOf(table, name) {
+    const builtins = IPT_TABLE_BUILTINS[table.name] || [];
+    const callers = new Map();
+    for (const chain of table.chains) {
+      for (const rule of chain.rules) {
+        if (!rule.isJumpToChain || !rule.action) continue;
+        if (!callers.has(rule.action)) callers.set(rule.action, new Set());
+        callers.get(rule.action).add(chain.name);
+      }
+    }
+    const roots = new Set();
+    const seen = new Set([name]);
+    const queue = [name];
+    while (queue.length) {
+      const cur = queue.shift();
+      if (builtins.includes(cur)) { roots.add(cur); continue; }
+      for (const from of callers.get(cur) || []) {
+        if (!seen.has(from)) { seen.add(from); queue.push(from); }
+      }
+    }
+    return roots;
+  }
+
+  function detectTargetNotValidHere(result, findings) {
+    if (result.format !== 'iptables' && result.format !== 'ip6tables') return;
+    for (const table of result.tables) {
+      const builtins = IPT_TABLE_BUILTINS[table.name];
+      if (!builtins) continue;
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          const target = rule.action;
+          if (!target) return;
+          const push = (title, details) => findings.push({
+            id: 'target-not-valid-here', severity: 'error', table: table.name,
+            tableFamily: table.family || null, chain: chain.name, ruleIdx: idx, title, details
+          });
+          const verb = rule.isGoto ? '-g' : '-j';
+          if (IPT_BUILTIN_CHAINS.has(target)) {
+            const userChain = table.chains.find((c) => c.name === target && c.declared && !c.policy && !builtins.includes(target));
+            if (userChain) return;
+            push(`\`${verb} ${target}\` jumps to a built-in chain — refused, and the file does not load`,
+              `Built-in chains are entered by the kernel at their hook, never jumped to. Measured (iptables 1.8.13, both backends): \`${verb} ${target}\` is refused ("RULE_APPEND failed (No such file or directory)" on nf_tables, "line N failed" on legacy) — ${RESTORE_REFUSED}. To share rules between ${chain.name} and ${target}, put them in a user chain and jump to it from both.`);
+            return;
+          }
+          if (target === 'DROP' && table.name === 'nat') {
+            push('`-j DROP` in the nat table — refused ("not intended for filtering"), the file does not load',
+              `Measured (iptables 1.8.13, both backends): "The \\"nat\\" table is not intended for filtering, the use of DROP is therefore inhibited", rc 2 — ${RESTORE_REFUSED}. Only the FIRST packet of a connection traverses nat anyway; drop in *filter (or *raw / *mangle PREROUTING to drop before conntrack).`);
+            return;
+          }
+          const place = IPT_TARGET_PLACE[target];
+          if (!place) return;
+          if (table.name !== place.table) {
+            push(`\`-j ${target}\` in *${table.name} — ${target} only exists in the ${place.table} table, so the file does not load`,
+              `Measured (iptables 1.8.13, both backends): ${target} outside *${place.table} is refused ("RULE_APPEND failed (Invalid argument)" on nf_tables, "line N failed" on legacy) — ${RESTORE_REFUSED}. Move the rule under *${place.table}${place.hooks ? ` (${place.hooks.join(' or ')})` : ''}.`);
+            return;
+          }
+          if (!place.hooks) return;
+          const roots = builtins.includes(chain.name) ? new Set([chain.name]) : builtinRootsOf(table, chain.name);
+          const bad = [...roots].filter((h) => !place.hooks.includes(h));
+          if (!bad.length) return;
+          const via = builtins.includes(chain.name) ? '' : ` (${chain.name} is reached from ${bad.join(', ')})`;
+          push(`\`-j ${target}\` runs in nat/${bad.join(', nat/')}${via} — ${target} is only valid in ${place.hooks.join('/')}, so the file does not load`,
+            `${target} rewrites the ${target === 'SNAT' || target === 'MASQUERADE' ? 'source on the way out' : 'destination on the way in'}, so the kernel only allows it in nat ${place.hooks.join(' and ')}. Measured (iptables 1.8.13, both backends): placed in ${bad.join('/')} it is refused ("RULE_APPEND failed (Invalid argument)"), and a user chain is judged by the built-ins that jump to it — DNAT in a chain reached from POSTROUTING is refused even two jumps deep, while the same chain reached only from PREROUTING loads. ${RESTORE_REFUSED}.`);
+        });
+      }
+    }
   }
 
   // ── interface-name-too-long ────────────────────────────────────────

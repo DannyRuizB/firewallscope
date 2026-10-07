@@ -1,0 +1,30 @@
+# A NAT gateway's hand-written rules.v4. The port-forwards live in a user
+# chain PORTFWD, jumped from PREROUTING - and then also from POSTROUTING,
+# "so the LAN can reach the forwarded ports too" (hairpin). DNAT is only
+# valid in nat PREROUTING/OUTPUT, and a user chain is judged by every
+# built-in that reaches it. Measured on THIS file (iptables 1.8.13,
+# nf_tables and legacy): refused - nf_tables at the DNAT line ("RULE_APPEND
+# failed (Invalid argument)"), legacy at the COMMIT - so neither *nat nor
+# *filter below loads and FORWARD stays at ACCEPT. Without the POSTROUTING
+# jump the same file loads.
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:PORTFWD - [0:0]
+-A PREROUTING -i eth0 -j PORTFWD
+-A POSTROUTING -o eth1 -j PORTFWD
+-A PORTFWD -p tcp --dport 443 -j DNAT --to-destination 10.0.0.10:443
+-A POSTROUTING -o eth0 -s 10.0.0.0/24 -j MASQUERADE
+COMMIT
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A FORWARD -i eth0 -o eth1 -d 10.0.0.10 -p tcp --dport 443 -j ACCEPT
+-A FORWARD -i eth1 -o eth0 -j ACCEPT
+COMMIT

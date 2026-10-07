@@ -62,6 +62,8 @@
               <button type="button" data-sample="loglevelnft">nft (iptables' log level + 16-char interface — won't load)</button>
               <button type="button" data-sample="icmptypetypo">iptables (--icmp-type typo — won't load)</button>
               <button type="button" data-sample="icmpv6typetypo">nft (icmpv6 type typo — won't load)</button>
+              <button type="button" data-sample="chainwrongtable">iptables (PREROUTING under *filter — won't load)</button>
+              <button type="button" data-sample="natwronghook">iptables (DNAT reached from POSTROUTING — won't load)</button>
               <button type="button" data-sample="nftlabeltoolong">nftables (133-byte comment — won't load)</button>
               <button type="button" data-sample="ufwdeadden">ufw (default deny — dead deny rules)</button>
             </div>

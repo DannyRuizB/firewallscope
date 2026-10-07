@@ -1,0 +1,16 @@
+# A hand-written /etc/iptables/rules.v4. The author wanted INVALID packets
+# dropped "as early as possible" and wrote it in PREROUTING - under *filter,
+# which has no PREROUTING chain (filter has INPUT, FORWARD and OUTPUT).
+# Measured on THIS file (iptables 1.8.13, nf_tables and legacy):
+# iptables-restore stops at that line with "No chain/target/match by that
+# name", *filter loads NOTHING and INPUT stays at policy ACCEPT - the box
+# boots open. Early dropping belongs in *raw or *mangle PREROUTING.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A PREROUTING -m conntrack --ctstate INVALID -j DROP
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p tcp --dport 22 -j ACCEPT
+COMMIT

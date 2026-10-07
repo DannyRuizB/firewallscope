@@ -41,6 +41,8 @@
     loglevelnft: 'samples/nft-log-level-iface.txt',
     icmptypetypo: 'samples/iptables-icmp-type-typo.txt',
     icmpv6typetypo: 'samples/nft-icmpv6-type-typo.txt',
+    chainwrongtable: 'samples/iptables-chain-wrong-table.txt',
+    natwronghook: 'samples/iptables-nat-target-wrong-hook.txt',
     nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 

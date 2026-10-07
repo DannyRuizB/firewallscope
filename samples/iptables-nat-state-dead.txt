@@ -6,8 +6,9 @@
 :INPUT ACCEPT [0:0]
 :OUTPUT ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]
-# "drop invalid before anything else" — nat never sees an INVALID packet
--A PREROUTING -m conntrack --ctstate INVALID -j DROP
+# "skip invalid before anything else" — nat never sees an INVALID packet
+# (and it could not say DROP here: nat refuses DROP, the file would not load)
+-A PREROUTING -m conntrack --ctstate INVALID -j RETURN
 # "don't re-DNAT existing connections" — nat never sees them either
 -A PREROUTING -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 -A PREROUTING -i eth0 -p tcp --dport 80 -j DNAT --to-destination 10.0.0.10:80

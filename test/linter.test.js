@@ -51,6 +51,8 @@ const EXPECTED = {
   'nft-log-level-iface.txt': ['log-level-unknown', 'interface-name-too-long'],
   'iptables-icmp-type-typo.txt': ['icmp-type-unknown'],
   'nft-icmpv6-type-typo.txt': ['icmp-type-unknown'],
+  'iptables-chain-wrong-table.txt': ['chain-not-in-table'],
+  'iptables-nat-target-wrong-hook.txt': ['target-not-valid-here'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -132,6 +134,8 @@ const ALL_SMELLS = [
   'log-level-unknown',
   'interface-name-too-long',
   'icmp-type-unknown',
+  'chain-not-in-table',
+  'target-not-valid-here',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3807,3 +3811,96 @@ test('icmp-type-unknown: the two samples each raise exactly one', () => {
     assert.equal(itHits(sample(name)).length, 1, name);
   }
 });
+
+// --- chain-not-in-table / target-not-valid-here ----------------------------
+// Measured (iptables 1.8.13, nf_tables and legacy, real loads): each table has
+// its own built-ins; DNAT/SNAT/MASQUERADE/REDIRECT only in nat (and only at
+// their hooks, a user chain judged by the built-ins that reach it), REJECT only
+// in filter, NOTRACK/CT only in raw, DROP never in nat, no jumps to built-ins.
+
+function wrongPlace(text) {
+  const fs = loadFirewallScope();
+  // Array.from: the sandbox's arrays are another realm's (deepEqual refuses them).
+  return Array.from(fs.lint(fs.parse(text)).findings
+    .filter((f) => f.id === 'chain-not-in-table' || f.id === 'target-not-valid-here'));
+}
+
+test('chain-not-in-table: -A PREROUTING under *filter is flagged, its rules are not double-counted', () => {
+  const f = wrongPlace('*filter\n:INPUT DROP [0:0]\n-A PREROUTING -j DROP\n-A PREROUTING -p tcp -j DROP\n-A INPUT -i lo -j ACCEPT\nCOMMIT\n');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].id, 'chain-not-in-table');
+  assert.equal(f[0].chain, 'PREROUTING');
+  assert.match(f[0].title, /\*filter has no PREROUTING/);
+});
+
+test('chain-not-in-table: FORWARD in *nat and INPUT in *raw are flagged; INPUT in *nat is valid', () => {
+  const f = wrongPlace('*nat\n-A FORWARD -j RETURN\n-A INPUT -j RETURN\nCOMMIT\n*raw\n-A INPUT -j RETURN\n-A PREROUTING -j RETURN\nCOMMIT\n');
+  assert.deepEqual(Array.from(f, (x) => `${x.table}/${x.chain}`).sort(), ['nat/FORWARD', 'raw/INPUT']);
+});
+
+test('chain-not-in-table: a declared chain is left alone (the backends disagree on :PREROUTING in *filter)', () => {
+  assert.equal(wrongPlace('*filter\n:PREROUTING ACCEPT [0:0]\n-A PREROUTING -j RETURN\nCOMMIT\n').length, 0);
+});
+
+test('target-not-valid-here: a jump or goto to a built-in chain is flagged', () => {
+  const f = wrongPlace('*filter\n:INPUT DROP [0:0]\n:X - [0:0]\n-A INPUT -p tcp --dport 22 -j OUTPUT\n-A INPUT -g FORWARD\n-A INPUT -j X\nCOMMIT\n');
+  assert.deepEqual(Array.from(f, (x) => x.ruleIdx), [0, 1]);
+  assert.match(f[1].title, /`-g FORWARD` jumps to a built-in/);
+});
+
+test('target-not-valid-here: targets outside their table (DNAT in filter, REJECT in mangle, NOTRACK in filter, DROP in nat)', () => {
+  const f = wrongPlace([
+    '*filter', ':X - [0:0]', '-A X -p tcp -j DNAT --to-destination 10.0.0.1', '-A INPUT -p udp -j NOTRACK', 'COMMIT',
+    '*mangle', '-A OUTPUT -p tcp -j REJECT', 'COMMIT',
+    '*nat', ':Y - [0:0]', '-A Y -p tcp --dport 23 -j DROP', 'COMMIT', ''
+  ].join('\n'));
+  assert.deepEqual(Array.from(f, (x) => `${x.table}/${x.chain}`), ['filter/X', 'filter/INPUT', 'mangle/OUTPUT', 'nat/Y']);
+  assert.match(f[3].title, /DROP` in the nat table/);
+});
+
+test('target-not-valid-here: NAT targets at the wrong hook, built-in and through user chains (two deep)', () => {
+  const f = wrongPlace([
+    '*nat', ':X - [0:0]', ':Y - [0:0]',
+    '-A PREROUTING -j MASQUERADE',
+    '-A INPUT -p tcp -j DNAT --to-destination 10.0.0.1',
+    '-A POSTROUTING -p tcp -j REDIRECT --to-ports 8080',
+    '-A OUTPUT -j SNAT --to-source 10.0.0.1',
+    '-A POSTROUTING -j X', '-A X -j Y', '-A Y -p tcp -j DNAT --to-destination 10.0.0.1',
+    'COMMIT', ''
+  ].join('\n'));
+  assert.deepEqual(Array.from(f, (x) => `${x.chain}#${x.ruleIdx}`).sort(), ['INPUT#0', 'OUTPUT#0', 'POSTROUTING#0', 'PREROUTING#0', 'Y#0']);
+  assert.match(f.find((x) => x.chain === 'Y').title, /Y is reached from POSTROUTING/);
+});
+
+test('target-not-valid-here: valid placements stay quiet (Docker / Kubernetes shapes, SNAT in INPUT, unreferenced chain, raw NOTRACK)', () => {
+  const f = wrongPlace([
+    '*nat', ':DOCKER - [0:0]', ':KUBE-SERVICES - [0:0]', ':KUBE-SVC-A - [0:0]', ':KUBE-SEP-A - [0:0]', ':KUBE-POSTROUTING - [0:0]', ':LOOSE - [0:0]',
+    '-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER',
+    '-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER',
+    '-A DOCKER -i docker0 -j RETURN',
+    '-A DOCKER ! -i docker0 -p tcp --dport 8080 -j DNAT --to-destination 172.17.0.2:80',
+    '-A PREROUTING -j KUBE-SERVICES', '-A OUTPUT -j KUBE-SERVICES',
+    '-A KUBE-SERVICES -j KUBE-SVC-A', '-A KUBE-SVC-A -j KUBE-SEP-A',
+    '-A KUBE-SEP-A -p tcp -j DNAT --to-destination 10.244.0.5:80',
+    '-A POSTROUTING -j KUBE-POSTROUTING', '-A KUBE-POSTROUTING -j MASQUERADE',
+    '-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE',
+    '-A INPUT -j SNAT --to-source 10.0.0.1',
+    '-A OUTPUT -p tcp -j REDIRECT --to-ports 8080',
+    '-A LOOSE -p tcp -j DNAT --to-destination 10.0.0.1',
+    'COMMIT',
+    '*raw', ':X - [0:0]', '-A PREROUTING -j X', '-A X -p udp -j NOTRACK', '-A OUTPUT -p udp -j CT --notrack', 'COMMIT',
+    '*filter', ':R - [0:0]', '-A INPUT -j R', '-A R -p tcp -j REJECT --reject-with tcp-reset', 'COMMIT', ''
+  ].join('\n'));
+  assert.deepEqual(f, []);
+});
+
+test('chain-not-in-table / target-not-valid-here: ip6tables is judged too; nft and ufw are not', () => {
+  const fs = loadFirewallScope();
+  const v6 = fs.lint(fs.parse('*filter\n:INPUT DROP [0:0]\n-A INPUT -p ipv6-icmp -j ACCEPT\n-A INPUT -s fe80::/10 -j ACCEPT\n-A INPUT -p tcp -j MASQUERADE\nCOMMIT\n'));
+  assert.ok(v6.findings.some((x) => x.id === 'target-not-valid-here'));
+  for (const name of ['nft-ruleset.txt', 'ufw-status.txt']) {
+    const r = fs.lint(fs.parse(sample(name)));
+    assert.ok(!r.findings.some((x) => x.id === 'chain-not-in-table' || x.id === 'target-not-valid-here'), name);
+  }
+});
+

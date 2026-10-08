@@ -43,6 +43,8 @@
     icmpv6typetypo: 'samples/nft-icmpv6-type-typo.txt',
     chainwrongtable: 'samples/iptables-chain-wrong-table.txt',
     natwronghook: 'samples/iptables-nat-target-wrong-hook.txt',
+    ctstatetypo: 'samples/iptables-ctstate-typo.txt',
+    nftctcase: 'samples/nft-ct-state-case.txt',
     nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 

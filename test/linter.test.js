@@ -53,6 +53,8 @@ const EXPECTED = {
   'nft-icmpv6-type-typo.txt': ['icmp-type-unknown'],
   'iptables-chain-wrong-table.txt': ['chain-not-in-table'],
   'iptables-nat-target-wrong-hook.txt': ['target-not-valid-here'],
+  'iptables-ctstate-typo.txt': ['ct-state-unknown', 'comment-match-without-text'],
+  'nft-ct-state-case.txt': ['ct-state-unknown'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -136,6 +138,8 @@ const ALL_SMELLS = [
   'icmp-type-unknown',
   'chain-not-in-table',
   'target-not-valid-here',
+  'ct-state-unknown',
+  'comment-match-without-text',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3904,3 +3908,72 @@ test('chain-not-in-table / target-not-valid-here: ip6tables is judged too; nft a
   }
 });
 
+
+// --- ct-state-unknown / comment-match-without-text ---------------------------
+
+const ctHits = (text, id = 'ct-state-unknown') => Array.from(FS.lint(FS.parse(text)).findings.filter((x) => x.id === id));
+const iptLines = (...l) => ['*filter', ':INPUT DROP [0:0]', ...l, 'COMMIT', ''].join('\n');
+const ctNftRule = (r) => `table inet t {\n  chain c {\n    type filter hook input priority 0; policy drop;\n    ${r}\n  }\n}\n`;
+
+test('ct-state-unknown (iptables): every measured-refused spelling is flagged, every accepted one is not', () => {
+  for (const bad of ['--ctstate ESTABLISHED,RELATD', '--ctstate ESTABLISHED,', '--ctstate NEW,,ESTABLISHED', '! --ctstate RELATD', '--ctstatus SEEN-REPLY', '--ctstatus ASSURED,FOO']) {
+    assert.equal(ctHits(iptLines(`-A INPUT -m conntrack ${bad} -j ACCEPT`)).length, 1, bad);
+  }
+  assert.equal(ctHits(iptLines('-A INPUT -m state --state SNAT -j ACCEPT')).length, 1, 'SNAT is conntrack-only');
+  for (const ok of ['--ctstate NEW,ESTABLISHED,RELATED,INVALID,UNTRACKED,SNAT,DNAT', '--ctstate established,related', '--ctstate Invalid', '--ctstatus NONE,EXPECTED,SEEN_REPLY,ASSURED,CONFIRMED', '--ctstatus assured']) {
+    assert.deepEqual(ctHits(iptLines(`-A INPUT -m conntrack ${ok} -j ACCEPT`)), [], ok);
+  }
+  assert.deepEqual(ctHits(iptLines('-A INPUT -m state --state NEW,ESTABLISHED,RELATED,INVALID,UNTRACKED -j ACCEPT')), []);
+});
+
+test('ct-state-unknown (iptables): the details point at the fix', () => {
+  assert.match(ctHits(iptLines('-A INPUT -m conntrack --ctstate ESTABLISHED,RELATD -j ACCEPT'))[0].details, /did you mean `RELATED`/);
+  assert.match(ctHits(iptLines('-A INPUT -m state --state DNAT -j ACCEPT'))[0].details, /conntrack-only state: use `-m conntrack --ctstate`/);
+  assert.match(ctHits(iptLines('-A INPUT -m conntrack --ctstatus SEEN-REPLY -j ACCEPT'))[0].details, /did you mean `SEEN_REPLY`.*underscore/);
+  assert.match(ctHits(iptLines('-A INPUT -m conntrack --ctstate NEW,,ESTABLISHED -j ACCEPT'))[0].details, /empty item/);
+});
+
+test('ct-state-unknown (nft): upper case, iptables spellings, typos and unmeasured status words are flagged', () => {
+  const cases = {
+    'ct state ESTABLISHED accept': /lower case/,
+    'ct state { established, relatd } accept': /did you mean `related`/,
+    'ct state vmap { established : accept, relatd : drop }': /`relatd`/,
+    'ct status seen_reply accept': /did you mean `seen-reply`.*hyphen/,
+    'ct status nat-done accept': /`nat-done`/,
+    'ct state new ct status seen_reply drop': /seen_reply/,
+  };
+  for (const [rule, re] of Object.entries(cases)) {
+    const f = ctHits(ctNftRule(rule));
+    assert.equal(f.length, 1, rule);
+    assert.match(f[0].details, re, rule);
+  }
+});
+
+test('ct-state-unknown (nft): every word nft loaded stays quiet', () => {
+  for (const ok of ['ct state { established, related } accept', 'ct state established,related accept', 'ct state != established drop',
+    'ct state invalid,untracked,new drop', 'ct state vmap { established : accept, invalid : drop, new : continue }',
+    'ct status { expected, seen-reply, assured, confirmed, snat, dnat, dying } accept', 'ct status hw-offload,seq-adjust,fixed-timeout accept']) {
+    assert.deepEqual(ctHits(ctNftRule(ok)), [], ok);
+  }
+});
+
+test('comment-match-without-text: `-m comment` with no `--comment` is flagged; with text (even empty) it is not', () => {
+  assert.equal(ctHits(iptLines('-A INPUT -m comment -j ACCEPT'), 'comment-match-without-text').length, 1);
+  assert.equal(ctHits(iptLines('-A INPUT -p tcp --dport 22 -m comment -m conntrack --ctstate NEW -j ACCEPT'), 'comment-match-without-text').length, 1);
+  assert.deepEqual(ctHits(iptLines('-A INPUT -p tcp --dport 22 -m comment --comment "ssh" -j ACCEPT'), 'comment-match-without-text'), []);
+  assert.deepEqual(ctHits(iptLines('-A INPUT -m comment --comment "" -j ACCEPT'), 'comment-match-without-text'), []);
+});
+
+test('ct-state-unknown / comment-match-without-text: the two samples raise exactly their lines, and no other sample raises them', () => {
+  const ipt = FS.lint(FS.parse(sample('iptables-ctstate-typo.txt'))).findings;
+  assert.equal(ipt.filter((x) => x.id === 'ct-state-unknown').length, 1);
+  assert.equal(ipt.filter((x) => x.id === 'comment-match-without-text').length, 1);
+  assert.equal(FS.lint(FS.parse(sample('nft-ct-state-case.txt'))).findings.filter((x) => x.id === 'ct-state-unknown').length, 2);
+  const fs = require('node:fs');
+  const path = require('node:path');
+  for (const name of fs.readdirSync(path.join(__dirname, '..', 'samples'))) {
+    if (name === 'iptables-ctstate-typo.txt' || name === 'nft-ct-state-case.txt') continue;
+    const ids = FS.lint(FS.parse(sample(name))).findings.map((x) => x.id);
+    assert.ok(!ids.includes('ct-state-unknown') && !ids.includes('comment-match-without-text'), name);
+  }
+});

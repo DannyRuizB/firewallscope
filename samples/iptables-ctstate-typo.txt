@@ -1,0 +1,16 @@
+# A hand-edited /etc/iptables/rules.v4. Two lines look harmless and stop the
+# file from loading (measured, iptables 1.8.13, nf_tables and legacy):
+# `RELATD` on the ESTABLISHED,RELATED accept ('Bad ctstate "RELATD"') and a
+# `-m comment` whose text was edited away ('comment: option "--comment" must
+# be specified'). iptables-restore stops at the first of them, rc 2: *filter
+# loads nothing and INPUT stays at policy ACCEPT - the box boots open.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATD -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m comment -j ACCEPT
+-A INPUT -p tcp --dport 443 -m comment --comment "https" -j ACCEPT
+COMMIT

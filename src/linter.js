@@ -118,6 +118,8 @@
     detectLimitDefaultRate(result, findings);
     detectCidrHostBitsSet(result, findings);
     detectLogLevelUnknown(result, findings);
+    detectCtStateUnknown(result, findings);
+    detectCommentMatchWithoutText(result, findings);
     detectInterfaceNameTooLong(result, findings);
     detectChainNotInTable(result, findings);
     detectTargetNotValidHere(result, findings);
@@ -3588,6 +3590,157 @@
           ? `iptables takes emerg, panic, alert, crit, error, warning, notice, info, debug or 0-7 — and nothing else (measured, both backends: 'log level "${level}" unknown', rc 2).${other ? ` \`${level}\` is how nft spells it; the two syntaxes disagree on exactly this word.` : ''} ${RESTORE_REFUSED}. ${fix ? `Write \`--log-level ${fix}\`.` : 'Use one of the names above, or a number 0-7.'}`
           : `nft takes emerg, alert, crit, err, warn, notice, info, debug or audit — no numbers, and not iptables' spellings (measured: \`warning\`, \`error\` and \`4\` are all refused).${other ? ` \`${level}\` is how iptables spells it.` : ''} ${NFT_REFUSED}. ${fix ? `Write \`level ${fix}\`${fix === 'warn' ? ' — or drop it: warn is the default, which is why `nft list` never prints it' : ''}.` : 'Use one of the names above.'}`
       });
+    });
+  }
+
+  // ── ct-state-unknown ───────────────────────────────────────────────
+  // A conntrack state or status the tool does not know stops the file from
+  // loading - and the typo usually sits on the ESTABLISHED,RELATED line the
+  // whole ruleset leans on. Measured (iptables 1.8.13 nf_tables + legacy,
+  // nftables 1.1.x, real loads):
+  //   - `-m conntrack --ctstate` takes NEW ESTABLISHED RELATED INVALID
+  //     UNTRACKED SNAT DNAT, any case. `RELATD`, a trailing comma
+  //     (`ESTABLISHED,`) or an empty item (`NEW,,ESTABLISHED`): 'Bad ctstate',
+  //     rc 2 - negated too.
+  //   - `-m state --state` takes the first five only: `SNAT` / `DNAT` are
+  //     conntrack-only ('Bad state "SNAT"').
+  //   - `--ctstatus` takes NONE EXPECTED SEEN_REPLY ASSURED CONFIRMED, any case.
+  //   - nft `ct state` takes invalid established related new untracked,
+  //     LOWER CASE ONLY (`ESTABLISHED` is refused); `ct status` takes the ten
+  //     words below - seen-reply with a hyphen, while iptables wants SEEN_REPLY with an underscore: each
+  //     front-end refuses the other's spelling (the log-level-unknown trap).
+  const IPT_CTSTATES = new Set(['NEW', 'ESTABLISHED', 'RELATED', 'INVALID', 'UNTRACKED', 'SNAT', 'DNAT']);
+  const IPT_STATES = new Set(['NEW', 'ESTABLISHED', 'RELATED', 'INVALID', 'UNTRACKED']);
+  const IPT_CTSTATUS = new Set(['NONE', 'EXPECTED', 'SEEN_REPLY', 'ASSURED', 'CONFIRMED']);
+  const NFT_CTSTATES = new Set(['invalid', 'established', 'related', 'new', 'untracked']);
+  // nft's status words, each one loaded for real; `src-nat-done`,
+  // `dst-nat-done`, `nat-done`, `offload`, `helper-assigned`, `template` and
+  // `untracked` are all refused by `ct status` (measured, rc 1).
+  const NFT_CTSTATUS = new Set(['expected', 'seen-reply', 'assured', 'confirmed', 'snat', 'dnat',
+    'dying', 'hw-offload', 'seq-adjust', 'fixed-timeout']);
+
+  function editDistance(a, b) {
+    const d = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+    for (let j = 1; j <= b.length; j++) d[0][j] = j;
+    for (let i = 1; i <= a.length; i++) {
+      for (let j = 1; j <= b.length; j++) {
+        d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      }
+    }
+    return d[a.length][b.length];
+  }
+
+  // The closest known word (distance <= 2), or null.
+  function closestWord(word, vocab) {
+    let best = null; let bestD = 3;
+    for (const v of vocab) {
+      const dist = editDistance(word, v);
+      if (dist < bestD) { best = v; bestD = dist; }
+    }
+    return best;
+  }
+
+  // Items of an nft ct state/status operand: `x`, `x,y`, `{ x, y }`, or the
+  // keys of `vmap { x : verdict, ... }`. Null for forms it does not read.
+  function nftCtItems(rest) {
+    let s = rest.replace(/^\s*(?:==|!=)\s*/, '');
+    const vmap = /^vmap\s*\{([^}]*)\}/.exec(s);
+    if (vmap) return vmap[1].split(',').map((kv) => kv.split(':')[0].trim()).filter(Boolean);
+    const set = /^\{([^}]*)\}/.exec(s);
+    if (set) return set[1].split(',').map((x) => x.trim()).filter(Boolean);
+    const tok = /^([A-Za-z_][\w,-]*)/.exec(s);
+    if (!tok) return null;
+    s = tok[1];
+    return s.split(',').map((x) => x.trim());
+  }
+
+  function detectCtStateUnknown(result, findings) {
+    const format = result.format;
+    const ipt = format === 'iptables' || format === 'ip6tables';
+    if (!ipt && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const raw = String(rule.raw || '');
+      const checks = [];
+      if (ipt) {
+        const re = /(?:^|\s)--(ctstate|state|ctstatus)\s+"?([^\s"]*)"?/g;
+        let m;
+        while ((m = re.exec(raw))) {
+          const opt = m[1];
+          const vocab = opt === 'ctstate' ? IPT_CTSTATES : opt === 'state' ? IPT_STATES : IPT_CTSTATUS;
+          const items = m[2].split(',');
+          const bad = items.filter((x) => !vocab.has(x.toUpperCase()));
+          if (bad.length) checks.push({ spelled: `--${opt} ${m[2]}`, opt, bad, items, vocab });
+        }
+      } else {
+        const re = /(?:^|\s)ct\s+(state|status)\s+/g;
+        let m;
+        while ((m = re.exec(raw))) {
+          const opt = m[1];
+          const items = nftCtItems(raw.slice(re.lastIndex));
+          if (!items) continue;
+          const vocab = opt === 'state' ? NFT_CTSTATES : NFT_CTSTATUS;
+          const bad = items.filter((x) => !vocab.has(x));
+          if (bad.length) checks.push({ spelled: `ct ${opt} ${items.join(',')}`, opt, bad, items, vocab });
+        }
+      }
+      for (const c of checks) {
+        const hints = c.bad.map((b) => {
+          if (b === '') return 'an empty item (a stray or doubled comma)';
+          let fix = null; let why = '';
+          if (ipt) {
+            const up = b.toUpperCase();
+            if (c.opt === 'state' && IPT_CTSTATES.has(up)) { why = ` — ${up} is a conntrack-only state: use \`-m conntrack --ctstate\``; }
+            else if (c.opt === 'ctstatus' && IPT_CTSTATUS.has(up.replace(/-/g, '_'))) { fix = up.replace(/-/g, '_'); why = ' — nft spells it with a hyphen, iptables with an underscore'; }
+            else fix = closestWord(up, c.vocab);
+          } else {
+            const low = b.toLowerCase().replace(/_/g, '-');
+            if (c.vocab.has(low)) { fix = low; why = b !== b.toLowerCase() ? ' — nft only takes lower case' : ' — iptables spells it with an underscore, nft with a hyphen'; }
+            else fix = closestWord(b.toLowerCase(), c.vocab);
+          }
+          return `\`${b}\`${fix ? ` (did you mean \`${fix}\`?)` : ''}${why}`;
+        });
+        const known = ipt ? [...c.vocab].join(', ') : [...c.vocab].join(', ');
+        findings.push({
+          id: 'ct-state-unknown',
+          severity: 'error',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: idx,
+          title: ipt
+            ? `\`${c.spelled}\` names a ${c.opt === 'ctstatus' ? 'status' : 'state'} iptables does not know — iptables-restore refuses the file`
+            : `\`${c.spelled}\` names a ${c.opt} nft does not know — the ruleset will not load`,
+          details: `Unknown: ${hints.join('; ')}. ${ipt ? `\`--${c.opt}\` takes ${known} (any case)` : `\`ct ${c.opt}\` takes ${known} (lower case only)`} — measured, ${ipt ? `both backends refuse anything else ('Bad ${c.opt}', rc 2), negated or not` : 'nft refuses anything else (rc 1)'}. ${ipt ? RESTORE_REFUSED : NFT_REFUSED} — and a state match is usually the ESTABLISHED,RELATED accept the rest of the ruleset relies on.`
+        });
+      }
+    });
+  }
+
+  // ── comment-match-without-text ─────────────────────────────────────
+  // `-m comment` loads the match; `--comment "..."` is its one mandatory
+  // option. Leave it out - a comment edited away, a variable that expanded to
+  // nothing in a template - and the line is refused. Measured (iptables
+  // 1.8.13, both backends): 'comment: option "--comment" must be specified',
+  // rc 2. An explicitly empty `--comment ""` loads.
+  function detectCommentMatchWithoutText(result, findings) {
+    if (result.format !== 'iptables' && result.format !== 'ip6tables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const raw = String(rule.raw || '');
+      const re = /(?:^|\s)-m\s+comment\b([\s\S]*?)(?=\s-m\s|\s-[jg]\s|$)/g;
+      let m;
+      while ((m = re.exec(raw))) {
+        if (/(?:^|\s)--comment(?:\s|$)/.test(m[1])) continue;
+        findings.push({
+          id: 'comment-match-without-text',
+          severity: 'error',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: idx,
+          title: '`-m comment` without `--comment` — iptables-restore refuses the file',
+          details: `\`--comment "text"\` is the comment match's one mandatory option. Measured (iptables 1.8.13, both backends): 'comment: option "--comment" must be specified', rc 2 — ${RESTORE_REFUSED}. Usually a comment edited away, or a template variable that expanded to nothing. Put the text back, or drop \`-m comment\` (an explicitly empty \`--comment ""\` also loads).`
+        });
+      }
     });
   }
 

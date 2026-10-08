@@ -1,0 +1,15 @@
+# An /etc/nftables.conf written by someone who knows iptables. nft refuses
+# two of its conntrack words (measured, nftables 1.1.x): `ct state` takes
+# lower case only, so `ESTABLISHED,RELATED` is refused, and nft spells the
+# status `seen-reply` with a hyphen where iptables writes SEEN_REPLY. `nft -f`
+# is atomic: the whole file is refused and the firewall never comes up.
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    iif "lo" accept
+    ct state ESTABLISHED,RELATED accept
+    ct state invalid drop
+    tcp dport 22 ct state new accept
+    udp dport 51820 ct status seen_reply accept
+  }
+}

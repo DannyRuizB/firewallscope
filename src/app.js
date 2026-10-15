@@ -45,6 +45,7 @@
     natwronghook: 'samples/iptables-nat-target-wrong-hook.txt',
     ctstatetypo: 'samples/iptables-ctstate-typo.txt',
     nftctcase: 'samples/nft-ct-state-case.txt',
+    ownerinput: 'samples/iptables-owner-input.txt',
     nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 

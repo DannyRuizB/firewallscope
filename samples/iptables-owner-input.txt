@@ -1,0 +1,21 @@
+# A hand-edited /etc/iptables/rules.v4 with two lines that stop it from
+# loading (measured, iptables 1.8.10, nf_tables and legacy): "only root may
+# reach the admin API" written as an INPUT rule with `-m owner` (the owner
+# match only exists in OUTPUT/POSTROUTING: "RULE_APPEND failed (Invalid
+# argument)"), and a payload blocklist with no `--algo` ('string: option
+# "--algo" must be specified'). Either alone is enough (each measured on its
+# own); together the string line is reported first, rc 2, because it fails at
+# parse time before the owner line reaches the kernel. *filter loads nothing
+# and INPUT stays at policy ACCEPT - the box boots open. The OUTPUT owner rule
+# at the end is valid and loads once the two are fixed.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p tcp --dport 8443 -m owner --uid-owner 0 -j ACCEPT
+-A INPUT -p tcp --dport 80 -m string --string "/wp-login.php" -j DROP
+-A INPUT -p tcp --dport 80 -j ACCEPT
+-A OUTPUT -m owner --uid-owner 33 -p tcp --dport 25 -j REJECT
+COMMIT

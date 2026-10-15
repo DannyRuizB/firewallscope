@@ -123,6 +123,8 @@
     detectInterfaceNameTooLong(result, findings);
     detectChainNotInTable(result, findings);
     detectTargetNotValidHere(result, findings);
+    detectOwnerMatchNotValidHere(result, findings);
+    detectStringMatchIncomplete(result, findings);
     detectConntrackHelperEnabled(result, findings);
 
     return summarize(findings);
@@ -3874,6 +3876,84 @@
         });
       }
     }
+  }
+
+  // ── owner-match-not-valid-here ─────────────────────────────────────
+  // `-m owner` matches the local socket that SENT a packet, so the kernel only
+  // allows it where such a socket exists: the OUTPUT and POSTROUTING hooks.
+  // Measured (iptables 1.8.10, nf_tables and legacy, ip6tables nf_tables;
+  // real loads in a scratch netns): `--uid-owner`, `--gid-owner`,
+  // `--socket-exists` and the negated forms are refused in filter INPUT/FORWARD,
+  // mangle PREROUTING/INPUT/FORWARD, nat PREROUTING and raw PREROUTING
+  // ("RULE_APPEND failed (Invalid argument)" / "line N failed"); OUTPUT and
+  // POSTROUTING load in every table that has them. A user chain is judged by
+  // the built-ins that reach it: jumped from INPUT and OUTPUT it is refused,
+  // unreferenced it loads. The usual slip is "only root may reach port X"
+  // written as an INPUT rule - and the whole file goes with it.
+  const OWNER_HOOKS = ['OUTPUT', 'POSTROUTING'];
+
+  function detectOwnerMatchNotValidHere(result, findings) {
+    if (result.format !== 'iptables' && result.format !== 'ip6tables') return;
+    for (const table of result.tables) {
+      const builtins = IPT_TABLE_BUILTINS[table.name];
+      if (!builtins) continue;
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          if (!/(?:^|\s)-m\s+owner\b/.test(String(rule.raw || ''))) return;
+          const roots = builtins.includes(chain.name) ? new Set([chain.name]) : builtinRootsOf(table, chain.name);
+          const bad = [...roots].filter((h) => !OWNER_HOOKS.includes(h));
+          if (!bad.length) return;
+          const via = builtins.includes(chain.name) ? '' : ` (${chain.name} is reached from ${bad.join(', ')})`;
+          findings.push({
+            id: 'owner-match-not-valid-here',
+            severity: 'error',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx,
+            title: `\`-m owner\` runs in ${table.name}/${bad.join(`, ${table.name}/`)}${via} — it is only valid in OUTPUT/POSTROUTING, so the file does not load`,
+            details: `The owner match looks at the local socket that SENT the packet; an incoming or forwarded packet has none, so the kernel refuses the match outside OUTPUT and POSTROUTING. Measured (iptables 1.8.10, both backends, and ip6tables): "RULE_APPEND failed (Invalid argument)" on nf_tables, "line N failed" on legacy — ${RESTORE_REFUSED}. To limit who may open outgoing connections, keep the rule in OUTPUT. To limit who may reach a local service, filter on the port in INPUT and let the service check the user (or bind it to 127.0.0.1 / a Unix socket).`
+          });
+        });
+      }
+    }
+  }
+
+  // ── string-match-incomplete ────────────────────────────────────────
+  // The string match has two mandatory pieces: a pattern (`--string` or
+  // `--hex-string`) and an `--algo` of `bm` or `kmp`. Measured (iptables
+  // 1.8.10, both backends, ip6tables): no --algo -> 'string: option "--algo"
+  // must be specified', no pattern -> "STRING match: You must specify
+  // `--string' or `--hex-string'", both rc 2; `--algo BM` or any other word
+  // -> "RULE_APPEND failed (No such file or directory)" (the kernel has no
+  // such textsearch module; the name is lower case). A blocklist that never
+  // loads takes the rest of the firewall with it.
+  function detectStringMatchIncomplete(result, findings) {
+    if (result.format !== 'iptables' && result.format !== 'ip6tables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const raw = String(rule.raw || '');
+      const re = /(?:^|\s)-m\s+string\b([\s\S]*?)(?=\s-m\s|\s-[jg]\s|$)/g;
+      let m;
+      while ((m = re.exec(raw))) {
+        const opts = m[1];
+        const problems = [];
+        if (!/(?:^|\s)--(?:hex-)?string\s/.test(opts)) problems.push('no `--string` / `--hex-string` ("STRING match: You must specify `--string\' or `--hex-string\'")');
+        const algo = opts.match(/(?:^|\s)--algo\s+(\S+)/);
+        if (!algo) problems.push('no `--algo` (\'string: option "--algo" must be specified\')');
+        else if (!['bm', 'kmp'].includes(algo[1])) problems.push(`\`--algo ${algo[1]}\` is not a search algorithm the kernel has ("RULE_APPEND failed (No such file or directory)")${['bm', 'kmp'].includes(algo[1].toLowerCase()) ? ` — it is case-sensitive: \`${algo[1].toLowerCase()}\`` : ''}`);
+        if (!problems.length) continue;
+        findings.push({
+          id: 'string-match-incomplete',
+          severity: 'error',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: idx,
+          title: '`-m string` is missing a required piece — iptables-restore refuses the file',
+          details: `${problems.join('; ')}. The string match needs a pattern and \`--algo bm\` or \`--algo kmp\` (lower case) — measured, iptables 1.8.10, both backends, and ip6tables. ${RESTORE_REFUSED}. And even loaded, a payload string match is a weak filter: it sees one packet at a time (a pattern split across segments slips by), is case-sensitive unless \`--icase\`, and is blind to TLS.`
+        });
+      }
+    });
   }
 
   // ── interface-name-too-long ────────────────────────────────────────

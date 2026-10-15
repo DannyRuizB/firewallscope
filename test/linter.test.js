@@ -55,6 +55,7 @@ const EXPECTED = {
   'iptables-nat-target-wrong-hook.txt': ['target-not-valid-here'],
   'iptables-ctstate-typo.txt': ['ct-state-unknown', 'comment-match-without-text'],
   'nft-ct-state-case.txt': ['ct-state-unknown'],
+  'iptables-owner-input.txt': ['owner-match-not-valid-here', 'string-match-incomplete'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -140,6 +141,8 @@ const ALL_SMELLS = [
   'target-not-valid-here',
   'ct-state-unknown',
   'comment-match-without-text',
+  'owner-match-not-valid-here',
+  'string-match-incomplete',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3975,5 +3978,76 @@ test('ct-state-unknown / comment-match-without-text: the two samples raise exact
     if (name === 'iptables-ctstate-typo.txt' || name === 'nft-ct-state-case.txt') continue;
     const ids = FS.lint(FS.parse(sample(name))).findings.map((x) => x.id);
     assert.ok(!ids.includes('ct-state-unknown') && !ids.includes('comment-match-without-text'), name);
+  }
+});
+
+// --- owner-match-not-valid-here / string-match-incomplete ----------------------
+// Measured (iptables 1.8.10, nf_tables + legacy, ip6tables; real loads in a scratch
+// netns): -m owner only loads where every built-in reaching it is OUTPUT or
+// POSTROUTING; -m string needs a pattern and --algo bm|kmp (lower case).
+
+const ownHits = (text, id = 'owner-match-not-valid-here') => Array.from(FS.lint(FS.parse(text)).findings.filter((x) => x.id === id));
+const tblLines = (table, ...l) => [`*${table}`, ...l, 'COMMIT', ''].join('\n');
+
+test('owner-match-not-valid-here: every measured-refused hook is flagged', () => {
+  const cases = [['filter', 'INPUT'], ['filter', 'FORWARD'], ['mangle', 'PREROUTING'], ['mangle', 'INPUT'], ['mangle', 'FORWARD'], ['nat', 'PREROUTING'], ['raw', 'PREROUTING']];
+  for (const [table, chain] of cases) {
+    const f = ownHits(tblLines(table, `:${chain} ACCEPT [0:0]`, `-A ${chain} -m owner --uid-owner 0 -j ACCEPT`));
+    assert.equal(f.length, 1, `${table}/${chain}`);
+    assert.equal(f[0].severity, 'error');
+  }
+  for (const opt of ['--gid-owner 0', '--socket-exists', '! --uid-owner 0']) {
+    assert.equal(ownHits(iptLines(`-A INPUT -m owner ${opt} -j ACCEPT`)).length, 1, opt);
+  }
+});
+
+test('owner-match-not-valid-here: OUTPUT / POSTROUTING in every table, and unreferenced chains, stay quiet', () => {
+  const ok = [['filter', 'OUTPUT'], ['mangle', 'OUTPUT'], ['mangle', 'POSTROUTING'], ['nat', 'OUTPUT'], ['nat', 'POSTROUTING'], ['raw', 'OUTPUT']];
+  for (const [table, chain] of ok) {
+    assert.deepEqual(ownHits(tblLines(table, `:${chain} ACCEPT [0:0]`, `-A ${chain} -m owner --uid-owner 0 -j ACCEPT`)), [], `${table}/${chain}`);
+  }
+  assert.deepEqual(ownHits(iptLines(':ORPHAN - [0:0]', '-A ORPHAN -m owner --uid-owner 0 -j ACCEPT')), []);
+  assert.deepEqual(ownHits(iptLines(':EGRESS - [0:0]', '-A OUTPUT -j EGRESS', '-A EGRESS -m owner --uid-owner 0 -j ACCEPT')), []);
+});
+
+test('owner-match-not-valid-here: a user chain is judged by the built-ins that reach it', () => {
+  const f = ownHits(iptLines(':SHARED - [0:0]', '-A INPUT -j SHARED', '-A OUTPUT -j SHARED', '-A SHARED -m owner --uid-owner 0 -j ACCEPT'));
+  assert.equal(f.length, 1);
+  assert.equal(f[0].chain, 'SHARED');
+  assert.match(f[0].title, /SHARED is reached from INPUT/);
+});
+
+test('string-match-incomplete: missing --algo, missing pattern and a wrong algo name are flagged', () => {
+  const cases = {
+    '-m string --string "evil"': /no `--algo`/,
+    '-m string --hex-string "|41|"': /no `--algo`/,
+    '-m string --algo bm': /no `--string`/,
+    '-m string --string "x" --algo BM': /case-sensitive: `bm`/,
+    '-m string --string "x" --algo foo': /`--algo foo` is not/,
+  };
+  for (const [m, re] of Object.entries(cases)) {
+    const f = ownHits(iptLines(`-A INPUT -p tcp --dport 80 ${m} -j DROP`), 'string-match-incomplete');
+    assert.equal(f.length, 1, m);
+    assert.equal(f[0].severity, 'error');
+    assert.match(f[0].details, re, m);
+  }
+});
+
+test('string-match-incomplete: complete matches stay quiet', () => {
+  for (const m of ['-m string --string "x" --algo bm', '-m string --algo kmp --hex-string "|41|"', '-m string --string "x" --algo bm --icase -m comment --comment "c"']) {
+    assert.deepEqual(ownHits(iptLines(`-A INPUT -p tcp --dport 80 ${m} -j DROP`), 'string-match-incomplete'), [], m);
+  }
+});
+
+test('owner-match-not-valid-here / string-match-incomplete: the sample raises exactly its lines, and no other sample raises them', () => {
+  const f = FS.lint(FS.parse(sample('iptables-owner-input.txt'))).findings;
+  assert.equal(f.filter((x) => x.id === 'owner-match-not-valid-here').length, 1);
+  assert.equal(f.filter((x) => x.id === 'string-match-incomplete').length, 1);
+  const fs = require('node:fs');
+  const path = require('node:path');
+  for (const name of fs.readdirSync(path.join(__dirname, '..', 'samples'))) {
+    if (name === 'iptables-owner-input.txt') continue;
+    const ids = FS.lint(FS.parse(sample(name))).findings.map((x) => x.id);
+    assert.ok(!ids.includes('owner-match-not-valid-here') && !ids.includes('string-match-incomplete'), name);
   }
 });

@@ -56,6 +56,8 @@ const EXPECTED = {
   'iptables-ctstate-typo.txt': ['ct-state-unknown', 'comment-match-without-text'],
   'nft-ct-state-case.txt': ['ct-state-unknown'],
   'iptables-owner-input.txt': ['owner-match-not-valid-here', 'string-match-incomplete'],
+  'iptables-limit-rate-plural.txt': ['limit-rate-invalid'],
+  'nft-limit-rate-abbrev.txt': ['limit-rate-invalid'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -143,6 +145,7 @@ const ALL_SMELLS = [
   'comment-match-without-text',
   'owner-match-not-valid-here',
   'string-match-incomplete',
+  'limit-rate-invalid',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3720,6 +3723,80 @@ test('log-level-unknown (nft): iptables spellings and numbers are refused, nft s
   assert.equal(llHits(nftRule('log level error prefix "x"')).length, 1, 'level before prefix');
   // A prefix that merely contains the word "level" is not a level.
   assert.equal(llHits(nftRule('log prefix "level warning: " drop')).length, 0);
+});
+
+// --- limit-rate-invalid ------------------------------------------------------
+// Measured (iptables 1.8.11 nf_tables + legacy, ip6tables, nftables 1.1.3 and
+// 1.1.6, real loads): iptables takes any prefix of second/minute/hour/day in
+// any case and refuses plurals, /hr, /week, `5/`, `0/s`, `five/min` and more
+// than 10000/s (-m limit) or 1000000/s (hashlimit); nft takes second, minute,
+// hour, day or week spelled out in lower case, and the kernel refuses 0.
+
+const lrHits = (text) => FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'limit-rate-invalid');
+const HL = '-p tcp -m hashlimit --hashlimit-mode srcip --hashlimit-name x';
+
+test('limit-rate-invalid (iptables): every measured-good spelling loads, every measured-bad one is an error', () => {
+  for (const r of ['5/s', '5/sec', '5/second', '5/minut', '5/min', '5/Sec', '5/MINUTE', '5/h', '3/hour', '1/d', '5', '10000/s', '600000/m']) {
+    assert.equal(lrHits(iptRule(`-p icmp -m limit --limit ${r} --limit-burst 10 -j ACCEPT`)).length, 0, r);
+  }
+  for (const r of ['5/minutes', '5/hours', '5/seconds', '5/days', '5/hr', '5/week', '5/', '0/s', 'five/min', '10001/s', '600001/m']) {
+    assert.equal(lrHits(iptRule(`-p icmp -m limit --limit ${r} -j ACCEPT`)).length, 1, r);
+  }
+  const f = lrHits(iptRule('-m limit --limit 5/minutes -j LOG --log-prefix "x: "'));
+  assert.equal(f[0].severity, 'error');
+  assert.match(f[0].title, /`--limit 5\/minutes`: `\/minutes` is not a unit iptables reads — iptables-restore refuses the file/);
+  assert.match(f[0].details, /bad rate "5\/minutes"/);
+  assert.match(f[0].details, /Write `--limit 5\/minute`/);
+  assert.match(f[0].details, /every table after it in the file load NOTHING/);
+  assert.match(lrHits(iptRule('-m limit --limit 5/hr -j ACCEPT'))[0].details, /Write `--limit 5\/hour`/);
+  const week = lrHits(iptRule('-m limit --limit 5/week -j ACCEPT'))[0];
+  assert.match(week.details, /`\/week` is nft's unit; iptables stops at `\/day`/);
+  assert.match(week.details, /Convert to a per-day rate/);
+  const fast = lrHits(iptRule('-p icmp -m limit --limit 600001/m -j ACCEPT'))[0];
+  assert.match(fast.title, /above the 10,000\/second ceiling/);
+  assert.match(fast.details, /Rate too fast "600001\/m"/);
+  assert.match(fast.details, /use `-m hashlimit`/);
+  assert.match(lrHits(iptRule('-p icmp -m limit --limit 0/s -j ACCEPT'))[0].title, /`--limit 0\/s` is not a rate/);
+  assert.equal(lrHits(iptRule('-p icmp -m limit --limit=5/minutes -j ACCEPT')).length, 1, '--limit=');
+  // --limit-burst is not --limit, and a comment can say anything.
+  assert.equal(lrHits(iptRule('-p icmp -m limit --limit 5/min --limit-burst 10 -j ACCEPT')).length, 0);
+  assert.equal(lrHits(iptRule('-p icmp -m limit --limit 5/min -m comment --comment "was --limit 5/minutes" -j ACCEPT')).length, 0);
+  const v6 = ['*filter', ':INPUT DROP [0:0]', '-A INPUT -p tcp -m limit --limit 5/minutes -j ACCEPT', 'COMMIT'].join('\n');
+  assert.equal(lrHits(v6).length, 1, 'ip6tables too');
+});
+
+test('limit-rate-invalid (iptables hashlimit): same units, bytes allowed, a 1,000,000/s ceiling', () => {
+  for (const r of ['5/min', '5/MIN', '10kb/s', '1mb/s', '1kb', '1000000/s']) {
+    assert.equal(lrHits(iptRule(`${HL} --hashlimit-upto ${r} -j ACCEPT`)).length, 0, r);
+  }
+  for (const r of ['5/minutes', '10kb/minutes', '0/s', '5/week', '5/hr', '1000001/s', '60000001/m']) {
+    assert.equal(lrHits(iptRule(`${HL} --hashlimit-above ${r} -j DROP`)).length, 1, r);
+  }
+  const f = lrHits(iptRule(`${HL} --hashlimit-upto 10kb/minutes -j ACCEPT`))[0];
+  assert.match(f.details, /Bad value for "--hashlimit-upto" option/);
+  assert.match(f.details, /Write `--hashlimit-upto 10kb\/minute`/);
+  assert.match(lrHits(iptRule(`${HL} --hashlimit-upto 1000001/s -j ACCEPT`))[0].title, /above the 1,000,000\/second ceiling/);
+});
+
+test('limit-rate-invalid (nft): only the five whole words load; iptables abbreviations, plurals and case do not', () => {
+  for (const r of ['5/second', '5/minute', '3/hour', '1/day', '5/week', '5 /minute', '5/ minute', '10 mbytes/second', 'over 5/hour burst 10 packets']) {
+    assert.equal(lrHits(nftRule(`icmp type echo-request limit rate ${r} accept`)).length, 0, r);
+  }
+  for (const r of ['5/min', '5/s', '5/Minute', '5/minutes', 'over 5/hours burst 4 packets', '0/second', '5/fortnight']) {
+    assert.equal(lrHits(nftRule(`tcp dport 22 limit rate ${r} accept`)).length, 1, r);
+  }
+  const f = lrHits(nftRule('tcp dport 22 ct state new limit rate 5/min accept'))[0];
+  assert.equal(f.severity, 'error');
+  assert.match(f.title, /`limit rate 5\/min`: nft has no unit `min` — the ruleset will not load/);
+  assert.match(f.details, /how iptables abbreviates it/);
+  assert.match(f.details, /Write `limit rate 5\/minute`/);
+  assert.match(f.details, /nft -f` is atomic/);
+  assert.match(lrHits(nftRule('limit rate 5/Minute accept'))[0].details, /nft is case-sensitive here/);
+  assert.match(lrHits(nftRule('limit rate over 5/hours burst 4 packets drop'))[0].details, /Write `limit rate over 5\/hour`/);
+  assert.match(lrHits(nftRule('limit rate 0/second accept'))[0].details, /Could not process rule: Invalid argument/);
+  // Inside a meter it is the same statement; inside a log prefix it is text.
+  assert.equal(lrHits(nftRule('tcp dport 22 meter m { ip saddr limit rate 5/min } accept')).length, 1);
+  assert.equal(lrHits(nftRule('limit rate 5/minute log prefix "limit rate 5/min: " drop')).length, 0);
 });
 
 // --- interface-name-too-long -------------------------------------------------

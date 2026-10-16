@@ -46,6 +46,8 @@
     ctstatetypo: 'samples/iptables-ctstate-typo.txt',
     nftctcase: 'samples/nft-ct-state-case.txt',
     ownerinput: 'samples/iptables-owner-input.txt',
+    limitplural: 'samples/iptables-limit-rate-plural.txt',
+    nftlimitabbrev: 'samples/nft-limit-rate-abbrev.txt',
     nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 

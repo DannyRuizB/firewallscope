@@ -116,6 +116,7 @@
     detectLogPrefixTooLong(result, findings);
     detectCommentTooLong(result, findings);
     detectLimitDefaultRate(result, findings);
+    detectLimitRateInvalid(result, findings);
     detectCidrHostBitsSet(result, findings);
     detectLogLevelUnknown(result, findings);
     detectCtStateUnknown(result, findings);
@@ -3461,6 +3462,112 @@
           ? `After the first ${hit.burst} packets the rule matches about one packet every 20 minutes and the rest fall through to the rules below — measured in front of a DROP, 5 of 12 pings answered. A quick test passes and the service dies afterwards.`
           : `After the first ${hit.burst} lines the log goes almost silent, so the attack you wanted a record of leaves one line every 20 minutes.`} Write the rate you mean: \`-m limit --limit 10/sec --limit-burst 20\` (nft: \`limit rate 10/second burst 20 packets\`).`
       });
+    });
+  }
+
+  // ── limit-rate-invalid ─────────────────────────────────────────────
+  // A rate is a number and a unit, and the two front-ends disagree about the
+  // unit - each refuses spellings the other takes. Measured (iptables 1.8.11
+  // nf_tables + legacy, ip6tables, nftables 1.1.3 and 1.1.6, real loads):
+  //   - iptables `--limit`, `--hashlimit-upto`, `--hashlimit-above`: the unit
+  //     is ANY prefix of second, minute, hour or day, any case (`5/s`,
+  //     `5/minut`, `5/Sec`, a bare `5` = per second all load). A plural
+  //     (`5/minutes`, `5/hours`, `5/seconds`), `5/hr`, `5/week`, `5/`, `0/s`
+  //     and `five/min` are refused: 'bad rate "5/minutes"' (hashlimit: 'Bad
+  //     value for "--hashlimit-upto" option'), rc 2. Above a ceiling it is
+  //     'Rate too fast': 10000/s for -m limit (600000/m loads, 600001/m does
+  //     not), 1000000/s for hashlimit. hashlimit also takes bytes (`10kb/s`).
+  //   - nft `limit rate [over] N/unit`: the unit is second, minute, hour, day
+  //     or week - spelled out, lower case. `5/min`, `5/s`, `5/Minute` and
+  //     `5/minutes` are a syntax error (rc 1); `0/second` parses and the
+  //     kernel refuses it ("Invalid argument", rc 1).
+  // So `5/min` copied from iptables into nft, `5/week` the other way, or a
+  // natural plural in either, is a file that does not load. A dump always
+  // shows a valid spelling: like log-level-unknown, it lives in hand-written
+  // files.
+  const IPT_RATE_UNITS = [['second', 1], ['minute', 60], ['hour', 3600], ['day', 86400]];
+  const NFT_RATE_UNITS = ['second', 'minute', 'hour', 'day', 'week'];
+  const RATE_UNIT_FIX = { s: 'second', sec: 'second', secs: 'second', m: 'minute', min: 'minute', mins: 'minute', h: 'hour', hr: 'hour', hrs: 'hour', d: 'day', w: 'week', wk: 'week', wks: 'week' };
+
+  function rateUnitFix(unit, valid) {
+    const l = unit.toLowerCase();
+    const singular = l.endsWith('s') ? l.slice(0, -1) : l;
+    const named = valid.includes(l) ? l : valid.includes(singular) ? singular : RATE_UNIT_FIX[l];
+    if (named && valid.includes(named)) return named;
+    return l ? valid.find((u) => u.startsWith(l)) || null : null;
+  }
+
+  function iptRateProblem(option, value) {
+    const hashlimit = option !== '--limit';
+    const m = (hashlimit ? /^(\d+)(b|kb|mb)?(?:\/(.*))?$/i : /^(\d+)(?:\/(.*))?$/).exec(value);
+    if (!m) return { why: 'not-a-number' };
+    const n = Number(m[1]);
+    const bytes = hashlimit && Boolean(m[2]);
+    const unit = hashlimit ? m[3] : m[2];
+    let secs = 1;
+    if (unit !== undefined) {
+      const hit = unit && IPT_RATE_UNITS.find(([name]) => name.startsWith(unit.toLowerCase()));
+      if (!hit) return { why: 'unit', unit, fix: rateUnitFix(unit, IPT_RATE_UNITS.map(([name]) => name)) };
+      secs = hit[1];
+    }
+    if (n === 0) return { why: 'zero' };
+    const ceiling = hashlimit ? 1000000 : 10000;
+    if (!bytes && n > ceiling * secs) return { why: 'too-fast', ceiling };
+    return null;
+  }
+
+  function detectLimitRateInvalid(result, findings) {
+    const format = result.format;
+    const ipt = format === 'iptables' || format === 'ip6tables';
+    if (!ipt && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      // Quoted text (a comment, a log prefix) can say anything.
+      const raw = String(rule.raw || '').replace(/"(?:[^"\\]|\\.)*"/g, '""');
+      const push = (title, details) => findings.push({
+        id: 'limit-rate-invalid',
+        severity: 'error',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: idx,
+        title,
+        details
+      });
+      if (ipt) {
+        for (const m of raw.matchAll(/(?:^|\s)(--limit|--hashlimit-upto|--hashlimit-above)[\s=]+"?([^\s"]+)"?/g)) {
+          const [, option, value] = m;
+          const p = iptRateProblem(option, value);
+          if (!p) continue;
+          const refused = option === '--limit' ? `'bad rate "${value}"'` : `'Bad value for "${option}" option'`;
+          const head = `\`${option} ${value}\``;
+          if (p.why === 'too-fast') {
+            push(`${head} is above the ${p.ceiling.toLocaleString('en-US')}/second ceiling — iptables-restore refuses the file`,
+              `${option === '--limit' ? '`-m limit`' : 'hashlimit'} stops at ${p.ceiling.toLocaleString('en-US')} packets per second, in whatever unit it is written (measured: 'Rate too fast "${value}"', rc 2${option === '--limit' ? '; 600000/m loads, 600001/m does not' : ''}). ${RESTORE_REFUSED}. ${option === '--limit' ? 'For a higher rate use `-m hashlimit`, which goes up to 1,000,000/s; if no limit is meant, drop the match.' : 'If no limit is meant, drop the match.'}`);
+          } else if (p.why === 'unit') {
+            const week = /^weeks?$/i.test(p.unit);
+            push(`${head}: \`/${p.unit}\` is not a unit iptables reads — iptables-restore refuses the file`,
+              `iptables takes any prefix of second, minute, hour or day, in any case — \`/s\`, \`/min\`, \`/hour\` — and nothing else: no plurals, no \`/hr\`, no \`/week\` (measured, both backends: ${refused}, rc 2).${week ? ' `/week` is nft\'s unit; iptables stops at `/day`.' : ''} ${RESTORE_REFUSED}. ${p.fix ? `Write \`${option} ${value.replace(/\/.*$/, '')}/${p.fix}\`.` : week ? 'Convert to a per-day rate.' : 'Use /second, /minute, /hour or /day.'}`);
+          } else {
+            push(`${head} is not a rate — iptables-restore refuses the file`,
+              `${p.why === 'zero' ? 'Zero is not a rate: there is no way to write "never" with a limit match' : 'The rate must start with a number'} (measured: ${refused}, rc 2). ${RESTORE_REFUSED}. ${p.why === 'zero' ? 'A rule meant never to match should not be there.' : 'Write it as N/unit, e.g. `5/minute`.'}`);
+          }
+        }
+        return;
+      }
+      for (const m of raw.matchAll(/\blimit\s+rate\s+(?:over\s+)?(\d+)\s*(?:[a-z]+\s*)?\/\s*([^\s;}]+)/gi)) {
+        const [text, n, unit] = m;
+        if (NFT_RATE_UNITS.includes(unit)) {
+          if (Number(n) !== 0) continue;
+          push(`\`${text.trim()}\`: zero is not a rate — the ruleset will not load`,
+            `It parses; the kernel refuses it on load (measured: "Could not process rule: Invalid argument", rc 1). ${NFT_REFUSED}. A rule meant never to match should not be there.`);
+          continue;
+        }
+        const fix = rateUnitFix(unit, NFT_RATE_UNITS);
+        const caseOnly = NFT_RATE_UNITS.includes(unit.toLowerCase());
+        const iptSpelling = !caseOnly && IPT_RATE_UNITS.some(([name]) => name.startsWith(unit.toLowerCase()));
+        push(`\`${text.trim()}\`: nft has no unit \`${unit}\` — the ruleset will not load`,
+          `nft takes second, minute, hour, day or week, spelled out in lower case (measured: \`5/min\`, \`5/s\`, \`5/Minute\` and \`5/minutes\` are all a syntax error, rc 1).${caseOnly ? ' nft is case-sensitive here; iptables is not, which is how this spelling gets copied in.' : iptSpelling ? ` \`${unit}\` is how iptables abbreviates it; nft wants the whole word.` : ''} ${NFT_REFUSED}. ${fix ? `Write \`${text.trim().replace(/\/\s*[^\s;}]+$/, `/${fix}`)}\`.` : 'Use one of the units above.'}`);
+      }
     });
   }
 

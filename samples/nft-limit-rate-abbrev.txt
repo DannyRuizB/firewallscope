@@ -1,0 +1,17 @@
+# An nft ruleset translated by hand from an iptables one, keeping its rates:
+# `5/min` and `10/s` are fine in iptables (any prefix of the unit) and a
+# syntax error in nft, which wants second, minute, hour, day or week spelled
+# out in lower case (measured, nftables 1.1.3 and 1.1.6, rc 1). `nft -f` is
+# atomic, so the whole ruleset is refused and the firewall never comes up.
+# With `5/minute` and `10/second` it loads, rc 0.
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iif "lo" accept
+		ct state established,related accept
+		icmp type echo-request limit rate 10/s accept
+		tcp dport 22 ct state new limit rate 5/min accept
+		tcp dport 443 accept
+		log prefix "INPUT-DROP: " drop
+	}
+}

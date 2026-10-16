@@ -1,0 +1,21 @@
+# A hand-edited /etc/iptables/rules.v4 with two lines that look fine
+# (measured, iptables 1.8.11, real loads):
+#  - "ping at 1/s, no burst at all" written as `--limit-burst 0`. legacy
+#    refuses the table (rc 1) and the box boots with INPUT at ACCEPT; the
+#    nf_tables backend loads it and quietly applies the default burst of 5.
+#  - the ssh accept edited from both ends: someone added `-m state --state
+#    NEW` in front of a conntrack match narrowed to ESTABLISHED. A connection
+#    is never both, so the rule loads and never matches (counter 0) - on the
+#    nf_tables backend ssh falls through to the DROP policy.
+# With `--limit-burst 1` and the state match removed, both backends load it
+# and new ssh connections are accepted.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p icmp --icmp-type echo-request -m limit --limit 1/second --limit-burst 0 -j ACCEPT
+-A INPUT -p tcp --dport 22 -m state --state NEW -m conntrack --ctstate ESTABLISHED -j ACCEPT
+-A INPUT -p tcp --dport 443 -j ACCEPT
+COMMIT

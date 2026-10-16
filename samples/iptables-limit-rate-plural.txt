@@ -1,0 +1,17 @@
+# A hand-written /etc/iptables/rules.v4 with rates written the way people say
+# them: "five per minute", "four per hour". iptables reads ANY prefix of
+# second/minute/hour/day (`5/min`, `5/s`, `5/Sec` all load) but no plural
+# (measured, iptables 1.8.11, nf_tables and legacy): 'bad rate "5/minutes"',
+# rc 2 - and hashlimit refuses `--hashlimit-upto 4/hours` the same way.
+# *filter loads nothing and INPUT stays at policy ACCEPT: the box boots open.
+# With `5/minute` and `4/hour` the file loads, rc 0.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m hashlimit --hashlimit-upto 4/hours --hashlimit-burst 4 --hashlimit-mode srcip --hashlimit-name ssh -j ACCEPT
+-A INPUT -p tcp --dport 443 -j ACCEPT
+-A INPUT -m limit --limit 5/minutes -j LOG --log-prefix "INPUT-DROP: "
+COMMIT

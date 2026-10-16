@@ -117,9 +117,11 @@
     detectCommentTooLong(result, findings);
     detectLimitDefaultRate(result, findings);
     detectLimitRateInvalid(result, findings);
+    detectLimitBurstInvalid(result, findings);
     detectCidrHostBitsSet(result, findings);
     detectLogLevelUnknown(result, findings);
     detectCtStateUnknown(result, findings);
+    detectCtStateNeverMatches(result, findings);
     detectCommentMatchWithoutText(result, findings);
     detectInterfaceNameTooLong(result, findings);
     detectChainNotInTable(result, findings);
@@ -3571,6 +3573,55 @@
     });
   }
 
+  // ── limit-burst-invalid ────────────────────────────────────────────
+  // The burst has a range, and its edges are not where people expect them.
+  // Measured (iptables 1.8.11 nf_tables + legacy, nftables 1.1.3, real loads
+  // with pings over loopback at 1/hour):
+  //   - `--limit-burst` takes 0-10000 and `--hashlimit-burst` 1-1000000; past
+  //     either edge the parser refuses the file ('bad value for option
+  //     "--limit-burst", or out of range (0-10000)'), rc 2.
+  //   - `--limit-burst 0` is the trap: the parser lets it through and the two
+  //     backends part ways. legacy refuses the table at COMMIT (rc 1);
+  //     nf_tables loads it with rc 0 and behaves as the DEFAULT burst of 5 -
+  //     5 of 6 pings passed where `--limit-burst 1` let exactly 1 through,
+  //     and the dump does not even print the option. Someone who wrote 0 for
+  //     "no burst at all" got five.
+  //   - nft `burst 0 packets` is refused outright ("packet limit burst must
+  //     be > 0", rc 1). A byte limit's burst was not measured and is left
+  //     alone.
+  function detectLimitBurstInvalid(result, findings) {
+    const format = result.format;
+    const ipt = format === 'iptables' || format === 'ip6tables';
+    if (!ipt && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const raw = String(rule.raw || '').replace(/"(?:[^"\\]|\\.)*"/g, '""');
+      const push = (title, details) => findings.push({
+        id: 'limit-burst-invalid', severity: 'error', table: table.name, tableFamily: table.family || null,
+        chain: chain.name, ruleIdx: idx, title, details
+      });
+      if (ipt) {
+        for (const m of raw.matchAll(/(?:^|\s)(--limit-burst|--hashlimit-burst)[\s=]+(\d+)(?=\s|$)/g)) {
+          const [, option, value] = m;
+          const n = Number(value);
+          const hashlimit = option === '--hashlimit-burst';
+          const [lo, hi] = hashlimit ? [1, 1000000] : [0, 10000];
+          if (!hashlimit && n === 0) {
+            push('`--limit-burst 0` means "no burst" to nobody: legacy refuses the file, nf_tables quietly uses 5',
+              `The two backends disagree about this one (measured): iptables-legacy refuses the table at COMMIT (rc 1), and iptables-nft loads it with rc 0 and applies the DEFAULT burst of 5 — 5 of 6 pings went through a 1/hour limit, where \`--limit-burst 1\` let exactly one through — and \`iptables -S\` no longer shows the option at all. On legacy: ${RESTORE_REFUSED}. Write \`--limit-burst 1\` for the strictest bucket.`);
+          } else if (n < lo || n > hi) {
+            push(`\`${option} ${value}\` is outside ${lo}-${hi.toLocaleString('en-US')} — iptables-restore refuses the file`,
+              `${hashlimit ? 'hashlimit' : '`-m limit`'} takes a burst from ${lo} to ${hi.toLocaleString('en-US')} (measured: 'bad value for option "${option}", or out of range (${lo}-${hi})', rc 2). ${RESTORE_REFUSED}. ${n > hi ? (hashlimit ? 'Lower it to 1000000 at most.' : 'Lower it to 10000 at most, or move to `-m hashlimit`, whose burst goes to 1,000,000.') : 'Write `--hashlimit-burst 1` for the strictest bucket.'}`);
+          }
+        }
+        return;
+      }
+      for (const m of raw.matchAll(/\blimit\s+rate\s+[^;}]*?\bburst\s+0\s+(packets)\b/gi)) {
+        push(`\`burst 0 ${m[1]}\` — nft refuses a zero burst: the ruleset will not load`,
+          `nft wants a burst of at least 1 (measured: "packet limit burst must be > 0", rc 1). ${NFT_REFUSED}. Write \`burst 1 ${m[1]}\` for the strictest bucket, or drop \`burst\` to take the default.`);
+      }
+    });
+  }
+
   // ── cidr-host-bits-set ─────────────────────────────────────────────
   // `-s 192.168.1.10/24` reads like "this host, in that subnet". The kernel
   // reads a prefix: the host bits are dropped and the rule matches the whole
@@ -3822,6 +3873,61 @@
           details: `Unknown: ${hints.join('; ')}. ${ipt ? `\`--${c.opt}\` takes ${known} (any case)` : `\`ct ${c.opt}\` takes ${known} (lower case only)`} — measured, ${ipt ? `both backends refuse anything else ('Bad ${c.opt}', rc 2), negated or not` : 'nft refuses anything else (rc 1)'}. ${ipt ? RESTORE_REFUSED : NFT_REFUSED} — and a state match is usually the ESTABLISHED,RELATED accept the rest of the ruleset relies on.`
         });
       }
+    });
+  }
+
+  // ── ct-state-never-matches ─────────────────────────────────────────
+  // A connection is in exactly one of NEW, ESTABLISHED, RELATED, INVALID or
+  // UNTRACKED, and every match on a rule must hold at once - so two state
+  // lists with nothing in common make a rule that never matches. It loads
+  // with rc 0 and its counter stays at 0. Measured with real connections
+  // (iptables 1.8.11 nf_tables, nftables 1.1.3): `-m state --state NEW -m
+  // conntrack --ctstate ESTABLISHED`, `--ctstate NEW` twice-with-ESTABLISHED,
+  // `--state INVALID` + `--ctstate NEW,RELATED` and nft `ct state new ct
+  // state established` all counted 0 of 3; overlapping lists (`NEW,
+  // ESTABLISHED` + `NEW`, nft `{ new, established }` + `new`) counted 3. The
+  // usual origin is a rule edited from both ends: one person narrows the
+  // conntrack list, another adds a -m state in front. Only positive lists of
+  // the five real states are judged - SNAT/DNAT are a second axis and a
+  // negation needs a universe this does not assume.
+  function detectCtStateNeverMatches(result, findings) {
+    const format = result.format;
+    const ipt = format === 'iptables' || format === 'ip6tables';
+    if (!ipt && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const raw = String(rule.raw || '').replace(/"(?:[^"\\]|\\.)*"/g, '""');
+      const lists = [];
+      if (ipt) {
+        for (const m of raw.matchAll(/(?:^|\s)(!\s+)?--(ctstate|state)\s+(!\s+)?([^\s"]+)/g)) {
+          if (m[1] || m[3]) return;
+          const items = m[4].split(',').map((x) => x.toUpperCase());
+          if (!items.every((x) => IPT_STATES.has(x))) return;
+          lists.push({ spelled: `--${m[2]} ${m[4]}`, items: new Set(items) });
+        }
+      } else {
+        const re = /(?:^|\s)ct\s+state\s+/g;
+        while (re.exec(raw)) {
+          const rest = raw.slice(re.lastIndex);
+          if (/^\s*!=/.test(rest) || /^\s*vmap\b/.test(rest)) return;
+          const items = nftCtItems(rest);
+          if (!items || !items.every((x) => NFT_CTSTATES.has(x))) return;
+          lists.push({ spelled: `ct state ${items.join(',')}`, items: new Set(items) });
+        }
+      }
+      if (lists.length < 2) return;
+      const common = [...lists[0].items].filter((x) => lists.every((l) => l.items.has(x)));
+      if (common.length) return;
+      const accept = isAcceptAction(rule);
+      findings.push({
+        id: 'ct-state-never-matches',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: idx,
+        title: `${lists.map((l) => `\`${l.spelled}\``).join(' and ')} share no state — this rule never matches`,
+        details: `A connection is in exactly one state at a time and every match on a rule must hold together, so these lists leave nothing that could match: the rule loads (rc 0) and its counter stays at 0 (measured with real connections, iptables and nft alike).${accept ? ' The traffic it was written to accept falls through to the rules below — usually the default drop.' : ''} Keep one list with the states you mean.`
+      });
     });
   }
 

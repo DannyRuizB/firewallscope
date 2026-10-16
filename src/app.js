@@ -48,6 +48,7 @@
     ownerinput: 'samples/iptables-owner-input.txt',
     limitplural: 'samples/iptables-limit-rate-plural.txt',
     nftlimitabbrev: 'samples/nft-limit-rate-abbrev.txt',
+    burstzero: 'samples/iptables-burst-zero-dead-state.txt',
     nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 

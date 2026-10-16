@@ -58,6 +58,7 @@ const EXPECTED = {
   'iptables-owner-input.txt': ['owner-match-not-valid-here', 'string-match-incomplete'],
   'iptables-limit-rate-plural.txt': ['limit-rate-invalid'],
   'nft-limit-rate-abbrev.txt': ['limit-rate-invalid'],
+  'iptables-burst-zero-dead-state.txt': ['limit-burst-invalid', 'ct-state-never-matches'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -146,6 +147,8 @@ const ALL_SMELLS = [
   'owner-match-not-valid-here',
   'string-match-incomplete',
   'limit-rate-invalid',
+  'limit-burst-invalid',
+  'ct-state-never-matches',
 ];
 
 // --- allow-under-default-allow -------------------------------------------
@@ -3797,6 +3800,83 @@ test('limit-rate-invalid (nft): only the five whole words load; iptables abbrevi
   // Inside a meter it is the same statement; inside a log prefix it is text.
   assert.equal(lrHits(nftRule('tcp dport 22 meter m { ip saddr limit rate 5/min } accept')).length, 1);
   assert.equal(lrHits(nftRule('limit rate 5/minute log prefix "limit rate 5/min: " drop')).length, 0);
+});
+
+// --- limit-burst-invalid -----------------------------------------------------
+// Measured (iptables 1.8.11 nf_tables + legacy, nftables 1.1.3, real loads):
+// --limit-burst 0-10000, --hashlimit-burst 1-1000000, else the parser refuses;
+// --limit-burst 0: legacy refuses at COMMIT, nf_tables loads it as burst 5;
+// nft `burst 0 packets` is refused.
+
+const lbHits = (text) => FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'limit-burst-invalid');
+
+test('limit-burst-invalid (iptables): the ranges, and the backend split on 0', () => {
+  for (const b of ['1', '5', '10000']) assert.equal(lbHits(iptRule(`-p icmp -m limit --limit 5/s --limit-burst ${b} -j ACCEPT`)).length, 0, b);
+  const zero = lbHits(iptRule('-p icmp -m limit --limit 1/s --limit-burst 0 -j ACCEPT'));
+  assert.equal(zero.length, 1);
+  assert.equal(zero[0].severity, 'error');
+  assert.match(zero[0].title, /legacy refuses the file, nf_tables quietly uses 5/);
+  assert.match(zero[0].details, /5 of 6 pings/);
+  assert.match(zero[0].details, /Write `--limit-burst 1`/);
+  for (const b of ['10001', '65535']) {
+    const f = lbHits(iptRule(`-p icmp -m limit --limit 5/s --limit-burst ${b} -j ACCEPT`));
+    assert.equal(f.length, 1, b);
+    assert.match(f[0].title, /outside 0-10,000 — iptables-restore refuses the file/);
+    assert.match(f[0].details, /out of range \(0-10000\)/);
+  }
+  // A comment can say anything.
+  assert.equal(lbHits(iptRule('-p icmp -m limit --limit 5/s -m comment --comment "--limit-burst 0" -j ACCEPT')).length, 0);
+});
+
+test('limit-burst-invalid (hashlimit and nft)', () => {
+  const HL = '-p tcp -m hashlimit --hashlimit-upto 5/s --hashlimit-mode srcip --hashlimit-name x';
+  for (const b of ['1', '1000000']) assert.equal(lbHits(iptRule(`${HL} --hashlimit-burst ${b} -j ACCEPT`)).length, 0, b);
+  for (const b of ['0', '1000001']) {
+    const f = lbHits(iptRule(`${HL} --hashlimit-burst ${b} -j ACCEPT`));
+    assert.equal(f.length, 1, b);
+    assert.match(f[0].title, /outside 1-1,000,000/);
+  }
+  assert.equal(lbHits(nftRule('limit rate 5/second burst 1 packets accept')).length, 0);
+  const f = lbHits(nftRule('limit rate over 5/second burst 0 packets drop'));
+  assert.equal(f.length, 1);
+  assert.match(f[0].details, /packet limit burst must be > 0/);
+  // A byte limit's burst was not measured: left alone.
+  assert.equal(lbHits(nftRule('limit rate 10 mbytes/second burst 0 mbytes accept')).length, 0);
+});
+
+// --- ct-state-never-matches --------------------------------------------------
+// Measured with real connections (iptables 1.8.11 nf_tables, nftables 1.1.3):
+// two state lists with nothing in common counted 0 of 3; overlapping lists 3.
+
+const csHits = (text) => FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'ct-state-never-matches');
+
+test('ct-state-never-matches (iptables): disjoint lists warn, overlapping or unjudged ones do not', () => {
+  for (const body of ['-m state --state NEW -m conntrack --ctstate ESTABLISHED -j ACCEPT',
+    '-m conntrack --ctstate NEW -m conntrack --ctstate ESTABLISHED -j ACCEPT',
+    '-m state --state INVALID -m conntrack --ctstate NEW,RELATED -j DROP',
+    '-m state --state new -m conntrack --ctstate ESTABLISHED -j ACCEPT']) {
+    assert.equal(csHits(iptRule(body)).length, 1, body);
+  }
+  const f = csHits(iptRule('-p tcp --dport 22 -m state --state NEW -m conntrack --ctstate ESTABLISHED -j ACCEPT'))[0];
+  assert.equal(f.severity, 'warning');
+  assert.match(f.title, /`--state NEW` and `--ctstate ESTABLISHED` share no state — this rule never matches/);
+  assert.match(f.details, /falls through to the rules below/);
+  for (const body of ['-m state --state NEW,ESTABLISHED -m conntrack --ctstate NEW -j ACCEPT',
+    '-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+    '-m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT',
+    '-m state ! --state NEW -m conntrack --ctstate NEW -j ACCEPT']) {
+    assert.equal(csHits(iptRule(body)).length, 0, body);
+  }
+});
+
+test('ct-state-never-matches (nft): disjoint ct state lists warn; sets, != and vmap are read correctly', () => {
+  assert.equal(csHits(nftRule('ct state new ct state established accept')).length, 1);
+  assert.equal(csHits(nftRule('ct state invalid ct state { new, related } drop')).length, 1);
+  assert.doesNotMatch(csHits(nftRule('ct state invalid ct state { new, related } drop'))[0].details, /falls through/);
+  for (const body of ['ct state { new, established } ct state new accept', 'ct state established ct state != established accept',
+    'ct state established,related accept', 'ct state vmap { established : accept, new : drop } ct state new']) {
+    assert.equal(csHits(nftRule(body)).length, 0, body);
+  }
 });
 
 // --- interface-name-too-long -------------------------------------------------

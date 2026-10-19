@@ -1,0 +1,30 @@
+# An nft NAT gateway translated by hand from an iptables rules.v4. The port
+# forwards live in a regular chain `portfwd`, jumped from prerouting - and
+# then also from postrouting, "so the LAN reaches them too" (hairpin). dnat
+# is only valid in a type nat chain at prerouting/output, and a regular
+# chain is judged by every base chain that reaches it. Measured on THIS file
+# (nftables 1.1.3): `nft -c -f` passes and `nft -f` is refused ("Could not
+# process rule: Operation not supported", rc 1) - atomically, so the filter
+# table below never loads either. Without the postrouting jump it loads.
+table ip nat {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "eth0" jump portfwd
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "eth1" jump portfwd
+		oifname "eth0" ip saddr 10.0.0.0/24 masquerade
+	}
+	chain portfwd {
+		tcp dport 443 dnat to 10.0.0.10:443
+	}
+}
+table ip filter {
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		ct state established,related accept
+		iifname "eth0" oifname "eth1" ip daddr 10.0.0.10 tcp dport 443 accept
+		iifname "eth1" oifname "eth0" accept
+	}
+}

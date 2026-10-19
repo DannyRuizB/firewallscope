@@ -53,6 +53,7 @@ const EXPECTED = {
   'nft-icmpv6-type-typo.txt': ['icmp-type-unknown'],
   'iptables-chain-wrong-table.txt': ['chain-not-in-table'],
   'iptables-nat-target-wrong-hook.txt': ['target-not-valid-here'],
+  'nft-nat-wrong-hook.txt': ['target-not-valid-here'],
   'iptables-ctstate-typo.txt': ['ct-state-unknown', 'comment-match-without-text'],
   'nft-ct-state-case.txt': ['ct-state-unknown'],
   'iptables-owner-input.txt': ['owner-match-not-valid-here', 'string-match-incomplete'],
@@ -4058,7 +4059,7 @@ test('target-not-valid-here: valid placements stay quiet (Docker / Kubernetes sh
   assert.deepEqual(f, []);
 });
 
-test('chain-not-in-table / target-not-valid-here: ip6tables is judged too; nft and ufw are not', () => {
+test('chain-not-in-table / target-not-valid-here: ip6tables is judged too; a valid nft NAT ruleset and ufw stay quiet', () => {
   const fs = loadFirewallScope();
   const v6 = fs.lint(fs.parse('*filter\n:INPUT DROP [0:0]\n-A INPUT -p ipv6-icmp -j ACCEPT\n-A INPUT -s fe80::/10 -j ACCEPT\n-A INPUT -p tcp -j MASQUERADE\nCOMMIT\n'));
   assert.ok(v6.findings.some((x) => x.id === 'target-not-valid-here'));
@@ -4066,6 +4067,58 @@ test('chain-not-in-table / target-not-valid-here: ip6tables is judged too; nft a
     const r = fs.lint(fs.parse(sample(name)));
     assert.ok(!r.findings.some((x) => x.id === 'chain-not-in-table' || x.id === 'target-not-valid-here'), name);
   }
+});
+
+// nftables, measured (nftables 1.1.3, ip/ip6/inet, real loads): dnat/redirect
+// only in type nat prerouting/output, snat in input/postrouting, masquerade in
+// postrouting; outside a type nat chain never; a regular chain judged by the
+// base chains that reach it; drop/reject in a nat chain load.
+const nftNat = (family, type, hook, stmt) =>
+  `table ${family} t {\n  chain c {\n    type ${type} hook ${hook} priority 0; policy accept;\n    ${stmt}\n  }\n}\n`;
+const nftNatHits = (text) => Array.from(FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'target-not-valid-here'));
+
+test('target-not-valid-here (nft): the measured hook matrix, the same in ip, ip6 and inet', () => {
+  const stmts = {
+    dnat: { ip: 'tcp dport 80 dnat to 10.0.0.1', ip6: 'tcp dport 80 dnat to [2001:db8::1]', inet: 'tcp dport 80 dnat ip to 10.0.0.1' },
+    snat: { ip: 'tcp dport 80 snat to 10.0.0.2', ip6: 'tcp dport 80 snat to [2001:db8::2]', inet: 'tcp dport 80 snat ip to 10.0.0.2' },
+    masquerade: { ip: 'tcp dport 80 masquerade', ip6: 'tcp dport 80 masquerade', inet: 'tcp dport 80 masquerade' },
+    redirect: { ip: 'tcp dport 80 redirect to :8080', ip6: 'tcp dport 80 redirect to :8080', inet: 'tcp dport 80 redirect to :8080' }
+  };
+  const loads = { dnat: ['prerouting', 'output'], redirect: ['prerouting', 'output'], snat: ['input', 'postrouting'], masquerade: ['postrouting'] };
+  for (const family of ['ip', 'ip6', 'inet']) {
+    for (const [kind, by] of Object.entries(stmts)) {
+      for (const hook of ['prerouting', 'input', 'output', 'postrouting']) {
+        const hits = nftNatHits(nftNat(family, 'nat', hook, by[family]));
+        assert.equal(hits.length, loads[kind].includes(hook) ? 0 : 1, `${family} ${kind} in nat/${hook}`);
+      }
+    }
+  }
+});
+
+test('target-not-valid-here (nft): NAT outside a type nat chain is flagged; filter verdicts in a nat chain are not', () => {
+  const f = nftNatHits(nftNat('ip', 'filter', 'prerouting', 'tcp dport 80 dnat to 10.0.0.1'));
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /`dnat` runs in filter\/prerouting — it is only valid in a type nat chain at prerouting\/output/);
+  assert.match(f[0].details, /Operation not supported/);
+  assert.match(f[0].details, /`nft -c` does not catch it/);
+  assert.equal(nftNatHits(nftNat('ip', 'route', 'output', 'tcp dport 80 dnat to 10.0.0.1')).length, 1);
+  assert.equal(nftNatHits(nftNat('inet', 'filter', 'forward', 'oifname "eth0" masquerade random')).length, 1);
+  for (const ok of ['tcp dport 22 reject', 'tcp dport 22 drop', 'ct status dnat accept', 'icmp type redirect drop',
+    'tcp dport 80 accept comment "dnat to 10.0.0.1 used to live here"']) {
+    assert.equal(nftNatHits(nftNat('ip', 'nat', 'postrouting', ok)).length, 0, ok);
+    assert.equal(nftNatHits(nftNat('ip', 'filter', 'input', ok)).length, 0, ok);
+  }
+});
+
+test('target-not-valid-here (nft): a regular chain is judged by the base chains that reach it', () => {
+  const tbl = (jumps) => `table ip t {\n  chain u {\n    tcp dport 80 dnat to 10.0.0.1\n  }\n  chain v {\n    jump u\n  }\n${jumps}}\n`;
+  const base = (type, hook, rule) => `  chain ${hook}_${type} {\n    type ${type} hook ${hook} priority 0; policy accept;\n    ${rule}\n  }\n`;
+  assert.equal(nftNatHits(tbl(base('nat', 'prerouting', 'jump u'))).length, 0, 'from nat prerouting');
+  assert.equal(nftNatHits(tbl('')).length, 0, 'unreferenced');
+  const two = nftNatHits(tbl(base('nat', 'prerouting', 'jump u') + base('nat', 'postrouting', 'goto v')));
+  assert.equal(two.length, 1, 'from postrouting, two deep');
+  assert.match(two[0].title, /\(u is reached from postrouting_nat\)/);
+  assert.equal(nftNatHits(tbl(base('filter', 'input', 'jump u'))).length, 1, 'from a filter chain');
 });
 
 

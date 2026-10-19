@@ -126,6 +126,7 @@
     detectInterfaceNameTooLong(result, findings);
     detectChainNotInTable(result, findings);
     detectTargetNotValidHere(result, findings);
+    detectNftNatPlacement(result, findings);
     detectOwnerMatchNotValidHere(result, findings);
     detectStringMatchIncomplete(result, findings);
     detectConntrackHelperEnabled(result, findings);
@@ -4022,9 +4023,11 @@
     }
   }
 
-  // Built-ins of the table that reach `name` through jumps/gotos.
-  function builtinRootsOf(table, name) {
+  // Built-ins of the table that reach `name` through jumps/gotos. `isRoot`
+  // says what a built-in is: iptables by table, nft by base chain.
+  function builtinRootsOf(table, name, isRoot) {
     const builtins = IPT_TABLE_BUILTINS[table.name] || [];
+    const rootTest = isRoot || ((n) => builtins.includes(n));
     const callers = new Map();
     for (const chain of table.chains) {
       for (const rule of chain.rules) {
@@ -4038,7 +4041,7 @@
     const queue = [name];
     while (queue.length) {
       const cur = queue.shift();
-      if (builtins.includes(cur)) { roots.add(cur); continue; }
+      if (rootTest(cur)) { roots.add(cur); continue; }
       for (const from of callers.get(cur) || []) {
         if (!seen.has(from)) { seen.add(from); queue.push(from); }
       }
@@ -4086,6 +4089,61 @@
           const via = builtins.includes(chain.name) ? '' : ` (${chain.name} is reached from ${bad.join(', ')})`;
           push(`\`-j ${target}\` runs in nat/${bad.join(', nat/')}${via} — ${target} is only valid in ${place.hooks.join('/')}, so the file does not load`,
             `${target} rewrites the ${target === 'SNAT' || target === 'MASQUERADE' ? 'source on the way out' : 'destination on the way in'}, so the kernel only allows it in nat ${place.hooks.join(' and ')}. Measured (iptables 1.8.13, both backends): placed in ${bad.join('/')} it is refused ("RULE_APPEND failed (Invalid argument)"), and a user chain is judged by the built-ins that jump to it — DNAT in a chain reached from POSTROUTING is refused even two jumps deep, while the same chain reached only from PREROUTING loads. ${RESTORE_REFUSED}.`);
+        });
+      }
+    }
+  }
+
+  // The same rule for nftables, measured (nftables 1.1.3 on a 6.18 kernel,
+  // ip/ip6/inet tables alike, real loads): the NAT statements only run in a
+  // `type nat` base chain - in a filter or route chain every one is refused -
+  // and inside nat only at their hooks: dnat and redirect in prerouting/
+  // output, snat in input/postrouting, masquerade in postrouting ("Could not
+  // process rule: Operation not supported", rc 1). A regular chain is judged
+  // by the base chains that jump to it: reached from nat prerouting a dnat
+  // loads, from nat postrouting or a filter chain it is refused, unreferenced
+  // it loads. Unlike iptables, `drop` and `reject` in a nat chain load, so
+  // they are not flagged here. And `nft -c` is no guard: it returned 0 for
+  // most of the refused placements.
+  const NFT_NAT_HOOKS = {
+    dnat: ['prerouting', 'output'],
+    redirect: ['prerouting', 'output'],
+    snat: ['input', 'postrouting'],
+    masquerade: ['postrouting']
+  };
+
+  // The NAT statement a rule carries, or null. Read from the text, not only
+  // the parsed verb: `dnat ip to ...` (inet) and `masquerade random` end in
+  // words the verb regex does not take. Quoted strings are blanked, and
+  // `icmp type redirect` / `ct status dnat` name a packet, not the statement.
+  function nftNatKind(rule) {
+    const text = ' ' + String(rule.raw || '').replace(/"[^"]*"/g, '""').trim();
+    const m = text.match(/\s(dnat|snat)(?:\s+(?:ip|ip6))?\s+to\s/) ||
+      text.match(/\s(masquerade|redirect)(?=\s*(?:;|$|to\s|random\b|persistent\b|fully-random\b|comment\b))/);
+    return m ? m[1] : null;
+  }
+
+  function detectNftNatPlacement(result, findings) {
+    if (result.format !== 'nftables') return;
+    for (const table of result.tables) {
+      if (!['ip', 'ip6', 'inet'].includes(table.family)) continue;
+      const byName = new Map(table.chains.map((c) => [c.name, c]));
+      const isBase = (n) => !!(byName.get(n) && byName.get(n).builtIn);
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          const kind = nftNatKind(rule);
+          if (!kind) return;
+          const hooks = NFT_NAT_HOOKS[kind];
+          const roots = chain.builtIn ? [chain] : [...builtinRootsOf(table, chain.name, isBase)].map((n) => byName.get(n));
+          const bad = roots.filter((c) => c.type && (c.type !== 'nat' || !hooks.includes(c.hook)));
+          if (!bad.length) return;
+          const via = chain.builtIn ? '' : ` (${chain.name} is reached from ${bad.map((c) => c.name).join(', ')})`;
+          findings.push({
+            id: 'target-not-valid-here', severity: 'error', table: table.name,
+            tableFamily: table.family || null, chain: chain.name, ruleIdx: idx,
+            title: `\`${kind}\` runs in ${bad.map((c) => `${c.type}/${c.hook}`).join(', ')}${via} — it is only valid in a type nat chain at ${hooks.join('/')}, so the ruleset does not load`,
+            details: `${kind === 'snat' || kind === 'masquerade' ? 'Source NAT is decided on the way out' : 'Destination NAT is decided on the way in'}, so the kernel only takes ${kind} in a \`type nat\` chain hooked at ${hooks.join(' or ')}. Measured (nftables 1.1.3, kernel 6.18, ip/ip6/inet tables, real loads): anywhere else \`nft -f\` fails with "Could not process rule: Operation not supported", rc 1, and a regular chain is judged by the base chains that jump to it. \`nft -c\` does not catch it: it returned 0 for dnat in nat input/postrouting, masquerade in nat prerouting and dnat in a filter prerouting chain, all refused by the real load. ${NFT_REFUSED}.`
+          });
         });
       }
     }

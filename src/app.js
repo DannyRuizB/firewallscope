@@ -49,6 +49,7 @@
     limitplural: 'samples/iptables-limit-rate-plural.txt',
     nftlimitabbrev: 'samples/nft-limit-rate-abbrev.txt',
     burstzero: 'samples/iptables-burst-zero-dead-state.txt',
+    nftnatwronghook: 'samples/nft-nat-wrong-hook.txt',
     nftlabeltoolong: 'samples/nft-label-too-long.txt'
   };
 

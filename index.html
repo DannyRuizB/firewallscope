@@ -55,6 +55,7 @@
               <button type="button" data-sample="ifacewrongchain">iptables (-o in INPUT / -i in OUTPUT — won't load)</button>
               <button type="button" data-sample="undefinedchain">iptables (jump to a chain that isn't there — won't load)</button>
               <button type="button" data-sample="multiportoverflow">iptables (16 ports in one multiport — won't load)</button>
+              <button type="button" data-sample="multiporttwolists">iptables (--dports + --sport in one multiport — won't load)</button>
               <button type="button" data-sample="logprefixtruncated">iptables (30-byte log prefix — silently cut)</button>
               <button type="button" data-sample="limitdefault">iptables (-m limit without --limit — 3/hour)</button>
               <button type="button" data-sample="cidrhostbits">iptables (10.20.0.15/24 — trusts the whole /24)</button>

@@ -43,6 +43,7 @@ const EXPECTED = {
   'iptables-iface-wrong-chain.txt': ['interface-match-wrong-direction'],
   'iptables-undefined-chain.txt': ['jump-to-undefined-chain'],
   'iptables-multiport-overflow.txt': ['multiport-too-many-ports'],
+  'iptables-multiport-two-lists.txt': ['multiport-one-option'],
   'iptables-log-prefix-truncated.txt': ['log-prefix-too-long'],
   'nft-label-too-long.txt': ['log-prefix-too-long', 'comment-too-long'],
   'iptables-limit-default.txt': ['limit-default-rate'],
@@ -134,6 +135,7 @@ const ALL_SMELLS = [
   'interface-match-wrong-direction',
   'jump-to-undefined-chain',
   'multiport-too-many-ports',
+  'multiport-one-option',
   'log-prefix-too-long',
   'comment-too-long',
   'limit-default-rate',
@@ -3521,6 +3523,72 @@ test('multiport-too-many-ports: --sports, --ports, negated lists and ip6tables c
     '-A INPUT -p ipv6-icmp -j ACCEPT', `-A INPUT -s fe80::/10 -p tcp -m multiport --dports ${ports(16)} -j ACCEPT`, 'COMMIT'].join('\n');
   assert.equal(mpHits(v6).length, 1);
   assert.equal(mpHits(mpRule(`-p tcp -m multiport --dports ${ports(8)} -m multiport --sports ${ports(8)}`)).length, 0);
+});
+
+// --- multiport-one-option ----------------------------------------------------
+// Measured (iptables 1.8.11, nf_tables AND legacy, iptables-restore on 34
+// variants, linter and kernel agree on all 34): one -m multiport takes one port
+// list; after it a singular --sport/--dport is read as multiport's --sports/
+// --dports unless a loaded tcp/udp match owns the exact name.
+
+function oneOptHits(text) {
+  return FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'multiport-one-option');
+}
+
+test('multiport-one-option: two port lists in one match is an error, with the message iptables prints', () => {
+  const f = oneOptHits(mpRule('-p tcp -m multiport --dports 22,80 --sports 1024:65535'));
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'error');
+  assert.equal(f[0].ruleIdx, 0);
+  assert.match(f[0].title, /one `-m multiport` with `--dports` and `--sports` — a multiport match takes one port list/);
+  assert.match(f[0].details, /option "--source-ports" cannot be used together with "--destination-ports"/);
+  assert.match(f[0].details, /every table after it in the file load NOTHING/);
+  const repeat = oneOptHits(mpRule('-p tcp -m multiport --dports 22 --dports 80'));
+  assert.equal(repeat.length, 1);
+  assert.match(repeat[0].details, /option "--destination-ports" can only be used once/);
+  assert.equal(oneOptHits(mpRule('-p tcp -m multiport --ports 22 --dports 80')).length, 1);
+  assert.equal(oneOptHits(mpRule('-p tcp -m multiport ! --dports 22 --sports 80')).length, 1);
+  assert.equal(oneOptHits(mpRule('-p tcp --match multiport --destination-ports 22 --source-ports 80')).length, 1);
+});
+
+test('multiport-one-option: a singular --sport / --dport after the multiport is swallowed as its list', () => {
+  const f = oneOptHits(mpRule('-p tcp -m multiport --dports 80,443 --sport 1024:65535'));
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /`--sport` \(read as `--sports`\)/);
+  assert.match(f[0].details, /getopt takes it as an abbreviation of multiport's `--sports`/);
+  assert.equal(oneOptHits(mpRule('-p tcp -m multiport --sports 1024:65535 --dport 22')).length, 1);
+  assert.equal(oneOptHits(mpRule('-p udp -m multiport --dports 53 --sport 53')).length, 1);
+  assert.equal(oneOptHits(mpRule('-p tcp -m multiport --dports 22,80 --dport 443')).length, 1, 'repeat via the singular');
+  assert.equal(oneOptHits(mpRule('-p tcp -m multiport --dports 22 -m comment --comment "web" --sports 80')).length, 1, 'a match in between changes nothing');
+  assert.equal(oneOptHits(mpRule('-p tcp -m multiport --dports 22,80 -m conntrack --ctstate NEW --sport 1024')).length, 1);
+  assert.equal(oneOptHits(mpRule('-p tcp -m multiport --dport 22,80')).length, 0, 'one list, abbreviated, loads');
+});
+
+test('multiport-one-option: what loads is never flagged (loaded protocol match, two matches, options before)', () => {
+  for (const body of [
+    '-p tcp -m multiport --dports 22,80 -m tcp --sport 1024:65535',
+    '-p tcp -m multiport --dports 22,80 -m multiport --sports 1024:65535',
+    '-p tcp -m multiport --dports 22 -m multiport --sport 80',
+    '-p tcp --syn -m multiport --dports 22,80 --sport 1024:65535',
+    '-p tcp -m multiport --dports 22,80 --syn --sport 1024:65535',
+    '-p tcp -m multiport --dports 22 --tcp-flags SYN SYN --dport 80',
+    '-p tcp -m tcp --sport 1024 -m multiport --dports 22 --dport 80',
+    '-p tcp -m tcp -m multiport --dports 22 --sport 80',
+    '-p tcp --dport 443 -m multiport --dports 22,80',
+    '-p tcp -m multiport --port 22',
+    '-p tcp -m multiport --dports 22 -m comment --comment "--sports 80"',
+  ]) {
+    assert.equal(oneOptHits(mpRule(body)).length, 0, body);
+  }
+});
+
+test('multiport-one-option: ip6tables too; nft is never judged', () => {
+  const v6 = ['*filter', ':INPUT DROP [0:0]', ':FORWARD DROP [0:0]', ':OUTPUT ACCEPT [0:0]',
+    '-A INPUT -p ipv6-icmp -j ACCEPT', '-A INPUT -p tcp -m multiport --dports 22,80 --sport 1024 -j ACCEPT', 'COMMIT'].join('\n');
+  assert.equal(oneOptHits(v6).length, 1);
+  const nft = ['table inet filter {', '  chain input {', '    type filter hook input priority 0; policy drop;',
+    '    tcp dport { 22, 80 } tcp sport 1024-65535 accept', '  }', '}'].join('\n');
+  assert.equal(oneOptHits(nft).length, 0);
 });
 
 test('multiport-too-many-ports: nft sets have no cap and are never judged', () => {

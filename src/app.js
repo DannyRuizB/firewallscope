@@ -34,6 +34,7 @@
     ifacewrongchain: 'samples/iptables-iface-wrong-chain.txt',
     undefinedchain: 'samples/iptables-undefined-chain.txt',
     multiportoverflow: 'samples/iptables-multiport-overflow.txt',
+    multiporttwolists: 'samples/iptables-multiport-two-lists.txt',
     logprefixtruncated: 'samples/iptables-log-prefix-truncated.txt',
     limitdefault: 'samples/iptables-limit-default.txt',
     cidrhostbits: 'samples/iptables-cidr-host-bits.txt',

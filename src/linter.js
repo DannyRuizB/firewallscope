@@ -113,6 +113,7 @@
     detectInterfaceMatchWrongDirection(result, findings);
     detectJumpToUndefinedChain(result, findings);
     detectMultiportTooManyPorts(result, findings);
+    detectMultiportOneOption(result, findings);
     detectLogPrefixTooLong(result, findings);
     detectCommentTooLong(result, findings);
     detectLimitDefaultRate(result, findings);
@@ -1243,6 +1244,101 @@
               ruleIdx: idx,
               title: `\`--${m[1]}\` lists ${slots} port slots${rangeNote}; multiport holds 15 — iptables-restore refuses the file`,
               details: `\`-m multiport\` takes at most 15 ports per list, and each range \`a:b\` counts as two. Measured (iptables 1.8.13, both backends): one slot over is refused with "too many ports specified" — ${RESTORE_REFUSED}. \`iptables-restore --test\` does catch this one, so a pre-flight check in the deploy would have. Split the list across two rules (or two \`-m multiport\` matches in one rule — the cap is per match), fold neighbouring ports into ranges only where they are truly contiguous, or move to an ipset (\`-m set --match-set\`) / an nft set, which have no such cap.`
+            });
+          }
+        });
+      }
+    }
+  }
+
+  // ── multiport-one-option ────────────────────────────────────────────
+  // One `-m multiport` match takes ONE port list: --dports, --sports or
+  // --ports. Measured (iptables 1.8.11, nf_tables AND legacy, real loads):
+  // `--dports 22,80 --sports 1024:65535`, `--ports 22 --dports 80` and
+  // `--dports` twice are refused ('multiport: option "--source-ports"
+  // cannot be used together with "--destination-ports"' / 'can only be used
+  // once') and the file loads nothing. The trap is the singular: after
+  // `-m multiport`, `--sport` / `--dport` are NOT the tcp match's options -
+  // getopt takes them as abbreviations of multiport's `--sports` / `--dports`
+  // (`-m multiport --dport 22,80` alone loads and is saved as `--dports`), so
+  // `-p tcp -m multiport --dports 22,80 --sport 1024:65535` is refused the
+  // same way. Options bind to whichever loaded match knows them, not by
+  // position: a `-m comment` in between changes nothing, while an EXACT name
+  // in a loaded tcp/udp match wins over the abbreviation - that match is
+  // loaded by `-m tcp` before the option, or by an earlier option multiport
+  // does not know (`--syn`, `--tcp-flags`, a `--dport` ahead of the
+  // multiport), which makes iptables load the protocol match itself. A second
+  // `-m multiport` takes the options after it, so two matches of one list
+  // each load fine (all measured, both backends).
+  const MULTIPORT_PORT_OPTS = { dports: 'dports', 'destination-ports': 'dports', sports: 'sports', 'source-ports': 'sports', ports: 'ports' };
+  const PROTO_MATCH_OPTS = {
+    tcp: ['dport', 'sport', 'destination-port', 'source-port', 'tcp-flags', 'syn', 'tcp-option'],
+    udp: ['dport', 'sport', 'destination-port', 'source-port'],
+    udplite: ['dport', 'sport', 'destination-port', 'source-port'],
+    sctp: ['dport', 'sport', 'destination-port', 'source-port', 'chunk-types'],
+    dccp: ['dport', 'sport', 'destination-port', 'source-port', 'dccp-types', 'dccp-option'],
+  };
+  // The multiport matches of one rule and the port options each one ends up
+  // with, resolved the way iptables' getopt does (see above).
+  function multiportOptionsPerMatch(match) {
+    const toks = String(match || '').replace(/"[^"]*"|'[^']*'/g, '""').split(/\s+/).filter(Boolean);
+    let proto = '';
+    let protoLoaded = false;
+    let cur = null;
+    const matches = [];
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i];
+      if (t === '-p' || t === '--protocol') {
+        if (toks[i + 1] === '!') i++;
+        proto = String(toks[++i] || '').toLowerCase();
+        continue;
+      }
+      if (t === '-m' || t === '--match') {
+        const name = String(toks[++i] || '').toLowerCase();
+        if (name === 'multiport') matches.push((cur = []));
+        else if (name === proto && PROTO_MATCH_OPTS[name]) protoLoaded = true;
+        continue;
+      }
+      if (!t.startsWith('--')) continue;
+      const opt = t.slice(2);
+      const protoOpts = PROTO_MATCH_OPTS[proto] || [];
+      // A loaded protocol match claims its exact names (and makes a shared
+      // prefix ambiguous - refused for another reason, not judged here).
+      if (protoLoaded && protoOpts.some((o) => o.startsWith(opt))) continue;
+      const full = Object.keys(MULTIPORT_PORT_OPTS).find((o) => o.startsWith(opt));
+      if (cur && full) {
+        cur.push({ written: t, list: MULTIPORT_PORT_OPTS[full], abbreviated: opt !== full });
+        continue;
+      }
+      if (protoOpts.some((o) => o.startsWith(opt))) protoLoaded = true;
+    }
+    return matches;
+  }
+  function detectMultiportOneOption(result, findings) {
+    const format = result.format;
+    if (format !== 'iptables' && format !== 'ip6tables') return;
+    for (const table of result.tables) {
+      for (const chain of table.chains) {
+        chain.rules.forEach((rule, idx) => {
+          for (const opts of multiportOptionsPerMatch(rule.match)) {
+            if (opts.length < 2) continue;
+            const [first, second] = opts;
+            const repeat = first.list === second.list;
+            const swallowed = opts.find((o) => o.abbreviated);
+            const asRead = (o) => (o.abbreviated ? `\`${o.written}\` (read as \`--${o.list}\`)` : `\`${o.written}\``);
+            const long = { dports: 'destination-ports', sports: 'source-ports', ports: 'ports' };
+            const message = repeat
+              ? `multiport: option "--${long[first.list]}" can only be used once`
+              : `multiport: option "--${long[second.list]}" cannot be used together with "--${long[first.list]}"`;
+            findings.push({
+              id: 'multiport-one-option',
+              severity: 'error',
+              table: table.name,
+              tableFamily: table.family || null,
+              chain: chain.name,
+              ruleIdx: idx,
+              title: `one \`-m multiport\` with ${asRead(first)} and ${asRead(second)} — a multiport match takes one port list; iptables-restore refuses the file`,
+              details: `A \`-m multiport\` match takes ONE port list — \`--dports\`, \`--sports\` or \`--ports\` (either side) — and iptables refuses a second one in the same match (*${message}*, measured on both backends). ${RESTORE_REFUSED}.${swallowed ? ` The trap here is the singular: \`${swallowed.written}\` looks like the tcp/udp match's option, but after \`-m multiport\` getopt takes it as an abbreviation of multiport's \`--${swallowed.list}\` — nothing had loaded the protocol match yet, so multiport claims it (measured: \`-m multiport --dport 22,80\` on its own loads and is saved as \`--dports 22,80\`).` : ''} To match both, give each list its own match (\`-m multiport --dports 22,80 -m multiport --sports 1024:65535\`), or, for a single port, load the protocol match explicitly so its exact \`--sport\` / \`--dport\` wins (\`-m multiport --dports 22,80 -m tcp --sport 1024:65535\`) — both load (measured). \`iptables-restore --test\` catches this one.`
             });
           }
         });

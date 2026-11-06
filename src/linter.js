@@ -114,6 +114,8 @@
     detectJumpToUndefinedChain(result, findings);
     detectMultiportTooManyPorts(result, findings);
     detectMultiportOneOption(result, findings);
+    detectPortOptionRepeated(result, findings);
+    detectPortMatchNeverMatches(result, findings);
     detectLogPrefixTooLong(result, findings);
     detectCommentTooLong(result, findings);
     detectLimitDefaultRate(result, findings);
@@ -1344,6 +1346,207 @@
         });
       }
     }
+  }
+
+  // ── port-match-never-matches / port-option-repeated ─────────────────
+  // Every match on a rule must hold at once, so two destination-port (or two
+  // source-port) constraints with no port in common make a rule that loads
+  // and never matches. Measured with real SYNs over loopback (debian:13,
+  // iptables 1.8.11 nf_tables AND legacy, nftables 1.1.3): `-p tcp --dport 443
+  // -m multiport --dports 22,80`, two multiport lists `22,80` / `443`, two
+  // `-m tcp` matches `--dport 22` / `--dport 80`, `--dport 1000:2000` with
+  // `--dports 22,80`, `--sport 1024:65535` with `--sports 22,80`, the udp
+  // forms, and nft `tcp dport 443 tcp dport { 22, 80 }` / `tcp dport 443 tcp
+  // dport 22` / a range with a disjoint set all load with rc 0 and count 0.
+  // Overlapping lists count (`--dport 80` + `--dports 22,80`, `1000:2000` +
+  // `22,1500`); so do the cases this does NOT judge: multiport `--ports`
+  // (either side - `--dport 443 --ports 22,80` matched sport 22 and 80), a
+  // `--dport` against a `--sport` (different fields), and negations. Two
+  // `-m tcp` matches have a twist on the nf_tables backend: the kernel rule
+  // is `tcp dport 22 tcp dport 80` (dead), but iptables-nft-save prints only
+  // `-m tcp --dport 80` - and restoring that dump turns the dead rule into a
+  // live port-80 accept (measured: 0 packets before, 1 after the round trip).
+  //
+  // The same side twice in ONE tcp/udp match is a different failure: it does
+  // not load (`Only one '--destination-port' allowed`, rc 2, both backends -
+  // including a trailing `--dport` that binds back to an already-loaded tcp
+  // match), so it is port-option-repeated (error), not a dead rule.
+  //
+  // Options bind exactly as in multiportOptionsPerMatch above; the values are
+  // kept this time. Port names (`--dport ssh`) are not resolved: such a
+  // constraint is left out, so the rule can only be judged on the others.
+  function portSpecIntervals(spec) {
+    const items = String(spec || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (!items.length) return null;
+    const norm = items.map((s) => s.replace(/^:(\d+)$/, '0:$1').replace(/^(\d+):$/, '$1:65535'));
+    return portIntervals(norm.join(','));
+  }
+  function intersectIntervals(a, b) {
+    const out = [];
+    for (const [aL, aH] of a) {
+      for (const [bL, bH] of b) {
+        const lo = Math.max(aL, bL);
+        const hi = Math.min(aH, bH);
+        if (lo <= hi) out.push([lo, hi]);
+      }
+    }
+    return out;
+  }
+  const PROTO_SIDE = { dport: 'dport', 'destination-port': 'dport', sport: 'sport', 'source-port': 'sport' };
+  function iptPortConstraints(match) {
+    const toks = String(match || '').replace(/"[^"]*"|'[^']*'/g, '""').split(/\s+/).filter(Boolean);
+    let proto = '';
+    let protoNegated = false;
+    let protoInst = null;
+    let multi = null;
+    const instances = [];
+    const valueAt = (i) => {
+      let j = i + 1;
+      let neg = toks[i - 1] === '!';
+      if (toks[j] === '!') { neg = true; j++; }
+      return { value: toks[j], negated: neg };
+    };
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i];
+      if (t === '-p' || t === '--protocol') {
+        if (toks[i - 1] === '!' || toks[i + 1] === '!') protoNegated = true;
+        if (toks[i + 1] === '!') i++;
+        proto = String(toks[++i] || '').toLowerCase();
+        continue;
+      }
+      if (t === '-m' || t === '--match') {
+        const name = String(toks[++i] || '').toLowerCase();
+        if (name === 'multiport') instances.push((multi = { kind: 'multiport', opts: [] }));
+        else if (name === proto && PROTO_MATCH_OPTS[name]) instances.push((protoInst = { kind: proto, explicit: true, opts: [] }));
+        continue;
+      }
+      if (!t.startsWith('--')) continue;
+      const opt = t.slice(2);
+      const protoOpts = PROTO_MATCH_OPTS[proto] || [];
+      const protoFull = protoOpts.find((o) => o.startsWith(opt));
+      if (protoInst && protoFull) {
+        if (PROTO_SIDE[protoFull]) protoInst.opts.push({ written: t, side: PROTO_SIDE[protoFull], long: protoFull, ...valueAt(i) });
+        continue;
+      }
+      const mpFull = Object.keys(MULTIPORT_PORT_OPTS).find((o) => o.startsWith(opt));
+      if (multi && mpFull) {
+        multi.opts.push({ written: t, side: MULTIPORT_PORT_OPTS[mpFull].replace(/s$/, ''), multiport: true, ...valueAt(i) });
+        continue;
+      }
+      if (protoFull) {
+        // An option only the protocol match knows: iptables loads it here.
+        instances.push((protoInst = { kind: proto, explicit: false, opts: [] }));
+        if (PROTO_SIDE[protoFull]) protoInst.opts.push({ written: t, side: PROTO_SIDE[protoFull], long: protoFull, ...valueAt(i) });
+      }
+    }
+    return { proto, protoNegated, instances };
+  }
+  function spelledIpt(o) {
+    return `${o.negated ? '! ' : ''}${o.written} ${o.value}`;
+  }
+  function detectPortOptionRepeated(result, findings) {
+    const format = result.format;
+    if (format !== 'iptables' && format !== 'ip6tables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const { instances } = iptPortConstraints(rule.match);
+      for (const inst of instances) {
+        if (inst.kind === 'multiport') continue;
+        for (const side of ['dport', 'sport']) {
+          const opts = inst.opts.filter((o) => o.side === side);
+          if (opts.length < 2) continue;
+          const long = side === 'dport' ? 'destination-port' : 'source-port';
+          findings.push({
+            id: 'port-option-repeated',
+            severity: 'error',
+            table: table.name,
+            tableFamily: table.family || null,
+            chain: chain.name,
+            ruleIdx: idx,
+            title: `\`${spelledIpt(opts[0])}\` and \`${spelledIpt(opts[1])}\` in one ${inst.kind} match — iptables-restore refuses the file`,
+            details: `A ${inst.kind} match takes one \`--${long}\`, and iptables refuses a second one in the same match (*Only one \`--${long}' allowed*, rc 2, measured on both backends). ${RESTORE_REFUSED}. Options bind to the loaded match that knows them, not by position, so a \`--dport\` written after a \`-m multiport\` still lands in the tcp/udp match when that one is already loaded (measured: \`-p tcp --dport 22 -m multiport --dports 80 --dport 443\` is refused the same way). For several ports use one list (\`-m multiport --${side}s 22,80\`); if the two values were meant to hold together, see port-match-never-matches — no packet can carry two ${side === 'dport' ? 'destination' : 'source'} ports.`
+          });
+          break;
+        }
+      }
+    });
+  }
+  function nftPortConstraints(raw) {
+    const text = String(raw || '').replace(/"(?:[^"\\]|\\.)*"/g, '""');
+    const out = [];
+    const re = /(?:^|\s)(tcp|udp|udplite|sctp|dccp|th)\s+(dport|sport)\s+/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const rest = text.slice(re.lastIndex);
+      const negated = /^!=/.test(rest);
+      const body = rest.replace(/^(?:==|!=)\s*/, '');
+      let value = null;
+      const set = /^\{([^}]*)\}/.exec(body);
+      if (set) {
+        const after = body.slice(set[0].length);
+        if (!/^\s*:/.test(set[1]) && !/:/.test(set[1])) value = set[1].replace(/\s+/g, '');
+        if (/^\s*(?:vmap|map)\b/.test(after)) value = null;
+      } else {
+        const tok = /^([0-9][0-9-]*)(?=\s|$|;)/.exec(body);
+        if (tok) value = tok[1];
+      }
+      out.push({ proto: m[1], side: m[2], value, negated, spelled: `${m[1]} ${m[2]} ${negated ? '!= ' : ''}${set ? `{ ${set[1].trim()} }` : (body.split(/\s+/)[0] || '')}` });
+    }
+    return out;
+  }
+  function detectPortMatchNeverMatches(result, findings) {
+    const format = result.format;
+    const ipt = format === 'iptables' || format === 'ip6tables';
+    if (!ipt && format !== 'nftables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      let byside;
+      let twoProtoMatches = false;
+      if (ipt) {
+        const c = iptPortConstraints(rule.match);
+        if (c.protoNegated) return;
+        // A repeat inside one match does not load: port-option-repeated's
+        // (tcp/udp) or multiport-one-option's (a second list in a multiport).
+        for (const inst of c.instances) {
+          if (inst.kind === 'multiport' ? inst.opts.length > 1
+            : ['dport', 'sport'].some((s) => inst.opts.filter((o) => o.side === s).length > 1)) return;
+        }
+        twoProtoMatches = c.instances.filter((x) => x.kind !== 'multiport').length > 1;
+        byside = { dport: [], sport: [] };
+        for (const inst of c.instances) {
+          for (const o of inst.opts) {
+            if (o.negated || !byside[o.side]) continue;
+            byside[o.side].push({ spelled: spelledIpt(o), iv: portSpecIntervals(o.value) });
+          }
+        }
+      } else {
+        const cons = nftPortConstraints(rule.raw);
+        const protos = new Set(cons.map((x) => x.proto).filter((p) => p !== 'th'));
+        if (protos.size > 1) return;
+        byside = { dport: [], sport: [] };
+        for (const o of cons) {
+          if (o.negated || o.value === null) continue;
+          byside[o.side].push({ spelled: o.spelled, iv: portSpecIntervals(o.value) });
+        }
+      }
+      for (const side of ['dport', 'sport']) {
+        const known = byside[side].filter((x) => x.iv);
+        if (known.length < 2) continue;
+        let common = known[0].iv;
+        for (const x of known.slice(1)) common = intersectIntervals(common, x.iv);
+        if (common.length) continue;
+        const accept = isAcceptAction(rule);
+        const what = side === 'dport' ? 'destination' : 'source';
+        findings.push({
+          id: 'port-match-never-matches',
+          severity: 'warning',
+          table: table.name,
+          tableFamily: table.family || null,
+          chain: chain.name,
+          ruleIdx: idx,
+          title: `${known.map((x) => `\`${x.spelled}\``).join(' and ')} share no port — this rule never matches`,
+          details: `A packet has one ${what} port and every match on a rule must hold together, so these leave nothing that could match: the rule loads (rc 0) and its counter stays at 0 (measured with real connections${ipt ? ', iptables nf_tables and legacy alike' : ', nft'}).${accept ? ' The traffic it was written to accept falls through to the rules below — usually the default drop.' : ''} The usual origin is a rule edited from both ends: a \`--dport\` left in front when the port list moved to a multiport, or a list narrowed without the other.${ipt && twoProtoMatches ? ' Two tcp/udp matches here also hide on the nf_tables backend: the kernel keeps both (dead), but iptables-nft-save prints only the last port — so the dump of that box shows a rule that looks live, and restoring the dump really makes it live (measured: 0 packets before the round trip, the last port matching after).' : ''} Keep one list with the ports you mean.`
+        });
+      }
+    });
   }
 
   // ── log-prefix-too-long / comment-too-long ──────────────────────────

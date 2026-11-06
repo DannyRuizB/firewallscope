@@ -1,0 +1,23 @@
+# A web server's /etc/iptables/rules.v4 after two quick edits to its port
+# lines (measured, iptables 1.8.11, real loads and real connections):
+#  - the web accept moved to a multiport list, and the old `--dport 443` in
+#    front of it stayed. A packet has one destination port, so 443 AND one of
+#    80/8080 never holds: the rule loads and its counter stays at 0 - every
+#    web port falls through to the DROP policy.
+#  - the monitoring line got a second port the quick way, `--dport 9100
+#    --dport 9256` in one tcp match. iptables refuses it ("Only one
+#    `--destination-port' allowed"), so the file loads NOTHING and the boot
+#    that replays it leaves INPUT at ACCEPT.
+# With `-m multiport --dports 80,443,8080` alone and the monitoring ports in
+# a multiport list of their own, both backends load it and the web ports
+# answer.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p tcp --dport 22 -s 10.0.0.0/8 -j ACCEPT
+-A INPUT -p tcp --dport 443 -m multiport --dports 80,8080 -j ACCEPT
+-A INPUT -p tcp -s 10.0.0.5/32 --dport 9100 --dport 9256 -j ACCEPT
+COMMIT

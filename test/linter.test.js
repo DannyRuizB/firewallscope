@@ -61,6 +61,7 @@ const EXPECTED = {
   'iptables-limit-rate-plural.txt': ['limit-rate-invalid'],
   'nft-limit-rate-abbrev.txt': ['limit-rate-invalid'],
   'iptables-burst-zero-dead-state.txt': ['limit-burst-invalid', 'ct-state-never-matches'],
+  'iptables-port-lists-dead.txt': ['port-option-repeated', 'port-match-never-matches'],
 };
 
 for (const [name, ids] of Object.entries(EXPECTED)) {
@@ -136,6 +137,8 @@ const ALL_SMELLS = [
   'jump-to-undefined-chain',
   'multiport-too-many-ports',
   'multiport-one-option',
+  'port-option-repeated',
+  'port-match-never-matches',
   'log-prefix-too-long',
   'comment-too-long',
   'limit-default-rate',
@@ -3589,6 +3592,107 @@ test('multiport-one-option: ip6tables too; nft is never judged', () => {
   const nft = ['table inet filter {', '  chain input {', '    type filter hook input priority 0; policy drop;',
     '    tcp dport { 22, 80 } tcp sport 1024-65535 accept', '  }', '}'].join('\n');
   assert.equal(oneOptHits(nft).length, 0);
+});
+
+// --- port-match-never-matches / port-option-repeated -------------------------
+// Measured with real SYNs (debian:13, iptables 1.8.11 nf_tables AND legacy,
+// nftables 1.1.3; 34 variants, linter and kernel agree on all 34): disjoint
+// port constraints on one side load and count 0; overlap, --ports, the other
+// side and negations count. The same side twice in ONE tcp/udp match is refused
+// ("Only one `--destination-port' allowed", rc 2).
+
+const nmHits = (text) => FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'port-match-never-matches');
+const poHits = (text) => FS.lint(FS.parse(text)).findings.filter((x) => x.id === 'port-option-repeated');
+const pmIpt = (body) => [...FILTER_HEAD, `-A INPUT ${body}`, 'COMMIT'].join('\n');
+const pmNft = (body) => ['table inet t {', ' chain i {', '  type filter hook input priority 0; policy drop;', `  ${body}`, ' }', '}'].join('\n');
+
+test('port-match-never-matches (iptables): disjoint port constraints warn — multiport, two tcp matches, ranges, sport', () => {
+  const f = nmHits(mpRule('-p tcp --dport 443 -m multiport --dports 22,80'));
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'warning');
+  assert.equal(f[0].ruleIdx, 0);
+  assert.match(f[0].title, /`--dport 443` and `--dports 22,80` share no port — this rule never matches/);
+  assert.match(f[0].details, /its counter stays at 0/);
+  assert.match(f[0].details, /falls through to the rules below/);
+  assert.doesNotMatch(f[0].details, /iptables-nft-save prints only the last port/, 'one tcp match: no round-trip note');
+  for (const body of [
+    '-p tcp -m multiport --dports 22,80 -m multiport --dports 443',
+    '-p tcp --dport 1000:2000 -m multiport --dports 22,80',
+    '-p tcp --dport :1023 -m multiport --dports 8080',
+    '-p tcp --sport 1024:65535 -m multiport --sports 22,80',
+    '-p udp --dport 53 -m multiport --dports 22,80',
+    '-p tcp -m multiport --dports 22 --tcp-flags SYN SYN --dport 80',
+    '-p tcp -m tcp --sport 1024 -m multiport --dports 22 --dport 80',
+  ]) {
+    assert.equal(nmHits(mpRule(body)).length, 1, body);
+  }
+  const two = nmHits(mpRule('-p tcp -m tcp --dport 22 -m tcp --dport 80'));
+  assert.equal(two.length, 1);
+  assert.match(two[0].details, /iptables-nft-save prints only the last port/);
+  assert.equal(nmHits(mpRule('-p tcp --dport 22 -m tcp --dport 80')).length, 1, 'implicit then explicit tcp match');
+  const drop = nmHits(pmIpt('-p tcp --dport 443 -m multiport --dports 22,80 -j DROP'));
+  assert.equal(drop.length, 1);
+  assert.doesNotMatch(drop[0].details, /falls through/);
+});
+
+test('port-match-never-matches (iptables): what can match, or does not load, is never flagged', () => {
+  for (const body of [
+    '-p tcp --dport 443',
+    '-p tcp -m tcp --dport 80 -m multiport --dports 22,80',
+    '-p tcp --dport 1000:2000 -m multiport --dports 22,1500',
+    '-p tcp --dport 22 -m multiport --dports 20:30',
+    '-p tcp -m multiport --dports 22:30 -m multiport --dports 25,80',
+    '-p tcp --dport 443 -m multiport --ports 22,80',
+    '-p tcp ! --dport 443 -m multiport --dports 22,80',
+    '-p tcp --dport 443 -m multiport ! --dports 22,80',
+    '-p tcp -m tcp --dport 443 -m tcp --sport 22',
+    '-p tcp --dport 443 -m multiport --dports 443,8443',
+    '-p tcp --dport ssh -m multiport --dports 80,443',
+    '! -p tcp --dport 443 -m multiport --dports 22,80',
+    // These do not load at all - other smells' findings, not a dead rule:
+    '-p tcp --dport 22 --dport 80',
+    '-p tcp -m multiport --dports 22,80 --dport 443',
+  ]) {
+    assert.equal(nmHits(mpRule(body)).length, 0, body);
+  }
+});
+
+test('port-match-never-matches (nft): disjoint dport/sport operands warn; sets, ranges, th and != are read correctly', () => {
+  const f = nmHits(pmNft('tcp dport 443 tcp dport { 22, 80 } accept'));
+  assert.equal(f.length, 1);
+  assert.match(f[0].title, /`tcp dport 443` and `tcp dport \{ 22, 80 \}` share no port/);
+  assert.doesNotMatch(f[0].details, /iptables-nft-save/);
+  for (const body of ['tcp dport 443 tcp dport 22 accept', 'tcp dport 1000-2000 tcp dport { 22, 80 } accept',
+    'tcp sport 1024-65535 tcp sport { 22, 80 } accept', 'meta l4proto tcp th dport 443 tcp dport 22 accept',
+    'udp dport 53 udp dport 5353 accept']) {
+    assert.equal(nmHits(pmNft(body)).length, 1, body);
+  }
+  for (const body of ['tcp dport 443 accept', 'tcp dport 80 tcp dport { 22, 80 } accept', 'tcp dport 1000-2000 tcp dport { 22, 1500 } accept',
+    'tcp dport != 443 tcp dport { 22, 80 } accept', 'tcp dport 443 tcp sport 22 accept', 'udp dport { 53, 5353 } accept',
+    'tcp dport 443 udp dport 53 accept', 'tcp dport 443 tcp dport @web accept', 'tcp dport vmap { 22 : accept, 80 : drop }',
+    'tcp dport 443 tcp dport >= 1024 accept', 'tcp dport 443 comment "tcp dport 22" accept']) {
+    assert.equal(nmHits(pmNft(body)).length, 0, body);
+  }
+});
+
+test('port-option-repeated: the same side twice in one tcp/udp match is an error, with the message iptables prints', () => {
+  const f = poHits(mpRule('-p tcp --dport 22 --dport 80'));
+  assert.equal(f.length, 1);
+  assert.equal(f[0].severity, 'error');
+  assert.match(f[0].title, /`--dport 22` and `--dport 80` in one tcp match — iptables-restore refuses the file/);
+  assert.match(f[0].details, /Only one `--destination-port' allowed/);
+  assert.match(f[0].details, /every table after it in the file load NOTHING/);
+  assert.match(poHits(mpRule('-p tcp --sport 22 --sport 80'))[0].details, /Only one `--source-port' allowed/);
+  for (const body of ['-p tcp -m tcp --dport 22 --dport 80', '-p tcp --destination-port 22 --dport 80',
+    '-p tcp --dport 22 -m multiport --dports 80 --dport 443', '-p udp --dport 53 --dport 5353']) {
+    assert.equal(poHits(mpRule(body)).length, 1, body);
+  }
+  for (const body of ['-p tcp -m tcp --dport 22 -m tcp --dport 80', '-p tcp --dport 22 --sport 80',
+    '-p tcp -m multiport --dports 22 --dports 80', '-p tcp --dport 22 -m comment --comment "--dport 80"']) {
+    assert.equal(poHits(mpRule(body)).length, 0, body);
+  }
+  const nft = pmNft('tcp dport 22 tcp dport 80 accept');
+  assert.equal(poHits(nft).length, 0, 'nft is never judged');
 });
 
 test('multiport-too-many-ports: nft sets have no cap and are never judged', () => {

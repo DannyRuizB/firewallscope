@@ -110,6 +110,7 @@
     detectTcpOptionWithoutTcp(result, findings);
     detectIcmpMatchWithoutIcmp(result, findings);
     detectIcmpTypeUnknown(result, findings);
+    detectIcmpType255(result, findings);
     detectInterfaceMatchWrongDirection(result, findings);
     detectJumpToUndefinedChain(result, findings);
     detectMultiportTooManyPorts(result, findings);
@@ -1044,8 +1045,9 @@
   // `--icmp-type bogus-type` and `--icmp-type 300` -> "Unknown ICMP type",
   // rc 2; `--icmpv6-type bogus6` -> "Unknown ICMPv6 type"; nft `icmp type
   // bogus-type` -> "Could not parse ICMP type", the whole file refused. A
-  // NUMERIC type is accepted silently for 0-255 (even one with no name, like
-  // 255), so numbers are judged only by range; names are judged against the
+  // NUMERIC type is accepted silently for 0-255, so numbers are judged only
+  // by range here (255 is not "a type with no name": IPv4 iptables reads it
+  // as ANY type - icmp-type-255-matches-any); names are judged against the
   // union of what iptables AND nft accept (so a name valid on either backend
   // is never flagged), compared case-insensitively. Like cidr-host-bits-set
   // and log-level-unknown, a dump is already normalised to numbers, so this
@@ -1122,6 +1124,52 @@
           break; // one finding per rule is enough
         }
       }
+    });
+  }
+
+  // ── icmp-type-255-matches-any ────────────────────────────────────────
+  // IPv4 iptables reads ICMP type 255 as "any type": the kernel's icmp match
+  // passes a packet when the rule's type is 0xFF OR type and code agree, so
+  // a rule written for type 255 matches EVERY ICMP packet, whatever code
+  // follows it. MEASURED (iptables 1.8.11, nf_tables and legacy, 3 real
+  // pings = 3 echo-requests + 3 echo-replies through INPUT): `--icmp-type 8`
+  // and `0` matched 3 of 6 each; `255`, `255/0` and `255/255` matched 6 of 6.
+  // iptables-save prints a bare `255` back as `any` (iptables-restore too)
+  // but keeps `255/0` as written, so a dump hides it. `! --icmp-type 255` is
+  // saved as `! --icmp-type any` and matched 0 of 6: never fires for ICMP.
+  // ip6tables reads 255 literally (`--icmpv6-type 255`: 0 of 6) and so does
+  // nft (`icmp type 255` counted 0) - this is IPv4 iptables only. The sample
+  // (a "drop the oddballs" block with `255/0`) answered 0 of 3 pings from
+  // another netns; without that line, 3 of 3. iptIcmpTypeIsAny is shared with
+  // the ICMP analyses (PMTUD, unlimited echo), which used to read 255 as one
+  // literal type and miss that it swallows all of ICMP.
+  function iptIcmpTypeIsAny(value) {
+    const type = String(value || '').split('/')[0].toLowerCase();
+    return type === 'any' || type === '255';
+  }
+
+  function detectIcmpType255(result, findings) {
+    if (result.format !== 'iptables') return;
+    eachRule(result, (rule, idx, chain, table) => {
+      const raw = String(rule.raw != null ? rule.raw : (rule.match || ''));
+      const m = /(?:^|\s)(!\s+)?--icmp-type\s+(\S+)/.exec(raw);
+      if (!m || m[2].split('/')[0] !== '255') return;
+      const value = m[2];
+      const negated = Boolean(m[1]);
+      findings.push({
+        id: 'icmp-type-255-matches-any',
+        severity: 'warning',
+        table: table.name,
+        tableFamily: table.family || null,
+        chain: chain.name,
+        ruleIdx: idx,
+        title: negated
+          ? `\`! --icmp-type ${value}\` matches no ICMP packet at all — iptables reads type 255 as "any"`
+          : `\`--icmp-type ${value}\` matches EVERY ICMP packet — iptables reads type 255 as "any", whatever the code`,
+        details: negated
+          ? `The kernel's IPv4 icmp match treats type 255 as a wildcard, so \`! --icmp-type ${value}\` is \`! --icmp-type any\` (that is how iptables-save prints it): the rule never fires for an ICMP packet. Measured (iptables 1.8.11, nf_tables and legacy, 3 pings through INPUT): 0 of 6 packets matched. If you meant "every ICMP type but one", name that type after the \`!\`.`
+          : `The kernel's IPv4 icmp match treats type 255 as a wildcard, so this rule acts on echo requests, echo replies, destination-unreachable (fragmentation-needed included), time-exceeded — all of ICMP. Measured (iptables 1.8.11, nf_tables and legacy, 3 pings through INPUT): \`--icmp-type 8\` matched 3 of 6 packets, \`255\`, \`255/0\` and \`255/255\` matched 6 of 6; a DROP like this answered 0 of 3 pings that got 3 of 3 without it. iptables-save turns a bare 255 into \`any\` but keeps \`255/0\` as written. If all of ICMP is what you mean, write \`any\` (or drop the type match); if you meant one type, use its name or number. ip6tables and nft read 255 literally.`
+      });
     });
   }
 
@@ -2445,10 +2493,15 @@
   }
 
   // The rule's ICMP type restriction, or null when it matches all of ICMP.
+  // iptables' type 255 is "any" (icmp-type-255-matches-any), and a negated
+  // any matches no ICMP at all: 'none'.
   function icmpTypeSpec(rule) {
     const text = `${rule.raw || ''} ${rule.match || ''}`;
-    let m = text.match(/--icmp-type[\s=]+(\S+)/i);
-    if (m) return m[1].toLowerCase();
+    let m = text.match(/(!\s+)?--icmp-type[\s=]+(\S+)/i);
+    if (m) {
+      if (iptIcmpTypeIsAny(m[2])) return m[1] ? 'none' : 'any';
+      return m[2].toLowerCase();
+    }
     m = text.match(/(^|\s)icmp\s+type\s+(\{[^}]*\}|\S+)/i);
     if (m) return m[2].toLowerCase();
     return null;
@@ -2459,6 +2512,7 @@
   function icmpSpecCoversPmtud(rule) {
     const spec = icmpTypeSpec(rule);
     if (spec === null) return true;
+    if (spec === 'none') return false;
     if (/\bany\b/.test(spec)) return true;
     if (/destination-unreachable|dest-unreach|fragmentation-needed|frag-needed/.test(spec)) return true;
     return /(^|[{,\s])3(\/4)?([},\s]|$)/.test(spec);
@@ -3443,8 +3497,10 @@
     // `meta l4proto icmp`, `icmp type echo-request`. The (^|\s)…(\s|$)
     // guards keep `icmpv6` / `ipv6-icmp` / `icmp6` from matching.
     if (proto !== 'icmp' && !/(^|\s)icmp(\s|$)/.test(text)) return false;
-    const typed = text.match(/--icmp-type[\s=]+(\S+)/) ||
-                  text.match(/(^|\s)icmp\s+type\s+(\S+)/);
+    // iptables' any (255 included) answers ping; a negated any answers nothing.
+    const ipt = text.match(/(!\s+)?--icmp-type[\s=]+(\S+)/);
+    if (ipt && iptIcmpTypeIsAny(ipt[2])) return !ipt[1];
+    const typed = ipt || text.match(/(^|\s)icmp\s+type\s+(\S+)/);
     if (!typed) return true; // no type match = all types, echo included
     const type = typed[typed.length - 1];
     return /^(echo-request|8)(\/|$)/.test(type);

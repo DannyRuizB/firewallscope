@@ -36,6 +36,7 @@
     multiportoverflow: 'samples/iptables-multiport-overflow.txt',
     multiporttwolists: 'samples/iptables-multiport-two-lists.txt',
     portlistsdead: 'samples/iptables-port-lists-dead.txt',
+    icmp255: 'samples/iptables-icmp-255.txt',
     logprefixtruncated: 'samples/iptables-log-prefix-truncated.txt',
     limitdefault: 'samples/iptables-limit-default.txt',
     cidrhostbits: 'samples/iptables-cidr-host-bits.txt',

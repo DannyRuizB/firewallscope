@@ -57,6 +57,7 @@
               <button type="button" data-sample="multiportoverflow">iptables (16 ports in one multiport — won't load)</button>
               <button type="button" data-sample="multiporttwolists">iptables (--dports + --sport in one multiport — won't load)</button>
               <button type="button" data-sample="portlistsdead">iptables (--dport twice — won't load — + a port list that never matches)</button>
+              <button type="button" data-sample="icmp255">iptables (ICMP type 255 — means "any": drops all of ICMP)</button>
               <button type="button" data-sample="logprefixtruncated">iptables (30-byte log prefix — silently cut)</button>
               <button type="button" data-sample="limitdefault">iptables (-m limit without --limit — 3/hour)</button>
               <button type="button" data-sample="cidrhostbits">iptables (10.20.0.15/24 — trusts the whole /24)</button>

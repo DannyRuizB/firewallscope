@@ -1,0 +1,23 @@
+# A host's /etc/iptables/rules.v4 with a "drop the oddballs" ICMP block
+# (measured, iptables 1.8.11, nf_tables and legacy, real pings from another
+# network namespace):
+#  - 255 looked like a harmless reserved type to drop next to the timestamp
+#    requests. The kernel's IPv4 icmp match reads type 255 as "any type",
+#    whatever code follows it: this line drops every ICMP packet that gets
+#    past the conntrack accept - every ping included - before the accepts
+#    below see one (errors about tracked connections still arrive as RELATED,
+#    above it). It loads with rc 0 and iptables-save keeps it as `255/0`, so
+#    a dump does not give it away. 3 pings: 0 answered. Without it: 3 of 3.
+# (ip6tables and nft read 255 literally; this is IPv4 iptables only.)
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p icmp --icmp-type timestamp-request -j DROP
+-A INPUT -p icmp --icmp-type 255/0 -j DROP
+-A INPUT -p icmp --icmp-type echo-request -m limit --limit 5/second -j ACCEPT
+-A INPUT -p icmp --icmp-type destination-unreachable -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT
+COMMIT
